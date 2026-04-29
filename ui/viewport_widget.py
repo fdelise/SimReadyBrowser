@@ -43,6 +43,7 @@ class ViewportWidget(QWidget):
         self._pending_dome_intensity = 1.0
         self._pending_dir_light = (0.8, 45.0, 60.0)
         self._pending_base_scene = "plane"
+        self._pending_collision_overlay = False
         self._load_generation = 0
         self._loading_asset = False
         self._physics = PhysicsController(self)
@@ -146,6 +147,14 @@ class ViewportWidget(QWidget):
             self._renderer.set_base_scene(self._pending_base_scene)
             self._renderer.request_render()
 
+    def set_physics_collision_overlay(self, enabled: bool) -> None:
+        self._pending_collision_overlay = bool(enabled)
+        if self._renderer:
+            self._renderer.set_collision_overlay_enabled(self._pending_collision_overlay)
+            if self._last_bounds:
+                self._renderer.set_collision_proxy_bounds(self._last_bounds)
+            self._renderer.request_render()
+
     def shutdown(self, timeout_ms: int = 20000) -> bool:
         self._load_generation += 1
         self._loading_asset = False
@@ -206,6 +215,9 @@ class ViewportWidget(QWidget):
         renderer.set_dome_intensity(self._pending_dome_intensity)
         renderer.set_directional_light(*self._pending_dir_light)
         renderer.set_base_scene(self._pending_base_scene)
+        renderer.set_collision_overlay_enabled(self._pending_collision_overlay)
+        if self._last_bounds:
+            renderer.set_collision_proxy_bounds(self._last_bounds)
 
         self._renderer = renderer
         return renderer
@@ -255,6 +267,8 @@ class ViewportWidget(QWidget):
         self._last_bounds = bounds
         self._physics.configure_asset(bounds)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
+        if self._renderer:
+            self._renderer.set_collision_proxy_bounds(bounds)
         center = np.array(bounds.get("center", [0.0, 0.0, 0.0]), dtype=np.float64)
         extent = float(bounds.get("extent", 1.0))
         self._camera.frame_bounds(center, extent)

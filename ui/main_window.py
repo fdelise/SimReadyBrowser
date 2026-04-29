@@ -283,6 +283,7 @@ class MainWindow(QMainWindow):
         self._controls.physics_step_requested.connect(self._viewport.step_physics)
         self._controls.physics_restart_requested.connect(self._viewport.restart_physics)
         self._controls.physics_base_scene_changed.connect(self._viewport.set_physics_base_scene)
+        self._controls.physics_collision_vis_changed.connect(self._viewport.set_physics_collision_overlay)
         self._controls.set_physics_status(self._viewport.physics_status)
 
     # ── Slots ──────────────────────────────────────────────────────────────────

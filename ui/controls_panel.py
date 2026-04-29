@@ -63,6 +63,7 @@ class ControlsPanel(QWidget):
     physics_step_requested = pyqtSignal()
     physics_restart_requested = pyqtSignal()
     physics_base_scene_changed = pyqtSignal(str)
+    physics_collision_vis_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -209,6 +210,10 @@ class ControlsPanel(QWidget):
         self._physics_play = QCheckBox("Play physics")
         self._physics_play.toggled.connect(self.physics_play_changed)
         lay.addWidget(self._physics_play)
+
+        self._physics_collision_vis = QCheckBox("Collision overlay")
+        self._physics_collision_vis.toggled.connect(self.physics_collision_vis_changed)
+        lay.addWidget(self._physics_collision_vis)
 
         button_row = QHBoxLayout()
         restart_btn = _small_button("Restart")

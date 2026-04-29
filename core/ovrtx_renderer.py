@@ -44,11 +44,20 @@ BASE_OBSTACLE_PATHS = [
     f"{REVIEW_ROOT}/ObstacleB",
     f"{REVIEW_ROOT}/ObstacleC",
 ]
+COLLISION_ASSET_PATH = f"{REVIEW_ROOT}/CollisionAssetProxy"
+COLLISION_GROUND_PATH = f"{REVIEW_ROOT}/CollisionGround"
+COLLISION_RAMP_PATH = f"{REVIEW_ROOT}/CollisionRamp"
+COLLISION_OBSTACLE_PATHS = [
+    f"{REVIEW_ROOT}/CollisionObstacleA",
+    f"{REVIEW_ROOT}/CollisionObstacleB",
+    f"{REVIEW_ROOT}/CollisionObstacleC",
+]
 DEFAULT_FRAME_BOUNDS = {"center": [0.0, 0.0, 0.0], "extent": 1.0}
 STAGE_UP_AXIS = "Z"
 STAGE_METERS_PER_UNIT = 1
 GROUND_PLANE_HALF_SIZE = 20.0
 GROUND_PLANE_Z = -0.005
+GROUND_COLLIDER_THICKNESS = 0.05
 BASE_SCENES = {"plane", "ramp", "obstacles"}
 HIDDEN_BASE_Z = -10000.0
 ENABLE_OVRTX_DEBUG_BOUNDS = os.environ.get("SIMREADY_OVRTX_DEBUG_BOUNDS") == "1"
@@ -101,6 +110,8 @@ class OVRTXRenderer(QObject):
     _camera_transform_requested = pyqtSignal(object)
     _asset_transform_requested = pyqtSignal(object)
     _base_scene_requested = pyqtSignal(str)
+    _collision_overlay_requested = pyqtSignal(bool)
+    _collision_bounds_requested = pyqtSignal(object)
     _dome_intensity_requested = pyqtSignal(float)
     _dir_light_requested = pyqtSignal(float, float, float)
     _render_requested = pyqtSignal()
@@ -133,6 +144,10 @@ class OVRTXRenderer(QObject):
         self._asset_transform_warning_shown = False
         self._base_scene = "plane"
         self._base_scene_dirty = True
+        self._collision_overlay_enabled = False
+        self._collision_proxy_bounds: Optional[dict] = None
+        self._collision_overlay_dirty = True
+        self._collision_overlay_warning_shown = False
         self._dome_intensity = 1.0
         self._dir_intensity = 0.8
         self._dir_azimuth = 45.0
@@ -152,6 +167,8 @@ class OVRTXRenderer(QObject):
         self._camera_transform_requested.connect(self._set_camera_transform, Qt.QueuedConnection)
         self._asset_transform_requested.connect(self._set_asset_transform, Qt.QueuedConnection)
         self._base_scene_requested.connect(self._set_base_scene, Qt.QueuedConnection)
+        self._collision_overlay_requested.connect(self._set_collision_overlay_enabled, Qt.QueuedConnection)
+        self._collision_bounds_requested.connect(self._set_collision_proxy_bounds, Qt.QueuedConnection)
         self._dome_intensity_requested.connect(self._set_dome_intensity, Qt.QueuedConnection)
         self._dir_light_requested.connect(self._set_directional_light, Qt.QueuedConnection)
         self._render_requested.connect(self._render_one, Qt.QueuedConnection)
@@ -183,6 +200,16 @@ class OVRTXRenderer(QObject):
         if self._shutdown_started:
             return
         self._base_scene_requested.emit(str(scene_id or "plane"))
+
+    def set_collision_overlay_enabled(self, enabled: bool) -> None:
+        if self._shutdown_started:
+            return
+        self._collision_overlay_requested.emit(bool(enabled))
+
+    def set_collision_proxy_bounds(self, bounds: dict) -> None:
+        if self._shutdown_started:
+            return
+        self._collision_bounds_requested.emit(dict(bounds or {}))
 
     def set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
@@ -269,6 +296,8 @@ class OVRTXRenderer(QObject):
             self._asset_transform_dirty = True
             self._asset_transform_warning_shown = False
             self._base_scene_dirty = True
+            self._collision_overlay_dirty = True
+            self._collision_overlay_warning_shown = False
             self.loading_started.emit(f"Loading {display_name} in OVRTX...")
             self.loading_progress.emit(5, "Preparing OVRTX stage...")
             self.status_changed.emit(f"Loading {display_name}...")
@@ -292,6 +321,7 @@ class OVRTXRenderer(QObject):
             self._apply_resolution()
             self._apply_asset_transform()
             self._apply_base_scene()
+            self._apply_collision_overlay()
             self._apply_dome_light()
             self._apply_directional_light()
 
@@ -386,6 +416,149 @@ def Scope "SimReadyStageSettings"
         uniform token subdivisionScheme = "none"
     }}"""
 
+    def _collision_visual_layer(self) -> str:
+        return f"""
+{self._edge_box_mesh("CollisionAssetProxy")}
+
+{self._edge_box_mesh("CollisionGround")}
+
+{self._edge_prism_mesh("CollisionRamp")}
+
+{self._edge_box_mesh("CollisionObstacleA")}
+
+{self._edge_box_mesh("CollisionObstacleB")}
+
+{self._edge_box_mesh("CollisionObstacleC")}
+"""
+
+    @classmethod
+    def _edge_box_mesh(cls, name: str) -> str:
+        corners = {
+            "000": (-0.5, -0.5, -0.5),
+            "100": (0.5, -0.5, -0.5),
+            "110": (0.5, 0.5, -0.5),
+            "010": (-0.5, 0.5, -0.5),
+            "001": (-0.5, -0.5, 0.5),
+            "101": (0.5, -0.5, 0.5),
+            "111": (0.5, 0.5, 0.5),
+            "011": (-0.5, 0.5, 0.5),
+        }
+        edges = [
+            (corners["000"], corners["100"]),
+            (corners["100"], corners["110"]),
+            (corners["110"], corners["010"]),
+            (corners["010"], corners["000"]),
+            (corners["001"], corners["101"]),
+            (corners["101"], corners["111"]),
+            (corners["111"], corners["011"]),
+            (corners["011"], corners["001"]),
+            (corners["000"], corners["001"]),
+            (corners["100"], corners["101"]),
+            (corners["110"], corners["111"]),
+            (corners["010"], corners["011"]),
+        ]
+        return cls._edge_mesh(name, edges, thickness=0.012)
+
+    @classmethod
+    def _edge_prism_mesh(cls, name: str) -> str:
+        p0 = (-1.7, -1.1, 0.0)
+        p1 = (1.7, -1.1, 0.0)
+        p2 = (1.7, 1.1, 0.0)
+        p3 = (-1.7, 1.1, 0.0)
+        p4 = (1.7, -1.1, 1.9)
+        p5 = (1.7, 1.1, 1.9)
+        edges = [
+            (p0, p1),
+            (p1, p4),
+            (p4, p0),
+            (p3, p2),
+            (p2, p5),
+            (p5, p3),
+            (p0, p3),
+            (p1, p2),
+            (p4, p5),
+        ]
+        return cls._edge_mesh(name, edges, thickness=0.025)
+
+    @classmethod
+    def _edge_mesh(cls, name: str, edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]], thickness: float) -> str:
+        points: list[np.ndarray] = []
+        face_counts: list[int] = []
+        face_indices: list[int] = []
+
+        for start, end in edges:
+            base = len(points)
+            points.extend(cls._rod_points(np.array(start, dtype=np.float64), np.array(end, dtype=np.float64), thickness))
+            for face in (
+                (0, 1, 2, 3),
+                (4, 7, 6, 5),
+                (0, 4, 5, 1),
+                (1, 5, 6, 2),
+                (2, 6, 7, 3),
+                (3, 7, 4, 0),
+            ):
+                face_counts.append(4)
+                face_indices.extend(base + idx for idx in face)
+
+        point_lines = ",\n            ".join(
+            f"({cls._usd_float(point[0])}, {cls._usd_float(point[1])}, {cls._usd_float(point[2])})" for point in points
+        )
+        count_lines = ", ".join(str(count) for count in face_counts)
+        index_lines = ", ".join(str(index) for index in face_indices)
+
+        return f"""    def Mesh "{name}" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {{
+        uniform bool doubleSided = true
+        int[] faceVertexCounts = [{count_lines}]
+        int[] faceVertexIndices = [{index_lines}]
+        rel material:binding = </SimReadyReview/Materials/CollisionMat>
+        point3f[] points = [
+            {point_lines}
+        ]
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, {HIDDEN_BASE_Z}, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+        uniform token subdivisionScheme = "none"
+    }}"""
+
+    @staticmethod
+    def _rod_points(start: np.ndarray, end: np.ndarray, thickness: float) -> list[np.ndarray]:
+        axis = end - start
+        length = float(np.linalg.norm(axis))
+        if length < 1.0e-8:
+            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        else:
+            axis /= length
+
+        helper = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(float(np.dot(axis, helper))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        u = np.cross(axis, helper)
+        u /= max(float(np.linalg.norm(u)), 1.0e-8)
+        v = np.cross(axis, u)
+        v /= max(float(np.linalg.norm(v)), 1.0e-8)
+        u *= thickness
+        v *= thickness
+
+        return [
+            start - u - v,
+            start + u - v,
+            start + u + v,
+            start - u + v,
+            end - u - v,
+            end + u - v,
+            end + u + v,
+            end - u + v,
+        ]
+
+    @staticmethod
+    def _usd_float(value: float) -> str:
+        value = float(value)
+        if not math.isfinite(value):
+            value = 0.0
+        return f"{value:.9g}"
+
     def _review_layer(self) -> str:
         return f"""#usda 1.0
 (
@@ -439,6 +612,21 @@ def Xform "SimReadyReview"
                 token outputs:surface
             }}
         }}
+
+        def Material "CollisionMat"
+        {{
+            token outputs:surface.connect = </SimReadyReview/Materials/CollisionMat/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {{
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.46, 0.73, 0.0)
+                color3f inputs:emissiveColor = (0.18, 0.32, 0.0)
+                float inputs:metallic = 0
+                float inputs:roughness = 0.25
+                token outputs:surface
+            }}
+        }}
     }}
 
     def Mesh "GroundPlane" (
@@ -460,6 +648,8 @@ def Xform "SimReadyReview"
     }}
 
 {self._base_visual_layer()}
+
+{self._collision_visual_layer()}
 
     def Camera "Camera"
     {{
@@ -534,7 +724,9 @@ def Xform "SimReadyReview"
             return
         self._asset_transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
         self._asset_transform_dirty = True
+        self._collision_overlay_dirty = True
         self._apply_asset_transform()
+        self._apply_collision_overlay()
 
     def _set_base_scene(self, scene_id: str) -> None:
         if self._shutdown_started:
@@ -544,7 +736,23 @@ def Xform "SimReadyReview"
             scene = "plane"
         self._base_scene = scene
         self._base_scene_dirty = True
+        self._collision_overlay_dirty = True
         self._apply_base_scene()
+        self._apply_collision_overlay()
+
+    def _set_collision_overlay_enabled(self, enabled: bool) -> None:
+        if self._shutdown_started:
+            return
+        self._collision_overlay_enabled = bool(enabled)
+        self._collision_overlay_dirty = True
+        self._apply_collision_overlay()
+
+    def _set_collision_proxy_bounds(self, bounds: dict) -> None:
+        if self._shutdown_started:
+            return
+        self._collision_proxy_bounds = self._normalize_collision_bounds(bounds)
+        self._collision_overlay_dirty = True
+        self._apply_collision_overlay()
 
     def _set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
@@ -634,6 +842,77 @@ def Xform "SimReadyReview"
         except Exception as exc:
             self._base_scene_dirty = False
             self.status_changed.emit(f"Base scene visual update skipped: {exc}")
+
+    def _apply_collision_overlay(self) -> None:
+        if not self._renderer or not self._stage_loaded:
+            return
+
+        hidden = self._hidden_base_transform()
+        asset_transform = hidden
+        ground_transform = hidden
+        ramp_transform = hidden
+        obstacle_transforms = [hidden for _ in COLLISION_OBSTACLE_PATHS]
+
+        if self._collision_overlay_enabled:
+            if self._collision_proxy_bounds:
+                center = self._collision_proxy_bounds["center"]
+                size = self._collision_proxy_bounds["size"]
+                asset_transform = self._box_transform(center, size) @ self._asset_transform
+
+            ground_transform = self._box_transform(
+                (0.0, 0.0, -GROUND_COLLIDER_THICKNESS * 0.5),
+                (GROUND_PLANE_HALF_SIZE * 2.0, GROUND_PLANE_HALF_SIZE * 2.0, GROUND_COLLIDER_THICKNESS),
+            )
+            if self._base_scene == "ramp":
+                ramp_transform = np.eye(4, dtype=np.float64)
+            elif self._base_scene == "obstacles":
+                obstacle_transforms = [
+                    self._box_transform((-2.4, -1.4, 0.35), (1.2, 1.2, 0.7)),
+                    self._box_transform((1.8, 1.2, 0.6), (1.0, 1.6, 1.2)),
+                    self._box_transform((0.0, -2.8, 0.25), (2.0, 0.6, 0.5)),
+                ]
+
+        try:
+            paths = [COLLISION_ASSET_PATH, COLLISION_GROUND_PATH, COLLISION_RAMP_PATH] + COLLISION_OBSTACLE_PATHS
+            transforms = [asset_transform, ground_transform, ramp_transform] + obstacle_transforms
+            for path, transform in zip(paths, transforms):
+                self._renderer.write_attribute(
+                    prim_paths=[path],
+                    attribute_name="omni:xform",
+                    tensor=np.array(transform, dtype=np.float64, copy=True).reshape(1, 4, 4),
+                    semantic=Semantic.XFORM_MAT4x4,
+                    prim_mode=PrimMode.MUST_EXIST,
+                )
+            self._collision_overlay_dirty = False
+        except Exception as exc:
+            self._collision_overlay_dirty = False
+            if not self._collision_overlay_warning_shown:
+                self._collision_overlay_warning_shown = True
+                self.status_changed.emit(f"Collision overlay update skipped: {exc}")
+
+    @staticmethod
+    def _normalize_collision_bounds(bounds: dict) -> Optional[dict]:
+        try:
+            center = np.array(bounds.get("center", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+        except Exception:
+            center = np.zeros(3, dtype=np.float64)
+
+        try:
+            size = np.array(bounds.get("size", []), dtype=np.float64).reshape(3)
+        except Exception:
+            size = np.array([], dtype=np.float64)
+
+        if size.size != 3 or not np.all(np.isfinite(size)) or np.any(size <= 0):
+            extent = float(bounds.get("extent", 1.0) or 1.0)
+            if not math.isfinite(extent) or extent <= 0:
+                extent = 1.0
+            side = max((2.0 * extent) / math.sqrt(3.0), 0.25)
+            size = np.array([side, side, side], dtype=np.float64)
+
+        if not np.all(np.isfinite(center)):
+            center = np.zeros(3, dtype=np.float64)
+        size = np.maximum(np.abs(size), np.array([0.05, 0.05, 0.05], dtype=np.float64))
+        return {"center": tuple(float(v) for v in center), "size": tuple(float(v) for v in size)}
 
     @staticmethod
     def _hidden_base_transform() -> np.ndarray:
@@ -1041,6 +1320,8 @@ def Xform "SimReadyReview"
                 self._apply_asset_transform()
             if self._base_scene_dirty:
                 self._apply_base_scene()
+            if self._collision_overlay_dirty:
+                self._apply_collision_overlay()
 
             t0 = time.perf_counter()
             products = self._renderer.step(
