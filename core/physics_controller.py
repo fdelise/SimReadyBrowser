@@ -1,24 +1,22 @@
-"""Optional OVPhysX simulation bridge for the SimReady viewport.
+"""Qt-side OVPhysX controller.
 
-OVPhysX simulates a lightweight box proxy for the loaded asset, then emits a
-USD row-vector transform that OVRTX can apply to the visual asset root.
+OVPhysX 0.3.7 currently crashes if a PhysX instance is created after Qt has
+initialized in this app, so simulation runs in a small worker subprocess. The
+Qt process owns UI state and converts worker poses back into OVRTX transforms.
 """
 
 from __future__ import annotations
 
+import json
 import math
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QProcess, QTimer, pyqtSignal
 
-
-PhysX = None  # type: ignore
-TensorType = None  # type: ignore
-OVPHYSX_AVAILABLE: Optional[bool] = None
-OVPHYSX_IMPORT_ERROR: Optional[BaseException] = None
 
 PROXY_PATH = "/World/AssetProxy"
 GROUND_HALF_SIZE = 20.0
@@ -26,33 +24,21 @@ GROUND_THICKNESS = 0.05
 GROUND_TOP_Z = 0.0
 DEFAULT_DT = 1.0 / 60.0
 
-
-def _ensure_ovphysx_available() -> bool:
-    global PhysX, TensorType, OVPHYSX_AVAILABLE, OVPHYSX_IMPORT_ERROR
-
-    if OVPHYSX_AVAILABLE is not None:
-        return OVPHYSX_AVAILABLE
-
-    try:
-        from ovphysx import PhysX as PhysXClass  # type: ignore
-
-        try:
-            from ovphysx.types import TensorType as TensorTypeClass  # type: ignore
-        except Exception:
-            from ovphysx import TensorType as TensorTypeClass  # type: ignore
-
-        PhysX = PhysXClass
-        TensorType = TensorTypeClass
-        OVPHYSX_AVAILABLE = True
-    except Exception as exc:
-        OVPHYSX_IMPORT_ERROR = exc
-        OVPHYSX_AVAILABLE = False
-
-    return OVPHYSX_AVAILABLE
+Z_TO_Y_ROTATION = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=np.float64,
+)
+Z_TO_Y_MATRIX = np.eye(4, dtype=np.float64)
+Z_TO_Y_MATRIX[:3, :3] = Z_TO_Y_ROTATION
+Y_TO_Z_MATRIX = Z_TO_Y_MATRIX.T
 
 
 class PhysicsController(QObject):
-    """Owns a small OVPhysX scene and streams visual transforms."""
+    """Owns a worker process and streams visual transforms into the viewport."""
 
     pose_changed = pyqtSignal(object)
     status_changed = pyqtSignal(str)
@@ -61,14 +47,15 @@ class PhysicsController(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._timer = QTimer(self)
-        self._timer.timeout.connect(self._step)
+        self._timer.timeout.connect(self._send_step)
 
-        self._physx = None
-        self._usd_handle = None
-        self._pose_binding = None
-        self._velocity_binding = None
-        self._pose_buffer: Optional[np.ndarray] = None
-        self._velocity_buffer: Optional[np.ndarray] = None
+        self._process: Optional[QProcess] = None
+        self._stdout_buffer = ""
+        self._intentional_stop = False
+        self._worker_ready = False
+        self._pending_play = False
+        self._pending_step_after_start = False
+        self._step_in_flight = False
 
         self._bounds: Optional[dict] = None
         self._center = np.zeros(3, dtype=np.float64)
@@ -90,7 +77,7 @@ class PhysicsController(QObject):
 
     @property
     def has_scene(self) -> bool:
-        return self._physx is not None
+        return self._process is not None and self._worker_ready
 
     @property
     def current_visual_transform(self) -> np.ndarray:
@@ -116,14 +103,10 @@ class PhysicsController(QObject):
             self.running_changed.emit(False)
             return False
 
-        if not _ensure_ovphysx_available():
-            detail = f": {OVPHYSX_IMPORT_ERROR}" if OVPHYSX_IMPORT_ERROR else ""
-            self._set_status(f"OVPhysX is not installed{detail}. Run launch.bat to install it.")
-            self.running_changed.emit(False)
-            return False
-
         self._release_scene()
         self._sim_time = 0.0
+        self._pending_play = bool(play)
+        self._pending_step_after_start = False
 
         visual = (
             np.array(visual_transform, dtype=np.float64, copy=True)
@@ -132,51 +115,28 @@ class PhysicsController(QObject):
         )
         body_matrix = self._body_from_visual(visual)
         scene_path = self._write_proxy_scene(body_matrix)
-
-        try:
-            self._set_status("Starting OVPhysX proxy simulation...")
-            self._physx = PhysX(device="cpu")
-            result = self._physx.add_usd(str(scene_path))
-            self._usd_handle = result[0] if isinstance(result, tuple) else result
-            self._physx.wait_all()
-            self._pose_binding = self._physx.create_tensor_binding(
-                prim_paths=[PROXY_PATH],
-                tensor_type=TensorType.RIGID_BODY_POSE,
-            )
-            self._pose_buffer = np.zeros(self._pose_binding.shape, dtype=np.float32)
-            try:
-                self._velocity_binding = self._physx.create_tensor_binding(
-                    prim_paths=[PROXY_PATH],
-                    tensor_type=TensorType.RIGID_BODY_VELOCITY,
-                )
-                self._velocity_buffer = np.zeros(self._velocity_binding.shape, dtype=np.float32)
-            except Exception:
-                self._velocity_binding = None
-                self._velocity_buffer = None
-            self._read_emit_pose()
-            self.set_playing(play)
-            if not play:
-                self._set_status("Physics reset and paused.")
-            return True
-        except Exception as exc:
-            self._release_scene()
-            self._set_status(f"OVPhysX startup failed: {exc}")
-            self.running_changed.emit(False)
-            return False
+        return self._start_worker(scene_path)
 
     def set_playing(self, playing: bool) -> None:
-        if playing and self._physx is None:
+        if playing and self._process is None:
             self.restart(play=True)
+            return
+
+        if playing and not self._worker_ready:
+            self._pending_play = True
+            self._set_status("Physics worker starting...")
             return
 
         if playing:
             if not self._timer.isActive():
-                self._timer.start(int(self._dt * 1000))
-            self._running = True
-            self.running_changed.emit(True)
+                self._timer.start(max(1, int(self._dt * 1000)))
+            if not self._running:
+                self._running = True
+                self.running_changed.emit(True)
             self._set_status("Physics playing.")
             return
 
+        self._pending_play = False
         if self._timer.isActive():
             self._timer.stop()
         if self._running:
@@ -185,113 +145,181 @@ class PhysicsController(QObject):
         self._set_status("Physics paused.")
 
     def step_once(self) -> None:
-        if self._physx is None:
-            if not self.restart(play=False):
-                return
+        if self._process is None:
+            if self.restart(play=False):
+                self._pending_step_after_start = True
+            return
         self.set_playing(False)
-        self._step()
+        self._send_step()
 
     def set_visual_transform(self, matrix: np.ndarray, zero_velocity: bool = True) -> None:
         visual = np.array(matrix, dtype=np.float64, copy=True)
         self._current_visual_transform = visual
-        if self._physx is not None and self._pose_binding is not None and self._pose_buffer is not None:
+        if self._worker_ready:
             pose = self._pose_from_visual(visual)
-            self._pose_buffer[0, :] = pose
-            self._pose_binding.write(self._pose_buffer)
-            if zero_velocity and self._velocity_binding is not None and self._velocity_buffer is not None:
-                self._velocity_buffer.fill(0.0)
-                self._velocity_binding.write(self._velocity_buffer)
+            self._send({"cmd": "set_pose", "pose": pose.tolist(), "zero_velocity": bool(zero_velocity)})
         self.pose_changed.emit(np.array(visual, dtype=np.float64, copy=True))
 
     def shutdown(self) -> None:
+        self._release_scene()
+
+    def _start_worker(self, scene_path: Path) -> bool:
+        self._set_status("Starting OVPhysX worker...")
+        self._process = QProcess(self)
+        self._process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        self._process.readyReadStandardOutput.connect(self._on_worker_stdout)
+        self._process.readyReadStandardError.connect(self._on_worker_stderr)
+        self._process.finished.connect(self._on_worker_finished)
+        self._intentional_stop = False
+        self._stdout_buffer = ""
+        self._worker_ready = False
+        self._step_in_flight = False
+
+        self._process.start(sys.executable, ["-u", "-m", "core.physics_worker"])
+        if not self._process.waitForStarted(5000):
+            error = self._process.errorString() if self._process else "unknown error"
+            self._release_scene()
+            self._set_status(f"Could not start OVPhysX worker: {error}")
+            self.running_changed.emit(False)
+            return False
+
+        self._send({"cmd": "start", "scene": str(scene_path)})
+        return True
+
+    def _send_step(self) -> None:
+        if not self._worker_ready or self._step_in_flight:
+            return
+        self._step_in_flight = True
+        self._send({"cmd": "step", "dt": self._dt, "time": self._sim_time})
+        self._sim_time += self._dt
+
+    def _send(self, message: dict) -> None:
+        process = self._process
+        if process is None or process.state() != QProcess.Running:
+            return
+        payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        process.write(payload)
+        process.waitForBytesWritten(100)
+
+    def _on_worker_stdout(self) -> None:
+        if self._process is None:
+            return
+        self._stdout_buffer += bytes(self._process.readAllStandardOutput()).decode("utf-8", "replace")
+        while "\n" in self._stdout_buffer:
+            line, self._stdout_buffer = self._stdout_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self._handle_worker_message(message)
+
+    def _on_worker_stderr(self) -> None:
+        if self._process is None:
+            return
+        text = bytes(self._process.readAllStandardError()).decode("utf-8", "replace").strip()
+        if text and "Traceback" in text:
+            self._set_status(text.splitlines()[-1])
+
+    def _handle_worker_message(self, message: dict) -> None:
+        kind = message.get("type")
+        if kind == "started":
+            self._worker_ready = True
+            self._set_status("Physics reset and ready.")
+            if self._pending_play:
+                self.set_playing(True)
+            if self._pending_step_after_start:
+                self._pending_step_after_start = False
+                self._send_step()
+            return
+
+        if kind == "pose":
+            pose = np.array(message.get("pose", []), dtype=np.float64)
+            if pose.size >= 7:
+                body_matrix = self._matrix_from_pose(pose[:7])
+                visual_matrix = self._visual_from_body(body_matrix)
+                self._current_visual_transform = visual_matrix
+                self._step_in_flight = False
+                self.pose_changed.emit(np.array(visual_matrix, dtype=np.float64, copy=True))
+            return
+
+        if kind == "error":
+            self._step_in_flight = False
+            self._pending_play = False
+            if self._timer.isActive():
+                self._timer.stop()
+            if self._running:
+                self._running = False
+                self.running_changed.emit(False)
+            self._set_status(f"OVPhysX failed: {message.get('message', 'unknown error')}")
+            return
+
+        if kind == "stopped":
+            self._worker_ready = False
+
+    def _on_worker_finished(self, _exit_code: int, _exit_status) -> None:
+        was_intentional = self._intentional_stop
+        self._process = None
+        self._worker_ready = False
+        self._step_in_flight = False
         if self._timer.isActive():
             self._timer.stop()
         if self._running:
             self._running = False
             self.running_changed.emit(False)
-        self._release_scene()
-
-    def _step(self) -> None:
-        if self._physx is None or self._pose_binding is None or self._pose_buffer is None:
-            return
-
-        try:
-            step_sync = getattr(self._physx, "step_sync", None)
-            if callable(step_sync):
-                try:
-                    step_sync(self._dt, self._sim_time)
-                except TypeError:
-                    step_sync(self._dt)
-            else:
-                self._physx.step(self._dt, self._sim_time)
-                self._physx.wait_all()
-            self._sim_time += self._dt
-            self._read_emit_pose()
-        except Exception as exc:
-            self.set_playing(False)
-            self._set_status(f"Physics step failed: {exc}")
-
-    def _read_emit_pose(self) -> None:
-        if self._pose_binding is None or self._pose_buffer is None:
-            return
-
-        self._pose_binding.read(self._pose_buffer)
-        body_matrix = self._matrix_from_pose(self._pose_buffer[0])
-        visual_matrix = self._visual_from_body(body_matrix)
-        self._current_visual_transform = visual_matrix
-        self.pose_changed.emit(np.array(visual_matrix, dtype=np.float64, copy=True))
+        if not was_intentional:
+            self._set_status("OVPhysX worker stopped.")
 
     def _release_scene(self) -> None:
         if self._timer.isActive():
             self._timer.stop()
-
-        for binding_name in ("_pose_binding", "_velocity_binding"):
-            binding = getattr(self, binding_name)
-            if binding is not None:
-                try:
-                    binding.destroy()
-                except Exception:
-                    pass
-                setattr(self, binding_name, None)
-
-        self._pose_buffer = None
-        self._velocity_buffer = None
-
-        if self._physx is not None:
-            try:
-                if self._usd_handle is not None:
-                    self._physx.remove_usd(self._usd_handle)
-                    self._physx.wait_all()
-            except Exception:
-                pass
-            try:
-                self._physx.release()
-            except Exception:
-                pass
-
-        self._physx = None
-        self._usd_handle = None
+        self._pending_play = False
+        self._pending_step_after_start = False
+        self._step_in_flight = False
         if self._running:
             self._running = False
             self.running_changed.emit(False)
 
+        process = self._process
+        self._process = None
+        self._worker_ready = False
+        if process is None:
+            return
+
+        self._intentional_stop = True
+        try:
+            if process.state() == QProcess.Running:
+                payload = (json.dumps({"cmd": "shutdown"}) + "\n").encode("utf-8")
+                process.write(payload)
+                process.waitForBytesWritten(100)
+                process.closeWriteChannel()
+                if not process.waitForFinished(3000):
+                    process.terminate()
+                    if not process.waitForFinished(1500):
+                        process.kill()
+                        process.waitForFinished(1500)
+        finally:
+            process.deleteLater()
+
     def _default_drop_visual_transform(self) -> np.ndarray:
-        body = np.eye(4, dtype=np.float64)
+        body_z = np.eye(4, dtype=np.float64)
         half_z = max(float(self._size[2]) * 0.5, 0.05)
         drop_height = max(float(self._size[2]) * 1.5, 0.75)
-        body[3, :3] = self._center
-        body[3, 2] = max(body[3, 2], GROUND_TOP_Z + half_z + drop_height)
-        return self._visual_from_body(body)
+        body_z[3, :3] = self._center
+        body_z[3, 2] = max(body_z[3, 2], GROUND_TOP_Z + half_z + drop_height)
+        return self._visual_from_body(self._z_to_y_matrix(body_z))
 
     def _body_from_visual(self, visual_matrix: np.ndarray) -> np.ndarray:
         visual = np.array(visual_matrix, dtype=np.float64, copy=True)
-        body = np.eye(4, dtype=np.float64)
-        body[:3, :3] = visual[:3, :3]
-        body[3, :3] = self._center @ visual[:3, :3] + visual[3, :3]
-        return body
+        body_z = np.eye(4, dtype=np.float64)
+        body_z[:3, :3] = visual[:3, :3]
+        body_z[3, :3] = self._center @ visual[:3, :3] + visual[3, :3]
+        return self._z_to_y_matrix(body_z)
 
     def _visual_from_body(self, body_matrix: np.ndarray) -> np.ndarray:
-        body = np.array(body_matrix, dtype=np.float64, copy=True)
+        body = self._y_to_z_matrix(body_matrix)
         visual = np.eye(4, dtype=np.float64)
         visual[:3, :3] = body[:3, :3]
         visual[3, :3] = body[3, :3] - self._center @ body[:3, :3]
@@ -310,23 +338,28 @@ class PhysicsController(QObject):
         temp_dir.mkdir(parents=True, exist_ok=True)
         self._scene_path = temp_dir / "asset_proxy.usda"
 
-        size = np.maximum(self._size, np.array([0.05, 0.05, 0.05], dtype=np.float64))
-        collider_scale = size
-        ground_z = GROUND_TOP_Z - GROUND_THICKNESS * 0.5
-        body_transform = self._usd_matrix(body_matrix)
+        size_z = np.maximum(self._size, np.array([0.05, 0.05, 0.05], dtype=np.float64))
+        size_y = np.array([size_z[0], size_z[2], size_z[1]], dtype=np.float64)
+        ground_y = -GROUND_THICKNESS * 0.5
+        body_pos = body_matrix[3, :3]
+        body_quat = self._quat_xyzw_from_row_rotation(body_matrix[:3, :3])
 
         text = f"""#usda 1.0
 (
     defaultPrim = "World"
+    doc = "SimReady Browser OVPhysX proxy scene"
     metersPerUnit = 1
-    upAxis = "Z"
+    upAxis = "Y"
+    kilogramsPerMass = 1
 )
 
-def Xform "World"
+def Xform "World" (
+    kind = "component"
+)
 {{
-    def PhysicsScene "physicsScene"
+    def PhysicsScene "PhysicsScene"
     {{
-        vector3f physics:gravityDirection = (0, 0, -1)
+        vector3f physics:gravityDirection = (0, -1, 0)
         float physics:gravityMagnitude = 9.81
     }}
 
@@ -334,30 +367,42 @@ def Xform "World"
         prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
     )
     {{
+        double3 xformOp:translate = ({self._fmt(body_pos[0])}, {self._fmt(body_pos[1])}, {self._fmt(body_pos[2])})
+        quatd xformOp:orient = ({self._fmt(body_quat[3])}, {self._fmt(body_quat[0])}, {self._fmt(body_quat[1])}, {self._fmt(body_quat[2])})
+        double3 xformOp:scale = (1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
         float physics:mass = 10
-        matrix4d xformOp:transform = {body_transform}
-        uniform token[] xformOpOrder = ["xformOp:transform"]
+        vector3f physics:velocity = (0, 0, 0)
+        vector3f physics:angularVelocity = (0, 0, 0)
 
-        def Cube "Collider" (
+        def Cube "CubeGeom" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
         )
         {{
-            uniform token purpose = "guide"
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
-            double3 xformOp:scale = ({self._fmt(collider_scale[0])}, {self._fmt(collider_scale[1])}, {self._fmt(collider_scale[2])})
+            double3 xformOp:scale = ({self._fmt(size_y[0])}, {self._fmt(size_y[1])}, {self._fmt(size_y[2])})
             uniform token[] xformOpOrder = ["xformOp:scale"]
         }}
     }}
 
-    def Cube "Ground" (
+    def Xform "Ground" (
         prepend apiSchemas = ["PhysicsCollisionAPI"]
     )
     {{
-        uniform token purpose = "guide"
-        double size = 1
-        double3 xformOp:translate = (0, 0, {self._fmt(ground_z)})
-        double3 xformOp:scale = ({self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_THICKNESS)})
-        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "GroundGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:translate = (0, {self._fmt(ground_y)}, 0)
+            double3 xformOp:scale = ({self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_THICKNESS)}, {self._fmt(GROUND_HALF_SIZE * 2.0)})
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }}
     }}
 }}
 """
@@ -447,13 +492,13 @@ def Xform "World"
         quat /= max(float(np.linalg.norm(quat)), 1e-9)
         return quat
 
-    @classmethod
-    def _usd_matrix(cls, matrix: np.ndarray) -> str:
-        m = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
-        rows = []
-        for row in m:
-            rows.append("(" + ", ".join(cls._fmt(v) for v in row) + ")")
-        return "( " + ", ".join(rows) + " )"
+    @staticmethod
+    def _z_to_y_matrix(matrix: np.ndarray) -> np.ndarray:
+        return Y_TO_Z_MATRIX @ np.asarray(matrix, dtype=np.float64).reshape(4, 4) @ Z_TO_Y_MATRIX
+
+    @staticmethod
+    def _y_to_z_matrix(matrix: np.ndarray) -> np.ndarray:
+        return Z_TO_Y_MATRIX @ np.asarray(matrix, dtype=np.float64).reshape(4, 4) @ Y_TO_Z_MATRIX
 
     @staticmethod
     def _fmt(value: float) -> str:
