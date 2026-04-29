@@ -460,7 +460,7 @@ class ViewportWidget(QWidget):
         if self._last_bounds:
             extent = float(self._last_bounds.get("extent", 1.0))
         scale = max(self._camera.radius * 0.0018, extent * 0.003, 0.005)
-        delta = (-dx * right + dy * up) * scale
+        delta = (dx * right - dy * up) * scale
         target = self._physics_grab_target_start + delta
 
         now = time.monotonic()
