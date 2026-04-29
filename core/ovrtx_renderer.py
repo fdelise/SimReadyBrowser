@@ -335,12 +335,12 @@ def Scope "SimReadyStageSettings"
         int[] faceVertexIndices = [0, 1, 2, 3, 0, 3, 5, 4, 1, 4, 5, 2, 0, 4, 1, 3, 2, 5]
         rel material:binding = </SimReadyReview/Materials/RampMat>
         point3f[] points = [
-            (-3.25, -2.0, 0.0),
-            (3.25, -2.0, 0.0),
-            (3.25, 2.0, 0.0),
-            (-3.25, 2.0, 0.0),
-            (3.25, -2.0, 1.25),
-            (3.25, 2.0, 1.25)
+            (-1.7, -1.1, 0.0),
+            (1.7, -1.1, 0.0),
+            (1.7, 1.1, 0.0),
+            (-1.7, 1.1, 0.0),
+            (1.7, -1.1, 1.9),
+            (1.7, 1.1, 1.9)
         ]
         matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, {HIDDEN_BASE_Z}, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]

@@ -23,8 +23,11 @@ class PhysicsWorker:
         self._usd_handle = None
         self._pose_binding = None
         self._velocity_binding = None
+        self._wrench_binding = None
         self._pose_buffer: Optional[np.ndarray] = None
         self._velocity_buffer: Optional[np.ndarray] = None
+        self._wrench_buffer: Optional[np.ndarray] = None
+        self._magnet: Optional[dict] = None
 
     def run(self) -> None:
         for line in sys.stdin:
@@ -40,6 +43,10 @@ class PhysicsWorker:
                     self.step(float(message.get("dt", 1.0 / 60.0)), float(message.get("time", 0.0)))
                 elif cmd == "set_pose":
                     self.set_pose(message.get("pose", []), bool(message.get("zero_velocity", True)))
+                elif cmd == "set_magnet":
+                    self.set_magnet(message)
+                elif cmd == "release_magnet":
+                    self.release_magnet(message.get("velocity", []), message.get("angular_velocity", []))
                 elif cmd == "shutdown":
                     self.shutdown()
                     self._emit({"type": "stopped"})
@@ -77,12 +84,20 @@ class PhysicsWorker:
             self._velocity_binding = None
             self._velocity_buffer = None
 
+        try:
+            self._wrench_binding = self._create_tensor_binding(TensorType.RIGID_BODY_WRENCH)
+            self._wrench_buffer = np.zeros(self._wrench_binding.shape, dtype=np.float32)
+        except Exception:
+            self._wrench_binding = None
+            self._wrench_buffer = None
+
         self._emit({"type": "started"})
         self._emit_pose()
 
     def step(self, dt: float, sim_time: float) -> None:
         if self._physx is None:
             raise RuntimeError("Physics scene is not started")
+        self._apply_magnet(max(float(dt), 1.0e-5))
         step_sync = getattr(self._physx, "step_sync", None)
         if callable(step_sync):
             try:
@@ -105,8 +120,50 @@ class PhysicsWorker:
             self._velocity_binding.write(self._velocity_buffer)
         self._emit_pose()
 
+    def set_magnet(self, message: dict) -> None:
+        target = np.array(message.get("target", []), dtype=np.float32)
+        anchor = np.array(message.get("anchor", []), dtype=np.float32)
+        target_velocity = np.array(message.get("target_velocity", [0.0, 0.0, 0.0]), dtype=np.float32)
+        if target.size != 3 or anchor.size != 3:
+            self._magnet = None
+            self._clear_wrench()
+            return
+        if target_velocity.size != 3:
+            target_velocity = np.zeros(3, dtype=np.float32)
+
+        self._magnet = {
+            "target": target.reshape(3),
+            "anchor": anchor.reshape(3),
+            "target_velocity": target_velocity.reshape(3),
+            "stiffness": float(message.get("stiffness", 520.0)),
+            "damping": float(message.get("damping", 62.0)),
+            "max_force": float(message.get("max_force", 3200.0)),
+        }
+
+    def release_magnet(self, velocity, angular_velocity=None) -> None:
+        self._magnet = None
+        self._clear_wrench()
+
+        if self._velocity_binding is None or self._velocity_buffer is None:
+            return
+
+        linear = np.array(velocity, dtype=np.float32)
+        angular = np.array(angular_velocity if angular_velocity is not None else [], dtype=np.float32)
+        if linear.size != 3:
+            linear = np.zeros(3, dtype=np.float32)
+        if angular.size != 3:
+            angular = np.zeros(3, dtype=np.float32)
+
+        self._velocity_buffer.fill(0.0)
+        if self._velocity_buffer.shape[-1] >= 3:
+            self._velocity_buffer[0, 0:3] = self._clamp_vector(linear.reshape(3), 18.0)
+        if self._velocity_buffer.shape[-1] >= 6:
+            self._velocity_buffer[0, 3:6] = self._clamp_vector(angular.reshape(3), 18.0)
+        self._velocity_binding.write(self._velocity_buffer)
+
     def shutdown(self) -> None:
-        for name in ("_pose_binding", "_velocity_binding"):
+        self._magnet = None
+        for name in ("_pose_binding", "_velocity_binding", "_wrench_binding"):
             binding = getattr(self, name)
             if binding is not None:
                 try:
@@ -117,6 +174,7 @@ class PhysicsWorker:
 
         self._pose_buffer = None
         self._velocity_buffer = None
+        self._wrench_buffer = None
 
         if self._physx is not None:
             try:
@@ -154,6 +212,88 @@ class PhysicsWorker:
             return
         self._pose_binding.read(self._pose_buffer)
         self._emit({"type": "pose", "pose": self._pose_buffer[0].astype(float).tolist()})
+
+    def _apply_magnet(self, dt: float) -> None:
+        if self._magnet is None or self._pose_binding is None or self._pose_buffer is None:
+            return
+
+        self._pose_binding.read(self._pose_buffer)
+        pose = np.array(self._pose_buffer[0, :], dtype=np.float32)
+        position = pose[:3]
+        rotation = self._row_rotation_from_quat_xyzw(pose[3:7])
+
+        anchor_local = self._magnet["anchor"]
+        anchor_world = position + anchor_local @ rotation
+        target = self._magnet["target"]
+        target_velocity = self._magnet["target_velocity"]
+
+        linear_velocity = np.zeros(3, dtype=np.float32)
+        angular_velocity = np.zeros(3, dtype=np.float32)
+        if self._velocity_binding is not None and self._velocity_buffer is not None:
+            self._velocity_binding.read(self._velocity_buffer)
+            if self._velocity_buffer.shape[-1] >= 3:
+                linear_velocity = np.array(self._velocity_buffer[0, 0:3], dtype=np.float32)
+            if self._velocity_buffer.shape[-1] >= 6:
+                angular_velocity = np.array(self._velocity_buffer[0, 3:6], dtype=np.float32)
+
+        lever = anchor_world - position
+        point_velocity = linear_velocity + np.cross(angular_velocity, lever)
+        offset = target - anchor_world
+        force = (
+            offset * float(self._magnet["stiffness"])
+            + (target_velocity - point_velocity) * float(self._magnet["damping"])
+        )
+        force = self._clamp_vector(force, float(self._magnet["max_force"]))
+
+        if self._wrench_binding is not None and self._wrench_buffer is not None:
+            self._wrench_buffer.fill(0.0)
+            self._wrench_buffer[0, 0:3] = force
+            self._wrench_buffer[0, 6:9] = anchor_world
+            self._wrench_binding.write(self._wrench_buffer)
+            return
+
+        if self._velocity_binding is not None and self._velocity_buffer is not None:
+            desired_linear = linear_velocity + force * (dt / 10.0)
+            desired_angular = angular_velocity + np.cross(lever, force) * (dt / 4.0)
+            self._velocity_buffer.fill(0.0)
+            self._velocity_buffer[0, 0:3] = self._clamp_vector(desired_linear, 12.0)
+            if self._velocity_buffer.shape[-1] >= 6:
+                self._velocity_buffer[0, 3:6] = self._clamp_vector(desired_angular, 12.0)
+            self._velocity_binding.write(self._velocity_buffer)
+
+    def _clear_wrench(self) -> None:
+        if self._wrench_binding is None or self._wrench_buffer is None:
+            return
+        self._wrench_buffer.fill(0.0)
+        try:
+            self._wrench_binding.write(self._wrench_buffer)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _row_rotation_from_quat_xyzw(quat: np.ndarray) -> np.ndarray:
+        x, y, z, w = [float(v) for v in quat[:4]]
+        norm = float(np.linalg.norm([x, y, z, w]))
+        if norm < 1.0e-9:
+            return np.eye(3, dtype=np.float32)
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        col = np.array(
+            [
+                [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w],
+                [2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w],
+                [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y],
+            ],
+            dtype=np.float32,
+        )
+        return col.T
+
+    @staticmethod
+    def _clamp_vector(vector: np.ndarray, limit: float) -> np.ndarray:
+        arr = np.array(vector, dtype=np.float32).reshape(3)
+        norm = float(np.linalg.norm(arr))
+        if norm > max(float(limit), 1.0e-6):
+            arr *= float(limit) / norm
+        return arr
 
     @staticmethod
     def _emit(message: dict) -> None:

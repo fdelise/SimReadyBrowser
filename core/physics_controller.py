@@ -68,6 +68,7 @@ class PhysicsController(QObject):
         self._scene_path: Optional[Path] = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._base_scene = "plane"
+        self._pending_magnet: Optional[dict] = None
 
     @property
     def status_text(self) -> str:
@@ -87,6 +88,7 @@ class PhysicsController(QObject):
 
     def configure_asset(self, bounds: dict) -> None:
         self.shutdown()
+        self._pending_magnet = None
         self._bounds = self._normalize_bounds(bounds)
         self._center = np.array(self._bounds["center"], dtype=np.float64)
         self._size = np.array(self._bounds["size"], dtype=np.float64)
@@ -96,6 +98,7 @@ class PhysicsController(QObject):
     def clear_asset(self) -> None:
         self.shutdown()
         self._bounds = None
+        self._pending_magnet = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._set_status("Load an asset, then use Play or Restart physics.")
 
@@ -182,6 +185,62 @@ class PhysicsController(QObject):
             self._send({"cmd": "set_pose", "pose": pose.tolist(), "zero_velocity": bool(zero_velocity)})
         self.pose_changed.emit(np.array(visual, dtype=np.float64, copy=True))
 
+    def begin_magnet(
+        self,
+        anchor_local_visual: np.ndarray,
+        target_visual: np.ndarray,
+        target_velocity_visual: Optional[np.ndarray] = None,
+    ) -> bool:
+        if self._bounds is None:
+            self._set_status("Load an asset before grabbing physics.")
+            return False
+
+        message = self._magnet_message(anchor_local_visual, target_visual, target_velocity_visual)
+        self._pending_magnet = message
+
+        if self._process is None:
+            if not self.restart(visual_transform=self._current_visual_transform, play=True):
+                return False
+            self._pending_magnet = message
+            self._set_status("Starting physics grab...")
+            return True
+
+        if not self._worker_ready:
+            self._pending_play = True
+            self._set_status("Starting physics grab...")
+            return True
+
+        self._send(message)
+        self.set_playing(True)
+        self._set_status("Physics grab active.")
+        return True
+
+    def update_magnet(self, target_visual: np.ndarray, target_velocity_visual: Optional[np.ndarray] = None) -> None:
+        if self._pending_magnet is None:
+            return
+        self._pending_magnet["target"] = self._point_z_to_y(target_visual).astype(float).tolist()
+        self._pending_magnet["target_velocity"] = self._vector_z_to_y(
+            np.zeros(3, dtype=np.float64) if target_velocity_visual is None else target_velocity_visual
+        ).astype(float).tolist()
+        if self._worker_ready:
+            self._send(self._pending_magnet)
+
+    def end_magnet(self, throw_velocity_visual: Optional[np.ndarray] = None) -> None:
+        self._pending_magnet = None
+        velocity = self._vector_z_to_y(
+            np.zeros(3, dtype=np.float64) if throw_velocity_visual is None else throw_velocity_visual
+        )
+        if self._worker_ready:
+            self._send(
+                {
+                    "cmd": "release_magnet",
+                    "velocity": velocity.astype(float).tolist(),
+                    "angular_velocity": [0.0, 0.0, 0.0],
+                }
+            )
+            self.set_playing(True)
+        self._set_status("Physics grab released.")
+
     def shutdown(self) -> None:
         self._release_scene()
 
@@ -250,6 +309,8 @@ class PhysicsController(QObject):
         if kind == "started":
             self._worker_ready = True
             self._set_status("Physics reset and ready.")
+            if self._pending_magnet is not None:
+                self._send(self._pending_magnet)
             if self._pending_play:
                 self.set_playing(True)
             if self._pending_step_after_start:
@@ -297,6 +358,7 @@ class PhysicsController(QObject):
     def _release_scene(self) -> None:
         if self._timer.isActive():
             self._timer.stop()
+        self._pending_magnet = None
         self._pending_play = False
         self._pending_step_after_start = False
         self._step_in_flight = False
@@ -354,6 +416,27 @@ class PhysicsController(QObject):
         pose[:3] = body[3, :3].astype(np.float32)
         pose[3:] = quat.astype(np.float32)
         return pose
+
+    def _magnet_message(
+        self,
+        anchor_local_visual: np.ndarray,
+        target_visual: np.ndarray,
+        target_velocity_visual: Optional[np.ndarray],
+    ) -> dict:
+        target_velocity = (
+            np.zeros(3, dtype=np.float64)
+            if target_velocity_visual is None
+            else np.asarray(target_velocity_visual, dtype=np.float64)
+        )
+        return {
+            "cmd": "set_magnet",
+            "anchor": self._vector_z_to_y(anchor_local_visual).astype(float).tolist(),
+            "target": self._point_z_to_y(target_visual).astype(float).tolist(),
+            "target_velocity": self._vector_z_to_y(target_velocity).astype(float).tolist(),
+            "stiffness": 520.0,
+            "damping": 62.0,
+            "max_force": 3200.0,
+        }
 
     def _write_proxy_scene(self, body_matrix: np.ndarray) -> Path:
         temp_dir = Path(tempfile.gettempdir()) / "simready_browser_physx"
@@ -450,12 +533,12 @@ def Xform "World" (
     }}"""
 
     def _ramp_usda(self) -> str:
-        angle = math.radians(14.0)
+        angle = math.radians(34.0)
         return f"""    def Xform "Ramp" (
         prepend apiSchemas = ["PhysicsCollisionAPI"]
     )
     {{
-        double3 xformOp:translate = (0, 0.62, 0)
+        double3 xformOp:translate = (0, 0.96, 0)
         quatd xformOp:orient = ({self._fmt(math.cos(angle * 0.5))}, 0, 0, {self._fmt(math.sin(angle * 0.5))})
         double3 xformOp:scale = (1, 1, 1)
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
@@ -466,7 +549,7 @@ def Xform "World" (
         {{
             float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
-            double3 xformOp:scale = (6.5, 0.24, 4.0)
+            double3 xformOp:scale = (3.4, 0.22, 2.2)
             uniform token[] xformOpOrder = ["xformOp:scale"]
         }}
     }}"""
@@ -583,6 +666,14 @@ def Xform "World" (
     @staticmethod
     def _y_to_z_matrix(matrix: np.ndarray) -> np.ndarray:
         return Z_TO_Y_MATRIX @ np.asarray(matrix, dtype=np.float64).reshape(4, 4) @ Y_TO_Z_MATRIX
+
+    @staticmethod
+    def _vector_z_to_y(vector: np.ndarray) -> np.ndarray:
+        return np.asarray(vector, dtype=np.float64).reshape(3) @ Z_TO_Y_ROTATION
+
+    @staticmethod
+    def _point_z_to_y(point: np.ndarray) -> np.ndarray:
+        return np.asarray(point, dtype=np.float64).reshape(3) @ Z_TO_Y_ROTATION
 
     @staticmethod
     def _fmt(value: float) -> str:

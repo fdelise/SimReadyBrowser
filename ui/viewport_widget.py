@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -50,9 +51,13 @@ class ViewportWidget(QWidget):
         self._physics.running_changed.connect(self.physics_running_changed)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
         self._physics_grabbing = False
-        self._physics_resume_after_grab = False
         self._physics_drag_start: Optional[QPoint] = None
         self._physics_drag_matrix = np.eye(4, dtype=np.float64)
+        self._physics_grab_anchor = np.zeros(3, dtype=np.float64)
+        self._physics_grab_target_start = np.zeros(3, dtype=np.float64)
+        self._physics_grab_last_target = np.zeros(3, dtype=np.float64)
+        self._physics_grab_last_time = 0.0
+        self._physics_grab_velocity = np.zeros(3, dtype=np.float64)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -408,7 +413,7 @@ class ViewportWidget(QWidget):
         self._canvas.set_overlay_text(
             "Select an asset from the browser to load it\n\n"
             "Alt+LMB - Tumble   |   Alt+MMB - Pan   |   Alt+RMB - Dolly\n"
-            "RMB - Look   |   WASD/QE - Fly   |   Shift+LMB - Pull   |   F - Frame"
+            "RMB - Look   |   WASD/QE - Fly   |   Shift+LMB - Grab   |   F - Frame"
         )
 
     def _hide_hint(self) -> None:
@@ -424,13 +429,23 @@ class ViewportWidget(QWidget):
             return False
 
         self._physics_grabbing = True
-        self._physics_resume_after_grab = self._physics.is_running
-        self._physics.set_playing(False)
         self._physics_drag_start = event.pos()
         self._physics_drag_matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True)
+        self._physics_grab_anchor = self._select_grab_anchor(event.pos())
+        self._physics_grab_target_start = self._anchor_world(self._physics_drag_matrix, self._physics_grab_anchor)
+        self._physics_grab_last_target = np.array(self._physics_grab_target_start, dtype=np.float64, copy=True)
+        self._physics_grab_last_time = time.monotonic()
+        self._physics_grab_velocity = np.zeros(3, dtype=np.float64)
+        if not self._physics.begin_magnet(
+            self._physics_grab_anchor,
+            self._physics_grab_target_start,
+            self._physics_grab_velocity,
+        ):
+            self._physics_grabbing = False
+            return False
         self.setFocus()
         self._canvas.setFocus()
-        self._on_physics_status("Magnet attached. Release Shift-drag to drop.")
+        self._on_physics_status("Grabbed a physics corner. Drag to lift; flick and release to throw.")
         event.accept()
         return True
 
@@ -446,9 +461,18 @@ class ViewportWidget(QWidget):
             extent = float(self._last_bounds.get("extent", 1.0))
         scale = max(self._camera.radius * 0.0018, extent * 0.003, 0.005)
         delta = (-dx * right + dy * up) * scale
-        matrix = np.array(self._physics_drag_matrix, dtype=np.float64, copy=True)
-        matrix[3, :3] += delta
-        self._physics.set_visual_transform(matrix, zero_velocity=True)
+        target = self._physics_grab_target_start + delta
+
+        now = time.monotonic()
+        dt = max(now - self._physics_grab_last_time, 1.0 / 120.0)
+        raw_velocity = (target - self._physics_grab_last_target) / dt
+        self._physics_grab_velocity = self._clamp_vector(
+            self._physics_grab_velocity * 0.55 + raw_velocity * 0.45,
+            14.0,
+        )
+        self._physics_grab_last_target = np.array(target, dtype=np.float64, copy=True)
+        self._physics_grab_last_time = now
+        self._physics.update_magnet(target, self._physics_grab_velocity)
 
     def _finish_physics_grab(self, drop: bool, pos: Optional[QPoint] = None) -> None:
         if pos is not None:
@@ -461,16 +485,70 @@ class ViewportWidget(QWidget):
         self._active_mode = None
 
         if drop:
-            self._physics.set_visual_transform(self._physics_current_transform, zero_velocity=True)
-            dropped = True
-            if self._physics.has_scene:
-                self._physics.set_playing(True)
-            else:
-                dropped = self._physics.restart(visual_transform=self._physics_current_transform, play=True)
-            if dropped:
-                self._on_physics_status("Dropped asset into physics.")
-        elif self._physics_resume_after_grab:
-            self._physics.set_playing(True)
+            self._physics.end_magnet(self._physics_grab_velocity)
+            self._on_physics_status("Released asset into physics.")
+        else:
+            self._physics.end_magnet(np.zeros(3, dtype=np.float64))
+
+    def _select_grab_anchor(self, pos: QPoint) -> np.ndarray:
+        size = np.ones(3, dtype=np.float64)
+        if self._last_bounds:
+            try:
+                size = np.array(self._last_bounds.get("size", size), dtype=np.float64).reshape(3)
+            except Exception:
+                size = np.ones(3, dtype=np.float64)
+        half = np.maximum(np.abs(size) * 0.5, np.array([0.05, 0.05, 0.05], dtype=np.float64))
+
+        matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True).reshape(4, 4)
+        body_center = self._body_center_world(matrix)
+        right, up, _forward = self._camera._camera_axes()
+        eye_dir = self._camera.eye - body_center
+        eye_norm = max(float(np.linalg.norm(eye_dir)), 1.0e-6)
+        pointer = np.array(
+            [
+                (float(pos.x()) / max(float(self._canvas.width()), 1.0)) * 2.0 - 1.0,
+                1.0 - (float(pos.y()) / max(float(self._canvas.height()), 1.0)) * 2.0,
+            ],
+            dtype=np.float64,
+        )
+
+        best_anchor = np.array([half[0], half[1], half[2]], dtype=np.float64)
+        best_score = -1.0e9
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    anchor = np.array([sx * half[0], sy * half[1], sz * half[2]], dtype=np.float64)
+                    offset = anchor @ matrix[:3, :3]
+                    footprint = max(float(np.linalg.norm(offset)), 1.0e-6)
+                    screen_score = (np.dot(offset, right) * pointer[0] + np.dot(offset, up) * pointer[1]) / footprint
+                    facing_score = np.dot(offset, eye_dir) / (footprint * eye_norm)
+                    score = screen_score + facing_score * 0.4
+                    if score > best_score:
+                        best_score = score
+                        best_anchor = anchor
+        return best_anchor
+
+    def _anchor_world(self, matrix: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+        transform = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+        return self._body_center_world(transform) + np.asarray(anchor, dtype=np.float64).reshape(3) @ transform[:3, :3]
+
+    def _body_center_world(self, matrix: np.ndarray) -> np.ndarray:
+        transform = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+        center = np.zeros(3, dtype=np.float64)
+        if self._last_bounds:
+            try:
+                center = np.array(self._last_bounds.get("center", center), dtype=np.float64).reshape(3)
+            except Exception:
+                center = np.zeros(3, dtype=np.float64)
+        return center @ transform[:3, :3] + transform[3, :3]
+
+    @staticmethod
+    def _clamp_vector(vector: np.ndarray, limit: float) -> np.ndarray:
+        arr = np.array(vector, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(arr))
+        if norm > max(float(limit), 1.0e-6):
+            arr *= float(limit) / norm
+        return arr
 
     def _set_loading(self, active: bool, text: str = "", progress: Optional[int] = None) -> None:
         self._canvas.set_loading(False)
