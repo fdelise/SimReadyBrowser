@@ -62,7 +62,7 @@ class ControlsPanel(QWidget):
     physics_play_changed   = pyqtSignal(bool)
     physics_step_requested = pyqtSignal()
     physics_restart_requested = pyqtSignal()
-    physics_grab_changed   = pyqtSignal(bool)
+    physics_base_scene_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -185,13 +185,30 @@ class ControlsPanel(QWidget):
         )
         lay.addWidget(self._physics_status)
 
+        scene_row = QHBoxLayout()
+        scene_label = QLabel("Base:")
+        scene_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        scene_row.addWidget(scene_label)
+
+        self._physics_base_scene = QComboBox()
+        self._physics_base_scene.addItem("Plane", "plane")
+        self._physics_base_scene.addItem("Ramp", "ramp")
+        self._physics_base_scene.addItem("Obstacles", "obstacles")
+        self._physics_base_scene.currentIndexChanged.connect(
+            lambda _idx: self.physics_base_scene_changed.emit(self._physics_base_scene.currentData())
+        )
+        scene_row.addWidget(self._physics_base_scene, 1)
+
+        scene_widget = QWidget()
+        scene_widget.setStyleSheet("background: transparent;")
+        scene_widget.setLayout(scene_row)
+        lay.addWidget(scene_widget)
+
         self._physics_play = QCheckBox("Play physics")
         self._physics_play.toggled.connect(self.physics_play_changed)
         lay.addWidget(self._physics_play)
-
-        self._physics_grab = QCheckBox("Grab/drop mode")
-        self._physics_grab.toggled.connect(self.physics_grab_changed)
-        lay.addWidget(self._physics_grab)
 
         button_row = QHBoxLayout()
         restart_btn = _small_button("Restart")

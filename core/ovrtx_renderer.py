@@ -38,11 +38,19 @@ CAMERA_PATH = f"{REVIEW_ROOT}/Camera"
 DOME_LIGHT_PATH = f"{REVIEW_ROOT}/DomeLight"
 KEY_LIGHT_PATH = f"{REVIEW_ROOT}/KeyLight"
 RENDER_PRODUCT_PATH = f"{REVIEW_ROOT}/Render/Viewport"
+BASE_RAMP_PATH = f"{REVIEW_ROOT}/Ramp"
+BASE_OBSTACLE_PATHS = [
+    f"{REVIEW_ROOT}/ObstacleA",
+    f"{REVIEW_ROOT}/ObstacleB",
+    f"{REVIEW_ROOT}/ObstacleC",
+]
 DEFAULT_FRAME_BOUNDS = {"center": [0.0, 0.0, 0.0], "extent": 1.0}
 STAGE_UP_AXIS = "Z"
 STAGE_METERS_PER_UNIT = 1
 GROUND_PLANE_HALF_SIZE = 20.0
 GROUND_PLANE_Z = -0.005
+BASE_SCENES = {"plane", "ramp", "obstacles"}
+HIDDEN_BASE_Z = -10000.0
 ENABLE_OVRTX_DEBUG_BOUNDS = os.environ.get("SIMREADY_OVRTX_DEBUG_BOUNDS") == "1"
 
 
@@ -92,6 +100,7 @@ class OVRTXRenderer(QObject):
     _resolution_requested = pyqtSignal(int, int)
     _camera_transform_requested = pyqtSignal(object)
     _asset_transform_requested = pyqtSignal(object)
+    _base_scene_requested = pyqtSignal(str)
     _dome_intensity_requested = pyqtSignal(float)
     _dir_light_requested = pyqtSignal(float, float, float)
     _render_requested = pyqtSignal()
@@ -122,6 +131,8 @@ class OVRTXRenderer(QObject):
         self._asset_transform = np.eye(4, dtype=np.float64)
         self._asset_transform_dirty = True
         self._asset_transform_warning_shown = False
+        self._base_scene = "plane"
+        self._base_scene_dirty = True
         self._dome_intensity = 1.0
         self._dir_intensity = 0.8
         self._dir_azimuth = 45.0
@@ -140,6 +151,7 @@ class OVRTXRenderer(QObject):
         self._resolution_requested.connect(self._set_resolution, Qt.QueuedConnection)
         self._camera_transform_requested.connect(self._set_camera_transform, Qt.QueuedConnection)
         self._asset_transform_requested.connect(self._set_asset_transform, Qt.QueuedConnection)
+        self._base_scene_requested.connect(self._set_base_scene, Qt.QueuedConnection)
         self._dome_intensity_requested.connect(self._set_dome_intensity, Qt.QueuedConnection)
         self._dir_light_requested.connect(self._set_directional_light, Qt.QueuedConnection)
         self._render_requested.connect(self._render_one, Qt.QueuedConnection)
@@ -166,6 +178,11 @@ class OVRTXRenderer(QObject):
         if self._shutdown_started:
             return
         self._asset_transform_requested.emit(np.array(matrix, dtype=np.float64, copy=True))
+
+    def set_base_scene(self, scene_id: str) -> None:
+        if self._shutdown_started:
+            return
+        self._base_scene_requested.emit(str(scene_id or "plane"))
 
     def set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
@@ -251,6 +268,7 @@ class OVRTXRenderer(QObject):
             self._asset_transform = np.eye(4, dtype=np.float64)
             self._asset_transform_dirty = True
             self._asset_transform_warning_shown = False
+            self._base_scene_dirty = True
             self.loading_started.emit(f"Loading {display_name} in OVRTX...")
             self.loading_progress.emit(5, "Preparing OVRTX stage...")
             self.status_changed.emit(f"Loading {display_name}...")
@@ -273,6 +291,7 @@ class OVRTXRenderer(QObject):
             self.loading_progress.emit(72, "Applying viewport settings...")
             self._apply_resolution()
             self._apply_asset_transform()
+            self._apply_base_scene()
             self._apply_dome_light()
             self._apply_directional_light()
 
@@ -305,6 +324,68 @@ def Scope "SimReadyStageSettings"
 }}
 """
 
+    def _base_visual_layer(self) -> str:
+        return f"""
+    def Mesh "Ramp" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {{
+        uniform bool doubleSided = true
+        int[] faceVertexCounts = [4, 4, 4, 3, 3]
+        int[] faceVertexIndices = [0, 1, 2, 3, 0, 3, 5, 4, 1, 4, 5, 2, 0, 4, 1, 3, 2, 5]
+        rel material:binding = </SimReadyReview/Materials/RampMat>
+        point3f[] points = [
+            (-3.25, -2.0, 0.0),
+            (3.25, -2.0, 0.0),
+            (3.25, 2.0, 0.0),
+            (-3.25, 2.0, 0.0),
+            (3.25, -2.0, 1.25),
+            (3.25, 2.0, 1.25)
+        ]
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, {HIDDEN_BASE_Z}, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+        uniform token subdivisionScheme = "none"
+    }}
+
+{self._base_box_mesh("ObstacleA")}
+
+{self._base_box_mesh("ObstacleB")}
+
+{self._base_box_mesh("ObstacleC")}
+"""
+
+    @staticmethod
+    def _base_box_mesh(name: str) -> str:
+        return f"""    def Mesh "{name}" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {{
+        uniform bool doubleSided = true
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [
+            0, 1, 2, 3,
+            4, 7, 6, 5,
+            0, 4, 5, 1,
+            1, 5, 6, 2,
+            2, 6, 7, 3,
+            3, 7, 4, 0
+        ]
+        rel material:binding = </SimReadyReview/Materials/ObstacleMat>
+        point3f[] points = [
+            (-0.5, -0.5, -0.5),
+            (0.5, -0.5, -0.5),
+            (0.5, 0.5, -0.5),
+            (-0.5, 0.5, -0.5),
+            (-0.5, -0.5, 0.5),
+            (0.5, -0.5, 0.5),
+            (0.5, 0.5, 0.5),
+            (-0.5, 0.5, 0.5)
+        ]
+        matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, {HIDDEN_BASE_Z}, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+        uniform token subdivisionScheme = "none"
+    }}"""
+
     def _review_layer(self) -> str:
         return f"""#usda 1.0
 (
@@ -330,6 +411,34 @@ def Xform "SimReadyReview"
                 token outputs:surface
             }}
         }}
+
+        def Material "RampMat"
+        {{
+            token outputs:surface.connect = </SimReadyReview/Materials/RampMat/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {{
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.48, 0.50, 0.47)
+                float inputs:metallic = 0
+                float inputs:roughness = 0.78
+                token outputs:surface
+            }}
+        }}
+
+        def Material "ObstacleMat"
+        {{
+            token outputs:surface.connect = </SimReadyReview/Materials/ObstacleMat/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {{
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.30, 0.36, 0.34)
+                float inputs:metallic = 0
+                float inputs:roughness = 0.8
+                token outputs:surface
+            }}
+        }}
     }}
 
     def Mesh "GroundPlane" (
@@ -349,6 +458,8 @@ def Xform "SimReadyReview"
         ]
         uniform token subdivisionScheme = "none"
     }}
+
+{self._base_visual_layer()}
 
     def Camera "Camera"
     {{
@@ -425,6 +536,16 @@ def Xform "SimReadyReview"
         self._asset_transform_dirty = True
         self._apply_asset_transform()
 
+    def _set_base_scene(self, scene_id: str) -> None:
+        if self._shutdown_started:
+            return
+        scene = str(scene_id or "plane").lower()
+        if scene not in BASE_SCENES:
+            scene = "plane"
+        self._base_scene = scene
+        self._base_scene_dirty = True
+        self._apply_base_scene()
+
     def _set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
             return
@@ -481,6 +602,53 @@ def Xform "SimReadyReview"
             if not self._asset_transform_warning_shown:
                 self._asset_transform_warning_shown = True
                 self.status_changed.emit(f"Asset transform update skipped: {exc}")
+
+    def _apply_base_scene(self) -> None:
+        if not self._renderer or not self._stage_loaded:
+            return
+
+        ramp_transform = self._hidden_base_transform()
+        obstacle_transforms = [self._hidden_base_transform() for _ in BASE_OBSTACLE_PATHS]
+
+        if self._base_scene == "ramp":
+            ramp_transform = np.eye(4, dtype=np.float64)
+        elif self._base_scene == "obstacles":
+            obstacle_transforms = [
+                self._box_transform((-2.4, -1.4, 0.35), (1.2, 1.2, 0.7)),
+                self._box_transform((1.8, 1.2, 0.6), (1.0, 1.6, 1.2)),
+                self._box_transform((0.0, -2.8, 0.25), (2.0, 0.6, 0.5)),
+            ]
+
+        try:
+            paths = [BASE_RAMP_PATH] + BASE_OBSTACLE_PATHS
+            transforms = [ramp_transform] + obstacle_transforms
+            for path, transform in zip(paths, transforms):
+                self._renderer.write_attribute(
+                    prim_paths=[path],
+                    attribute_name="omni:xform",
+                    tensor=np.array(transform, dtype=np.float64, copy=True).reshape(1, 4, 4),
+                    semantic=Semantic.XFORM_MAT4x4,
+                    prim_mode=PrimMode.MUST_EXIST,
+                )
+            self._base_scene_dirty = False
+        except Exception as exc:
+            self._base_scene_dirty = False
+            self.status_changed.emit(f"Base scene visual update skipped: {exc}")
+
+    @staticmethod
+    def _hidden_base_transform() -> np.ndarray:
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[3, :3] = [0.0, 0.0, HIDDEN_BASE_Z]
+        return matrix
+
+    @staticmethod
+    def _box_transform(center: tuple[float, float, float], size: tuple[float, float, float]) -> np.ndarray:
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[0, 0] = float(size[0])
+        matrix[1, 1] = float(size[1])
+        matrix[2, 2] = float(size[2])
+        matrix[3, :3] = [float(center[0]), float(center[1]), float(center[2])]
+        return matrix
 
     def _apply_dome_light(self) -> None:
         if not self._renderer or not self._stage_loaded:
@@ -871,6 +1039,8 @@ def Xform "SimReadyReview"
                 self._apply_camera()
             if self._asset_transform_dirty:
                 self._apply_asset_transform()
+            if self._base_scene_dirty:
+                self._apply_base_scene()
 
             t0 = time.perf_counter()
             products = self._renderer.step(

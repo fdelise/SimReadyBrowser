@@ -23,6 +23,7 @@ GROUND_HALF_SIZE = 20.0
 GROUND_THICKNESS = 0.05
 GROUND_TOP_Z = 0.0
 DEFAULT_DT = 1.0 / 60.0
+BASE_SCENES = {"plane", "ramp", "obstacles"}
 
 Z_TO_Y_ROTATION = np.array(
     [
@@ -66,6 +67,7 @@ class PhysicsController(QObject):
         self._status_text = "Load an asset, then use Play or Restart physics."
         self._scene_path: Optional[Path] = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
+        self._base_scene = "plane"
 
     @property
     def status_text(self) -> str:
@@ -151,6 +153,26 @@ class PhysicsController(QObject):
             return
         self.set_playing(False)
         self._send_step()
+
+    def set_base_scene(self, scene_id: str) -> None:
+        scene = str(scene_id or "plane").lower()
+        if scene not in BASE_SCENES:
+            scene = "plane"
+        if scene == self._base_scene:
+            return
+
+        self._base_scene = scene
+        if self._bounds is None:
+            self._set_status(f"Physics base set to {scene}.")
+            return
+
+        active = self._process is not None
+        was_running = self._running or self._pending_play
+        visual = np.array(self._current_visual_transform, dtype=np.float64, copy=True)
+        if active:
+            self.restart(visual_transform=visual, play=was_running)
+        else:
+            self._set_status(f"Physics base set to {scene}.")
 
     def set_visual_transform(self, matrix: np.ndarray, zero_velocity: bool = True) -> None:
         visual = np.array(matrix, dtype=np.float64, copy=True)
@@ -340,9 +362,9 @@ class PhysicsController(QObject):
 
         size_z = np.maximum(self._size, np.array([0.05, 0.05, 0.05], dtype=np.float64))
         size_y = np.array([size_z[0], size_z[2], size_z[1]], dtype=np.float64)
-        ground_y = -GROUND_THICKNESS * 0.5
         body_pos = body_matrix[3, :3]
         body_quat = self._quat_xyzw_from_row_rotation(body_matrix[:3, :3])
+        base_scene = self._base_scene_usda()
 
         text = f"""#usda 1.0
 (
@@ -386,7 +408,29 @@ def Xform "World" (
         }}
     }}
 
-    def Xform "Ground" (
+{base_scene}
+}}
+"""
+        self._scene_path.write_text(text, encoding="utf-8")
+        return self._scene_path
+
+    def _base_scene_usda(self) -> str:
+        parts = [self._ground_usda()]
+        if self._base_scene == "ramp":
+            parts.append(self._ramp_usda())
+        elif self._base_scene == "obstacles":
+            parts.extend(
+                [
+                    self._box_usda("ObstacleA", (-2.4, 0.35, 1.4), (1.2, 0.7, 1.2)),
+                    self._box_usda("ObstacleB", (1.8, 0.6, -1.2), (1.0, 1.2, 1.6)),
+                    self._box_usda("ObstacleC", (0.0, 0.25, 2.8), (2.0, 0.5, 0.6)),
+                ]
+            )
+        return "\n".join(parts)
+
+    def _ground_usda(self) -> str:
+        ground_y = -GROUND_THICKNESS * 0.5
+        return f"""    def Xform "Ground" (
         prepend apiSchemas = ["PhysicsCollisionAPI"]
     )
     {{
@@ -403,11 +447,51 @@ def Xform "World" (
             double3 xformOp:scale = ({self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_THICKNESS)}, {self._fmt(GROUND_HALF_SIZE * 2.0)})
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
         }}
-    }}
-}}
-"""
-        self._scene_path.write_text(text, encoding="utf-8")
-        return self._scene_path
+    }}"""
+
+    def _ramp_usda(self) -> str:
+        angle = math.radians(14.0)
+        return f"""    def Xform "Ramp" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {{
+        double3 xformOp:translate = (0, 0.62, 0)
+        quatd xformOp:orient = ({self._fmt(math.cos(angle * 0.5))}, 0, 0, {self._fmt(math.sin(angle * 0.5))})
+        double3 xformOp:scale = (1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Cube "RampGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:scale = (6.5, 0.24, 4.0)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+        }}
+    }}"""
+
+    def _box_usda(self, name: str, translate: tuple[float, float, float], scale: tuple[float, float, float]) -> str:
+        tx, ty, tz = translate
+        sx, sy, sz = scale
+        return f"""    def Xform "{name}" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {{
+        double3 xformOp:translate = ({self._fmt(tx)}, {self._fmt(ty)}, {self._fmt(tz)})
+        double3 xformOp:scale = (1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+
+        def Cube "Geom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:scale = ({self._fmt(sx)}, {self._fmt(sy)}, {self._fmt(sz)})
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+        }}
+    }}"""
 
     def _set_status(self, text: str) -> None:
         self._status_text = text

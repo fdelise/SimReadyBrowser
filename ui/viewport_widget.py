@@ -41,6 +41,7 @@ class ViewportWidget(QWidget):
         self._renderer = None
         self._pending_dome_intensity = 1.0
         self._pending_dir_light = (0.8, 45.0, 60.0)
+        self._pending_base_scene = "plane"
         self._load_generation = 0
         self._loading_asset = False
         self._physics = PhysicsController(self)
@@ -48,7 +49,6 @@ class ViewportWidget(QWidget):
         self._physics.status_changed.connect(self._on_physics_status)
         self._physics.running_changed.connect(self.physics_running_changed)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
-        self._physics_grab_enabled = False
         self._physics_grabbing = False
         self._physics_resume_after_grab = False
         self._physics_drag_start: Optional[QPoint] = None
@@ -134,14 +134,12 @@ class ViewportWidget(QWidget):
     def step_physics(self) -> None:
         self._physics.step_once()
 
-    def set_physics_grab_enabled(self, enabled: bool) -> None:
-        self._physics_grab_enabled = bool(enabled)
-        if enabled:
-            self._on_physics_status("Grab/drop mode enabled. Drag the asset, then release to drop.")
-        elif self._physics_grabbing:
-            self._finish_physics_grab(drop=True)
-        else:
-            self._on_physics_status(self._physics.status_text)
+    def set_physics_base_scene(self, scene_id: str) -> None:
+        self._pending_base_scene = str(scene_id or "plane")
+        self._physics.set_base_scene(self._pending_base_scene)
+        if self._renderer:
+            self._renderer.set_base_scene(self._pending_base_scene)
+            self._renderer.request_render()
 
     def shutdown(self, timeout_ms: int = 20000) -> bool:
         self._load_generation += 1
@@ -202,6 +200,7 @@ class ViewportWidget(QWidget):
         renderer.set_camera_transform(self._camera.get_transform())
         renderer.set_dome_intensity(self._pending_dome_intensity)
         renderer.set_directional_light(*self._pending_dir_light)
+        renderer.set_base_scene(self._pending_base_scene)
 
         self._renderer = renderer
         return renderer
@@ -365,6 +364,13 @@ class ViewportWidget(QWidget):
 
         super().keyPressEvent(event)
 
+    def keyReleaseEvent(self, event) -> None:
+        if event.key() == Qt.Key_Shift and self._physics_grabbing:
+            self._finish_physics_grab(drop=True)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._position_loading_overlay()
@@ -393,22 +399,28 @@ class ViewportWidget(QWidget):
             if event.type() == QEvent.KeyPress:
                 self.keyPressEvent(event)
                 return True
+            if event.type() == QEvent.KeyRelease:
+                self.keyReleaseEvent(event)
+                return True
         return super().eventFilter(obj, event)
 
     def _show_hint(self) -> None:
         self._canvas.set_overlay_text(
             "Select an asset from the browser to load it\n\n"
             "Alt+LMB - Tumble   |   Alt+MMB - Pan   |   Alt+RMB - Dolly\n"
-            "RMB - Look   |   WASD/QE - Fly   |   Wheel - Dolly   |   F - Frame"
+            "RMB - Look   |   WASD/QE - Fly   |   Shift+LMB - Pull   |   F - Frame"
         )
 
     def _hide_hint(self) -> None:
         self._canvas.set_overlay_text("")
 
     def _try_start_physics_grab(self, event) -> bool:
-        if not self._physics_grab_enabled or self._last_bounds is None:
+        if self._last_bounds is None:
             return False
-        if event.button() != Qt.LeftButton or event.modifiers() & Qt.AltModifier:
+        if event.button() != Qt.LeftButton:
+            return False
+        modifiers = event.modifiers()
+        if not (modifiers & Qt.ShiftModifier) or modifiers & Qt.AltModifier:
             return False
 
         self._physics_grabbing = True
@@ -418,7 +430,7 @@ class ViewportWidget(QWidget):
         self._physics_drag_matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True)
         self.setFocus()
         self._canvas.setFocus()
-        self._on_physics_status("Dragging asset. Release to drop into physics.")
+        self._on_physics_status("Magnet attached. Release Shift-drag to drop.")
         event.accept()
         return True
 
