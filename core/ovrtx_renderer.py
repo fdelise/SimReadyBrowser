@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import math
 import gc
+import hashlib
 import json
 import os
 import re
+import subprocess
 import struct
+import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -45,6 +49,7 @@ BASE_OBSTACLE_PATHS = [
     f"{REVIEW_ROOT}/ObstacleC",
 ]
 COLLISION_ASSET_PATH = f"{REVIEW_ROOT}/CollisionAssetProxy"
+COLLISION_ASSET_OVERLAY_ROOT = f"{REVIEW_ROOT}/CollisionAssetOverlay"
 COLLISION_GROUND_PATH = f"{REVIEW_ROOT}/CollisionGround"
 COLLISION_RAMP_PATH = f"{REVIEW_ROOT}/CollisionRamp"
 COLLISION_OBSTACLE_PATHS = [
@@ -57,10 +62,11 @@ STAGE_UP_AXIS = "Z"
 STAGE_METERS_PER_UNIT = 1
 GROUND_PLANE_HALF_SIZE = 20.0
 GROUND_PLANE_Z = -0.005
-GROUND_COLLIDER_THICKNESS = 0.05
+GROUND_COLLIDER_THICKNESS = 0.5
 BASE_SCENES = {"plane", "ramp", "obstacles"}
 HIDDEN_BASE_Z = -10000.0
 ENABLE_OVRTX_DEBUG_BOUNDS = os.environ.get("SIMREADY_OVRTX_DEBUG_BOUNDS") == "1"
+USD_DISCOVERY_PYTHON_ENV = "SIMREADY_USD_PYTHON"
 
 
 def _ensure_ovrtx_available() -> bool:
@@ -146,8 +152,11 @@ class OVRTXRenderer(QObject):
         self._base_scene_dirty = True
         self._collision_overlay_enabled = False
         self._collision_proxy_bounds: Optional[dict] = None
+        self._collision_asset_overlay_loaded = False
+        self._collision_asset_overlay_path: Optional[Path] = None
         self._collision_overlay_dirty = True
         self._collision_overlay_warning_shown = False
+        self._current_usd_source: Optional[str] = None
         self._dome_intensity = 1.0
         self._dir_intensity = 0.8
         self._dir_azimuth = 45.0
@@ -292,9 +301,12 @@ class OVRTXRenderer(QObject):
 
         try:
             self._stage_loaded = False
+            self._current_usd_source = usd_source
             self._asset_transform = np.eye(4, dtype=np.float64)
             self._asset_transform_dirty = True
             self._asset_transform_warning_shown = False
+            self._collision_asset_overlay_loaded = False
+            self._collision_asset_overlay_path = None
             self._base_scene_dirty = True
             self._collision_overlay_dirty = True
             self._collision_overlay_warning_shown = False
@@ -418,21 +430,32 @@ def Scope "SimReadyStageSettings"
 
     def _collision_visual_layer(self) -> str:
         return f"""
-{self._edge_box_mesh("CollisionAssetProxy")}
+    over "CollisionAssetOverlay" (
+        prepend apiSchemas = ["OmniRtxSettingsCommonAdvancedAPI_1"]
+    )
+    {{
+        bool omni:rtx:wireframe:enabled = 1
+        token omni:rtx:wireframe:mode = "emissive"
+        bool omni:rtx:wireframe:shading:enabled = 0
+        bool omni:rtx:wireframe:perPrimThicknessWorldSpace = 1
+        float omni:rtx:wireframe:thickness = 0.006
+    }}
 
-{self._edge_box_mesh("CollisionGround")}
+{self._edge_box_curves("CollisionAssetProxy")}
 
-{self._edge_prism_mesh("CollisionRamp")}
+{self._edge_box_curves("CollisionGround")}
 
-{self._edge_box_mesh("CollisionObstacleA")}
+{self._edge_prism_curves("CollisionRamp")}
 
-{self._edge_box_mesh("CollisionObstacleB")}
+{self._edge_box_curves("CollisionObstacleA")}
 
-{self._edge_box_mesh("CollisionObstacleC")}
+{self._edge_box_curves("CollisionObstacleB")}
+
+{self._edge_box_curves("CollisionObstacleC")}
 """
 
     @classmethod
-    def _edge_box_mesh(cls, name: str) -> str:
+    def _edge_box_curves(cls, name: str) -> str:
         corners = {
             "000": (-0.5, -0.5, -0.5),
             "100": (0.5, -0.5, -0.5),
@@ -457,10 +480,10 @@ def Scope "SimReadyStageSettings"
             (corners["110"], corners["111"]),
             (corners["010"], corners["011"]),
         ]
-        return cls._edge_mesh(name, edges, thickness=0.012)
+        return cls._edge_curves(name, edges, thickness=0.012)
 
     @classmethod
-    def _edge_prism_mesh(cls, name: str) -> str:
+    def _edge_prism_curves(cls, name: str) -> str:
         p0 = (-1.7, -1.1, 0.0)
         p1 = (1.7, -1.1, 0.0)
         p2 = (1.7, 1.1, 0.0)
@@ -478,79 +501,41 @@ def Scope "SimReadyStageSettings"
             (p1, p2),
             (p4, p5),
         ]
-        return cls._edge_mesh(name, edges, thickness=0.025)
+        return cls._edge_curves(name, edges, thickness=0.025)
 
     @classmethod
-    def _edge_mesh(cls, name: str, edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]], thickness: float) -> str:
-        points: list[np.ndarray] = []
-        face_counts: list[int] = []
-        face_indices: list[int] = []
-
-        for start, end in edges:
-            base = len(points)
-            points.extend(cls._rod_points(np.array(start, dtype=np.float64), np.array(end, dtype=np.float64), thickness))
-            for face in (
-                (0, 1, 2, 3),
-                (4, 7, 6, 5),
-                (0, 4, 5, 1),
-                (1, 5, 6, 2),
-                (2, 6, 7, 3),
-                (3, 7, 4, 0),
-            ):
-                face_counts.append(4)
-                face_indices.extend(base + idx for idx in face)
-
+    def _edge_curves(cls, name: str, edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]], thickness: float) -> str:
         point_lines = ",\n            ".join(
-            f"({cls._usd_float(point[0])}, {cls._usd_float(point[1])}, {cls._usd_float(point[2])})" for point in points
+            f"({cls._usd_float(coord[0])}, {cls._usd_float(coord[1])}, {cls._usd_float(coord[2])})"
+            for edge in edges
+            for coord in edge
         )
-        count_lines = ", ".join(str(count) for count in face_counts)
-        index_lines = ", ".join(str(index) for index in face_indices)
+        curve_counts = ", ".join("2" for _ in edges)
+        width = max(float(thickness), 0.0005)
 
-        return f"""    def Mesh "{name}" (
+        return f"""    def BasisCurves "{name}" (
         prepend apiSchemas = ["MaterialBindingAPI"]
     )
     {{
-        uniform bool doubleSided = true
-        int[] faceVertexCounts = [{count_lines}]
-        int[] faceVertexIndices = [{index_lines}]
         rel material:binding = </SimReadyReview/Materials/CollisionMat>
+        uniform token type = "linear"
+        uniform token wrap = "nonperiodic"
+        int[] curveVertexCounts = [{curve_counts}]
         point3f[] points = [
             {point_lines}
         ]
+        float[] widths = [{cls._usd_float(width)}] (
+            interpolation = "constant"
+        )
+        color3f[] primvars:displayColor = [(0.46, 0.95, 0)] (
+            interpolation = "constant"
+        )
+        float[] primvars:displayOpacity = [1] (
+            interpolation = "constant"
+        )
         matrix4d xformOp:transform = ( (1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, {HIDDEN_BASE_Z}, 1) )
         uniform token[] xformOpOrder = ["xformOp:transform"]
-        uniform token subdivisionScheme = "none"
     }}"""
-
-    @staticmethod
-    def _rod_points(start: np.ndarray, end: np.ndarray, thickness: float) -> list[np.ndarray]:
-        axis = end - start
-        length = float(np.linalg.norm(axis))
-        if length < 1.0e-8:
-            axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        else:
-            axis /= length
-
-        helper = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        if abs(float(np.dot(axis, helper))) > 0.9:
-            helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        u = np.cross(axis, helper)
-        u /= max(float(np.linalg.norm(u)), 1.0e-8)
-        v = np.cross(axis, u)
-        v /= max(float(np.linalg.norm(v)), 1.0e-8)
-        u *= thickness
-        v *= thickness
-
-        return [
-            start - u - v,
-            start + u - v,
-            start + u + v,
-            start - u + v,
-            end - u - v,
-            end + u - v,
-            end + u + v,
-            end - u + v,
-        ]
 
     @staticmethod
     def _usd_float(value: float) -> str:
@@ -621,9 +606,10 @@ def Xform "SimReadyReview"
             {{
                 uniform token info:id = "UsdPreviewSurface"
                 color3f inputs:diffuseColor = (0.46, 0.73, 0.0)
-                color3f inputs:emissiveColor = (0.18, 0.32, 0.0)
+                color3f inputs:emissiveColor = (0.46, 0.95, 0.0)
                 float inputs:metallic = 0
                 float inputs:roughness = 0.25
+                float inputs:opacity = 1
                 token outputs:surface
             }}
         }}
@@ -849,16 +835,14 @@ def Xform "SimReadyReview"
 
         hidden = self._hidden_base_transform()
         asset_transform = hidden
+        authored_asset_transform = hidden
         ground_transform = hidden
         ramp_transform = hidden
         obstacle_transforms = [hidden for _ in COLLISION_OBSTACLE_PATHS]
 
         if self._collision_overlay_enabled:
-            if self._collision_proxy_bounds:
-                center = self._collision_proxy_bounds["center"]
-                size = self._collision_proxy_bounds["size"]
-                asset_transform = self._box_transform(center, size) @ self._asset_transform
-
+            if self._ensure_collision_asset_overlay():
+                authored_asset_transform = self._expanded_collision_asset_transform()
             ground_transform = self._box_transform(
                 (0.0, 0.0, -GROUND_COLLIDER_THICKNESS * 0.5),
                 (GROUND_PLANE_HALF_SIZE * 2.0, GROUND_PLANE_HALF_SIZE * 2.0, GROUND_COLLIDER_THICKNESS),
@@ -875,6 +859,9 @@ def Xform "SimReadyReview"
         try:
             paths = [COLLISION_ASSET_PATH, COLLISION_GROUND_PATH, COLLISION_RAMP_PATH] + COLLISION_OBSTACLE_PATHS
             transforms = [asset_transform, ground_transform, ramp_transform] + obstacle_transforms
+            if self._collision_asset_overlay_loaded:
+                paths.append(COLLISION_ASSET_OVERLAY_ROOT)
+                transforms.append(authored_asset_transform)
             for path, transform in zip(paths, transforms):
                 self._renderer.write_attribute(
                     prim_paths=[path],
@@ -889,6 +876,119 @@ def Xform "SimReadyReview"
             if not self._collision_overlay_warning_shown:
                 self._collision_overlay_warning_shown = True
                 self.status_changed.emit(f"Collision overlay update skipped: {exc}")
+
+    def _ensure_collision_asset_overlay(self) -> bool:
+        if self._collision_asset_overlay_loaded:
+            return True
+        if not self._renderer or not self._stage_loaded:
+            return False
+        if not self._current_usd_source:
+            return False
+
+        try:
+            overlay_path, stats = self._build_collision_wire_overlay_usd(self._current_usd_source)
+            if not overlay_path or not overlay_path.exists():
+                return False
+            self._renderer.add_usd(str(overlay_path))
+            self._collision_asset_overlay_path = overlay_path
+            self._collision_asset_overlay_loaded = True
+            collider_count = int(stats.get("collider_count", 0) or 0)
+            edge_count = int(stats.get("edge_count", 0) or 0)
+            self.status_changed.emit(
+                f"Authored collision wire overlay ready ({collider_count} colliders, {edge_count} edges)."
+            )
+            return True
+        except Exception as exc:
+            if not self._collision_overlay_warning_shown:
+                self._collision_overlay_warning_shown = True
+                self.status_changed.emit(f"Authored collision mesh overlay unavailable: {exc}")
+            return False
+
+    def _build_collision_wire_overlay_usd(self, usd_source: str) -> tuple[Optional[Path], dict]:
+        helper_python = self._usd_discovery_python()
+        if not helper_python:
+            return None, {}
+
+        digest = hashlib.sha1(str(usd_source).encode("utf-8", "replace")).hexdigest()[:16]
+        output_path = Path(tempfile.gettempdir()) / "simready_browser_collision_overlay" / f"{digest}.usda"
+        try:
+            result = subprocess.run(
+                [
+                    helper_python,
+                    "-u",
+                    "-m",
+                    "core.usd_collision_discovery",
+                    "--wire-usd",
+                    str(usd_source),
+                    str(output_path),
+                    "/World/Asset",
+                ],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                capture_output=True,
+                text=True,
+                timeout=90.0,
+                check=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"OpenUSD wire overlay helper failed to start: {exc}") from exc
+
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip().splitlines()
+            raise RuntimeError(detail[-1] if detail else "OpenUSD wire overlay helper failed")
+
+        stats = {}
+        for line in reversed((result.stdout or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                stats = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        return output_path, stats if isinstance(stats, dict) else {}
+
+    @staticmethod
+    def _usd_discovery_python() -> Optional[str]:
+        root = Path(__file__).resolve().parents[1]
+        candidates = [
+            os.environ.get(USD_DISCOVERY_PYTHON_ENV, ""),
+            str(root / ".usd_discovery_venv" / "Scripts" / "python.exe"),
+            str(root / ".usd_discovery_venv" / "bin" / "python"),
+        ]
+        current = Path(sys.executable).resolve() if hasattr(sys, "executable") else None
+        for item in candidates:
+            if not item:
+                continue
+            path = Path(item).expanduser()
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if not resolved.exists():
+                continue
+            if current is not None and resolved == current and not os.environ.get(USD_DISCOVERY_PYTHON_ENV):
+                continue
+            return str(resolved)
+        return None
+
+    def _expanded_collision_asset_transform(self) -> np.ndarray:
+        if not self._collision_proxy_bounds:
+            return np.array(self._asset_transform, dtype=np.float64, copy=True)
+
+        center = np.array(self._collision_proxy_bounds["center"], dtype=np.float64)
+        extent = float(np.linalg.norm(np.array(self._collision_proxy_bounds["size"], dtype=np.float64))) * 0.5
+        grow = 1.0 + min(0.018, max(0.004, 0.01 / max(extent, 0.1)))
+
+        translate_to_origin = np.eye(4, dtype=np.float64)
+        translate_to_origin[3, :3] = -center
+        scale = np.eye(4, dtype=np.float64)
+        scale[0, 0] = grow
+        scale[1, 1] = grow
+        scale[2, 2] = grow
+        translate_back = np.eye(4, dtype=np.float64)
+        translate_back[3, :3] = center
+        return translate_to_origin @ scale @ translate_back @ self._asset_transform
 
     @staticmethod
     def _normalize_collision_bounds(bounds: dict) -> Optional[dict]:

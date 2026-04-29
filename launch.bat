@@ -115,6 +115,25 @@ if errorlevel 1 (
 )
 echo  Core packages installed.
 
+:: Keep OpenUSD Python isolated from OVRTX/OVPhysX. Installing usd-core into
+:: the main app venv can make the NVIDIA USD runtimes conflict at startup.
+echo  Preparing isolated OpenUSD discovery helper...
+if not exist ".usd_discovery_venv\" (
+    uv venv .usd_discovery_venv --python .venv\Scripts\python.exe >nul
+)
+if exist ".usd_discovery_venv\Scripts\python.exe" (
+    uv pip install --python .usd_discovery_venv\Scripts\python.exe usd-core==25.11 --quiet
+    if errorlevel 1 (
+        echo  WARNING: Could not install isolated usd-core helper.
+        echo  Composed USD collider traversal will fall back to SimReady payload scanning.
+    ) else (
+        set SIMREADY_USD_PYTHON=%CD%\.usd_discovery_venv\Scripts\python.exe
+        echo  Isolated USD discovery helper ready.
+    )
+) else (
+    echo  WARNING: Could not create isolated OpenUSD helper environment.
+)
+
 :: Step 5b: Try to install OVRTX from NVIDIA's PyPI index
 echo  Installing OVRTX from https://pypi.nvidia.com ...
 uv pip install ovrtx --extra-index-url https://pypi.nvidia.com --quiet

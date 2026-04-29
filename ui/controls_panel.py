@@ -64,6 +64,7 @@ class ControlsPanel(QWidget):
     physics_restart_requested = pyqtSignal()
     physics_base_scene_changed = pyqtSignal(str)
     physics_collision_vis_changed = pyqtSignal(bool)
+    physics_grab_force_changed = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -186,6 +187,13 @@ class ControlsPanel(QWidget):
         )
         lay.addWidget(self._physics_status)
 
+        grab_hint = QLabel("Grab: hold Shift + Left Mouse Button on the asset, drag to pull, release to drop or throw.")
+        grab_hint.setWordWrap(True)
+        grab_hint.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        lay.addWidget(grab_hint)
+
         scene_row = QHBoxLayout()
         scene_label = QLabel("Base:")
         scene_label.setStyleSheet(
@@ -207,11 +215,35 @@ class ControlsPanel(QWidget):
         scene_widget.setLayout(scene_row)
         lay.addWidget(scene_widget)
 
+        force_row = QHBoxLayout()
+        force_label = QLabel("Grab force:")
+        force_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        force_row.addWidget(force_label)
+
+        self._physics_grab_force = QDoubleSpinBox()
+        self._physics_grab_force.setRange(0.25, 5.0)
+        self._physics_grab_force.setDecimals(2)
+        self._physics_grab_force.setSingleStep(0.25)
+        self._physics_grab_force.setValue(2.0)
+        self._physics_grab_force.setSuffix("x")
+        self._physics_grab_force.setToolTip("Higher values pull harder and need less mouse travel while grabbing.")
+        self._physics_grab_force.valueChanged.connect(
+            lambda value: self.physics_grab_force_changed.emit(float(value))
+        )
+        force_row.addWidget(self._physics_grab_force, 1)
+
+        force_widget = QWidget()
+        force_widget.setStyleSheet("background: transparent;")
+        force_widget.setLayout(force_row)
+        lay.addWidget(force_widget)
+
         self._physics_play = QCheckBox("Play physics")
         self._physics_play.toggled.connect(self.physics_play_changed)
         lay.addWidget(self._physics_play)
 
-        self._physics_collision_vis = QCheckBox("Collision overlay")
+        self._physics_collision_vis = QCheckBox("Collision wire overlay")
         self._physics_collision_vis.toggled.connect(self.physics_collision_vis_changed)
         lay.addWidget(self._physics_collision_vis)
 

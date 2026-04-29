@@ -16,6 +16,10 @@ from core.physics_controller import PhysicsController
 from styles.nvidia_theme import COLOR_ACCENT, COLOR_TEXT_SECONDARY, COLOR_VIEWPORT_BG
 
 LOAD_START_DELAY_MS = 150
+CAMERA_FOCAL_LENGTH_MM = 24.0
+CAMERA_HORIZONTAL_APERTURE_MM = 20.955
+GRAB_THROW_VELOCITY_LIMIT = 10.0
+DEFAULT_GRAB_FORCE_AMOUNT = 2.0
 
 
 class ViewportWidget(QWidget):
@@ -46,20 +50,28 @@ class ViewportWidget(QWidget):
         self._pending_collision_overlay = False
         self._load_generation = 0
         self._loading_asset = False
+        self._physics_cooking_active = False
+        self._physics_auto_cook_started = False
         self._current_usd_source: Optional[str] = None
         self._physics = PhysicsController(self)
         self._physics.pose_changed.connect(self._on_physics_pose)
         self._physics.status_changed.connect(self._on_physics_status)
         self._physics.running_changed.connect(self.physics_running_changed)
+        self._physics.cooking_progress.connect(self._on_physics_cooking_progress)
+        self._physics.cooking_finished.connect(self._on_physics_cooking_finished)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
         self._physics_grabbing = False
         self._physics_drag_start: Optional[QPoint] = None
         self._physics_drag_matrix = np.eye(4, dtype=np.float64)
         self._physics_grab_anchor = np.zeros(3, dtype=np.float64)
         self._physics_grab_target_start = np.zeros(3, dtype=np.float64)
+        self._physics_grab_plane_normal = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+        self._physics_grab_pointer_offset = np.zeros(3, dtype=np.float64)
         self._physics_grab_last_target = np.zeros(3, dtype=np.float64)
         self._physics_grab_last_time = 0.0
         self._physics_grab_velocity = np.zeros(3, dtype=np.float64)
+        self._physics_grab_force_amount = DEFAULT_GRAB_FORCE_AMOUNT
+        self._physics.set_grab_force_amount(self._physics_grab_force_amount)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -86,6 +98,8 @@ class ViewportWidget(QWidget):
         self._physics.clear_asset()
         self._physics_current_transform = np.eye(4, dtype=np.float64)
         self._physics_grabbing = False
+        self._physics_cooking_active = False
+        self._physics_auto_cook_started = False
         self._loading_asset = True
         self._load_generation += 1
         generation = self._load_generation
@@ -130,6 +144,8 @@ class ViewportWidget(QWidget):
             self._renderer.request_render()
 
     def set_physics_playing(self, playing: bool) -> None:
+        if playing and not self._physics.has_scene and not self._physics_cooking_active:
+            self._begin_physics_progress("Preparing physics colliders...", 0)
         self._physics.set_playing(playing)
 
     def restart_physics(self) -> None:
@@ -137,7 +153,12 @@ class ViewportWidget(QWidget):
             self._on_physics_status("Load an asset before starting physics.")
             self.physics_running_changed.emit(False)
             return
-        self._physics.restart(play=True)
+        if not self._physics.has_scene and not self._physics_cooking_active:
+            self._begin_physics_progress("Preparing physics colliders...", 0)
+        if not self._physics.restart(play=True):
+            self._physics_cooking_active = False
+            self.loading_changed.emit(False, self._physics.status_text)
+            self._set_loading(False)
 
     def step_physics(self) -> None:
         self._physics.step_once()
@@ -151,11 +172,19 @@ class ViewportWidget(QWidget):
 
     def set_physics_collision_overlay(self, enabled: bool) -> None:
         self._pending_collision_overlay = bool(enabled)
+        if enabled:
+            self._on_physics_status(
+                "Collision wire overlay shows authored asset colliders plus base-scene box colliders."
+            )
         if self._renderer:
             self._renderer.set_collision_overlay_enabled(self._pending_collision_overlay)
             if self._last_bounds:
                 self._renderer.set_collision_proxy_bounds(self._last_bounds)
             self._renderer.request_render()
+
+    def set_physics_grab_force(self, amount: float) -> None:
+        self._physics_grab_force_amount = self._sanitize_grab_force_amount(amount)
+        self._physics.set_grab_force_amount(self._physics_grab_force_amount)
 
     def shutdown(self, timeout_ms: int = 20000) -> bool:
         self._load_generation += 1
@@ -264,6 +293,8 @@ class ViewportWidget(QWidget):
         self._set_loading(False)
         if not ok:
             self._canvas.set_overlay_text(msg)
+            return
+        self._cook_physics_after_load()
 
     def _on_bounds_ready(self, bounds: dict) -> None:
         self._last_bounds = bounds
@@ -276,6 +307,46 @@ class ViewportWidget(QWidget):
         self._camera.frame_bounds(center, extent)
         if not self._loading_asset:
             self._push_camera()
+            self._cook_physics_after_load()
+
+    def _cook_physics_after_load(self) -> None:
+        if self._loading_asset or self._physics_auto_cook_started:
+            return
+        if self._last_bounds is None or not self._current_usd_source:
+            return
+        if self._physics.has_scene or self._physics_cooking_active:
+            return
+
+        self._physics_auto_cook_started = True
+        self._begin_physics_progress("Cooking physics colliders for loaded asset...", 0)
+        if not self._physics.cook_colliders():
+            self._physics_cooking_active = False
+            self.loading_changed.emit(False, self._physics.status_text)
+            self._set_loading(False)
+
+    def _on_physics_cooking_progress(self, value: int, msg: str) -> None:
+        if value >= 100:
+            return
+        self._physics_cooking_active = True
+        self.physics_status_changed.emit(msg)
+        self.status_msg.emit(msg)
+        self.loading_changed.emit(True, msg)
+        self._set_loading(True, msg, value)
+
+    def _on_physics_cooking_finished(self, ok: bool, msg: str) -> None:
+        _ = ok
+        self._physics_cooking_active = False
+        self.physics_status_changed.emit(msg)
+        self.status_msg.emit(msg)
+        self.loading_changed.emit(False, msg)
+        self._set_loading(False)
+
+    def _begin_physics_progress(self, text: str, progress: int = 0) -> None:
+        self._physics_cooking_active = True
+        self.physics_status_changed.emit(text)
+        self.status_msg.emit(text)
+        self.loading_changed.emit(True, text)
+        self._set_loading(True, text, progress)
 
     def _push_camera(self) -> None:
         if not self._renderer:
@@ -449,6 +520,15 @@ class ViewportWidget(QWidget):
         self._physics_drag_matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True)
         self._physics_grab_anchor = self._select_grab_anchor(event.pos())
         self._physics_grab_target_start = self._anchor_world(self._physics_drag_matrix, self._physics_grab_anchor)
+        _right, _up, forward = self._camera._camera_axes()
+        self._physics_grab_plane_normal = np.array(forward, dtype=np.float64, copy=True)
+        self._physics_grab_pointer_offset = np.zeros(3, dtype=np.float64)
+        pointer_target = self._grab_target_from_pointer(event.pos())
+        self._physics_grab_pointer_offset = (
+            self._physics_grab_target_start - pointer_target
+            if pointer_target is not None
+            else np.zeros(3, dtype=np.float64)
+        )
         self._physics_grab_last_target = np.array(self._physics_grab_target_start, dtype=np.float64, copy=True)
         self._physics_grab_last_time = time.monotonic()
         self._physics_grab_velocity = np.zeros(3, dtype=np.float64)
@@ -469,6 +549,23 @@ class ViewportWidget(QWidget):
         if self._physics_drag_start is None:
             return
 
+        target = self._grab_target_from_pointer(pos)
+        if target is None:
+            target = self._fallback_grab_target(pos)
+        target = self._scaled_grab_target(target)
+
+        now = time.monotonic()
+        dt = max(now - self._physics_grab_last_time, 1.0 / 120.0)
+        raw_velocity = (target - self._physics_grab_last_target) / dt
+        self._physics_grab_velocity = self._clamp_vector(
+            self._physics_grab_velocity * 0.6 + raw_velocity * 0.4,
+            GRAB_THROW_VELOCITY_LIMIT * max(1.0, np.sqrt(self._physics_grab_force_amount)),
+        )
+        self._physics_grab_last_target = np.array(target, dtype=np.float64, copy=True)
+        self._physics_grab_last_time = now
+        self._physics.update_magnet(target, self._physics_grab_velocity)
+
+    def _fallback_grab_target(self, pos: QPoint) -> np.ndarray:
         dx = pos.x() - self._physics_drag_start.x()
         dy = pos.y() - self._physics_drag_start.y()
         right, up, _forward = self._camera._camera_axes()
@@ -477,18 +574,39 @@ class ViewportWidget(QWidget):
             extent = float(self._last_bounds.get("extent", 1.0))
         scale = max(self._camera.radius * 0.0018, extent * 0.003, 0.005)
         delta = (dx * right - dy * up) * scale
-        target = self._physics_grab_target_start + delta
+        return self._physics_grab_target_start + delta
 
-        now = time.monotonic()
-        dt = max(now - self._physics_grab_last_time, 1.0 / 120.0)
-        raw_velocity = (target - self._physics_grab_last_target) / dt
-        self._physics_grab_velocity = self._clamp_vector(
-            self._physics_grab_velocity * 0.55 + raw_velocity * 0.45,
-            14.0,
-        )
-        self._physics_grab_last_target = np.array(target, dtype=np.float64, copy=True)
-        self._physics_grab_last_time = now
-        self._physics.update_magnet(target, self._physics_grab_velocity)
+    def _grab_target_from_pointer(self, pos: QPoint) -> Optional[np.ndarray]:
+        ray_origin, ray_direction = self._pointer_ray(pos)
+        plane_normal = np.array(self._physics_grab_plane_normal, dtype=np.float64).reshape(3)
+        denom = float(np.dot(ray_direction, plane_normal))
+        if abs(denom) < 1.0e-5:
+            return None
+        distance = float(np.dot(self._physics_grab_target_start - ray_origin, plane_normal) / denom)
+        if distance <= 0.0 or not np.isfinite(distance):
+            return None
+        return ray_origin + ray_direction * distance + self._physics_grab_pointer_offset
+
+    def _pointer_ray(self, pos: QPoint) -> tuple[np.ndarray, np.ndarray]:
+        width = max(float(self._canvas.width()), 1.0)
+        height = max(float(self._canvas.height()), 1.0)
+        ndc_x = (float(pos.x()) / width) * 2.0 - 1.0
+        ndc_y = 1.0 - (float(pos.y()) / height) * 2.0
+
+        aspect = width / height
+        half_horizontal = np.tan(np.arctan(CAMERA_HORIZONTAL_APERTURE_MM / (2.0 * CAMERA_FOCAL_LENGTH_MM)))
+        half_vertical = half_horizontal / max(aspect, 1.0e-6)
+        right, up, forward = self._camera._camera_axes()
+        direction = forward + right * ndc_x * half_horizontal + up * ndc_y * half_vertical
+        direction_norm = max(float(np.linalg.norm(direction)), 1.0e-9)
+        return self._camera.eye.copy(), direction / direction_norm
+
+    def _scaled_grab_target(self, target: np.ndarray) -> np.ndarray:
+        amount = self._physics_grab_force_amount
+        if abs(amount - 1.0) < 1.0e-6:
+            return np.array(target, dtype=np.float64, copy=True)
+        offset = np.asarray(target, dtype=np.float64) - self._physics_grab_target_start
+        return self._physics_grab_target_start + offset * amount
 
     def _finish_physics_grab(self, drop: bool, pos: Optional[QPoint] = None) -> None:
         if pos is not None:
@@ -565,6 +683,16 @@ class ViewportWidget(QWidget):
         if norm > max(float(limit), 1.0e-6):
             arr *= float(limit) / norm
         return arr
+
+    @staticmethod
+    def _sanitize_grab_force_amount(value: float) -> float:
+        try:
+            amount = float(value)
+        except Exception:
+            amount = DEFAULT_GRAB_FORCE_AMOUNT
+        if not np.isfinite(amount):
+            amount = DEFAULT_GRAB_FORCE_AMOUNT
+        return max(0.25, min(5.0, amount))
 
     def _set_loading(self, active: bool, text: str = "", progress: Optional[int] = None) -> None:
         self._canvas.set_loading(False)
@@ -690,17 +818,19 @@ class _RenderCanvas(QLabel):
     def _draw_loading_overlay(self, painter: QPainter) -> None:
         painter.fillRect(self.rect(), QColor(0, 0, 0, 165))
 
-        bar_width = min(460, max(220, self.width() - 96))
+        bar_width = min(520, max(240, self.width() - 96))
         bar_height = 10
         bar_x = (self.width() - bar_width) // 2
-        bar_y = self.height() // 2 + 34
+        bar_y = max(70, self.height() - 54)
 
         painter.setFont(QFont("Segoe UI", 11, QFont.DemiBold))
         painter.setPen(QColor(COLOR_TEXT_SECONDARY))
-        text_rect = self.rect().adjusted(32, 0, -32, 0)
         painter.drawText(
-            text_rect.adjusted(0, -36, 0, 0),
-            Qt.AlignCenter | Qt.TextWordWrap,
+            32,
+            max(8, bar_y - 56),
+            max(120, self.width() - 64),
+            46,
+            Qt.AlignBottom | Qt.AlignHCenter | Qt.TextWordWrap,
             self._loading_text or "Loading asset in OVRTX...",
         )
 
@@ -751,8 +881,8 @@ class _ViewportLoadingOverlay(QWidget):
         self.setStyleSheet("background: rgba(0, 0, 0, 165);")
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(48, 0, 48, 0)
-        root.setSpacing(10)
+        root.setContentsMargins(48, 0, 48, 30)
+        root.setSpacing(8)
         root.addStretch(1)
 
         self._label = QLabel("Loading asset in OVRTX...")
@@ -775,7 +905,6 @@ class _ViewportLoadingOverlay(QWidget):
             f"QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 3px; }}"
         )
         root.addWidget(self._bar)
-        root.addStretch(1)
 
     def set_loading(self, active: bool, text: str = "", progress: Optional[int] = None) -> None:
         if not active:
