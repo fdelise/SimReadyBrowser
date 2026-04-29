@@ -269,6 +269,8 @@ class MainWindow(QMainWindow):
         self._viewport.fps_updated.connect(
             lambda fps: self._fps_label.setText(f"{fps:.1f} fps")
         )
+        self._viewport.physics_status_changed.connect(self._controls.set_physics_status)
+        self._viewport.physics_running_changed.connect(self._controls.set_physics_running)
 
         # Controls → viewport
         self._controls.dome_intensity_changed.connect(self._viewport.set_dome_intensity)
@@ -277,6 +279,11 @@ class MainWindow(QMainWindow):
         )
         self._controls.reset_camera_requested.connect(self._viewport.reset_camera)
         self._controls.load_asset_requested.connect(self._load_asset)
+        self._controls.physics_play_changed.connect(self._viewport.set_physics_playing)
+        self._controls.physics_step_requested.connect(self._viewport.step_physics)
+        self._controls.physics_restart_requested.connect(self._viewport.restart_physics)
+        self._controls.physics_grab_changed.connect(self._viewport.set_physics_grab_enabled)
+        self._controls.set_physics_status(self._viewport.physics_status)
 
     # ── Slots ──────────────────────────────────────────────────────────────────
 

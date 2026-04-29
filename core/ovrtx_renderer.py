@@ -91,6 +91,7 @@ class OVRTXRenderer(QObject):
     _load_stage_requested = pyqtSignal(str)
     _resolution_requested = pyqtSignal(int, int)
     _camera_transform_requested = pyqtSignal(object)
+    _asset_transform_requested = pyqtSignal(object)
     _dome_intensity_requested = pyqtSignal(float)
     _dir_light_requested = pyqtSignal(float, float, float)
     _render_requested = pyqtSignal()
@@ -118,6 +119,9 @@ class OVRTXRenderer(QObject):
 
         self._camera_transform = SphericalCamera().get_transform()
         self._camera_dirty = True
+        self._asset_transform = np.eye(4, dtype=np.float64)
+        self._asset_transform_dirty = True
+        self._asset_transform_warning_shown = False
         self._dome_intensity = 1.0
         self._dir_intensity = 0.8
         self._dir_azimuth = 45.0
@@ -135,6 +139,7 @@ class OVRTXRenderer(QObject):
         self._load_stage_requested.connect(self._load_stage, Qt.QueuedConnection)
         self._resolution_requested.connect(self._set_resolution, Qt.QueuedConnection)
         self._camera_transform_requested.connect(self._set_camera_transform, Qt.QueuedConnection)
+        self._asset_transform_requested.connect(self._set_asset_transform, Qt.QueuedConnection)
         self._dome_intensity_requested.connect(self._set_dome_intensity, Qt.QueuedConnection)
         self._dir_light_requested.connect(self._set_directional_light, Qt.QueuedConnection)
         self._render_requested.connect(self._render_one, Qt.QueuedConnection)
@@ -156,6 +161,11 @@ class OVRTXRenderer(QObject):
         if self._shutdown_started:
             return
         self._camera_transform_requested.emit(np.array(matrix, dtype=np.float64, copy=True))
+
+    def set_asset_transform(self, matrix: np.ndarray) -> None:
+        if self._shutdown_started:
+            return
+        self._asset_transform_requested.emit(np.array(matrix, dtype=np.float64, copy=True))
 
     def set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
@@ -238,6 +248,9 @@ class OVRTXRenderer(QObject):
 
         try:
             self._stage_loaded = False
+            self._asset_transform = np.eye(4, dtype=np.float64)
+            self._asset_transform_dirty = True
+            self._asset_transform_warning_shown = False
             self.loading_started.emit(f"Loading {display_name} in OVRTX...")
             self.loading_progress.emit(5, "Preparing OVRTX stage...")
             self.status_changed.emit(f"Loading {display_name}...")
@@ -259,6 +272,7 @@ class OVRTXRenderer(QObject):
             self._camera_dirty = True
             self.loading_progress.emit(72, "Applying viewport settings...")
             self._apply_resolution()
+            self._apply_asset_transform()
             self._apply_dome_light()
             self._apply_directional_light()
 
@@ -404,6 +418,13 @@ def Xform "SimReadyReview"
         self._camera_transform = np.array(matrix, dtype=np.float64, copy=True)
         self._camera_dirty = True
 
+    def _set_asset_transform(self, matrix: np.ndarray) -> None:
+        if self._shutdown_started:
+            return
+        self._asset_transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+        self._asset_transform_dirty = True
+        self._apply_asset_transform()
+
     def _set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
             return
@@ -442,6 +463,24 @@ def Xform "SimReadyReview"
             prim_mode=PrimMode.MUST_EXIST,
         )
         self._camera_dirty = False
+
+    def _apply_asset_transform(self) -> None:
+        if not self._renderer or not self._stage_loaded:
+            return
+        try:
+            self._renderer.write_attribute(
+                prim_paths=[ASSET_ROOT],
+                attribute_name="omni:xform",
+                tensor=np.array(self._asset_transform, dtype=np.float64, copy=True).reshape(1, 4, 4),
+                semantic=Semantic.XFORM_MAT4x4,
+                prim_mode=PrimMode.MUST_EXIST,
+            )
+            self._asset_transform_dirty = False
+        except Exception as exc:
+            self._asset_transform_dirty = False
+            if not self._asset_transform_warning_shown:
+                self._asset_transform_warning_shown = True
+                self.status_changed.emit(f"Asset transform update skipped: {exc}")
 
     def _apply_dome_light(self) -> None:
         if not self._renderer or not self._stage_loaded:
@@ -558,7 +597,7 @@ def Xform "SimReadyReview"
         extent = max(float(np.linalg.norm(hi - lo)) * 0.5, 0.1)
         if metadata_bounds:
             extent = max(extent, float(metadata_bounds.get("extent", extent)))
-        return {"center": center.tolist(), "extent": extent}
+        return {"center": center.tolist(), "extent": extent, "size": (hi - lo).tolist()}
 
     def _read_metadata_bounds(self, usd_source: str) -> Optional[dict]:
         parsed = urllib.parse.urlparse(usd_source)
@@ -586,7 +625,7 @@ def Xform "SimReadyReview"
                     dims = np.array([float(v) for v in extent[:3]], dtype=np.float64)
                     if np.all(np.isfinite(dims)):
                         radius = max(float(np.linalg.norm(np.abs(dims))) * 0.5, 0.1)
-                        return {"center": [0.0, 0.0, 0.0], "extent": radius}
+                        return {"center": [0.0, 0.0, 0.0], "extent": radius, "size": np.abs(dims).tolist()}
             except Exception:
                 continue
         return None
@@ -733,7 +772,8 @@ def Xform "SimReadyReview"
         center = (lo + hi) * 0.5
         extent = max(float(np.linalg.norm(hi - lo)) * 0.5, 0.05)
         center = self._gltf_y_up_to_usd_z_up(center)
-        return {"center": center.tolist(), "extent": extent}
+        size = np.abs(self._gltf_y_up_to_usd_z_up(hi - lo))
+        return {"center": center.tolist(), "extent": extent, "size": size.tolist()}
 
     @staticmethod
     def _gltf_y_up_to_usd_z_up(value: np.ndarray) -> np.ndarray:
@@ -829,6 +869,8 @@ def Xform "SimReadyReview"
         try:
             if self._camera_dirty:
                 self._apply_camera()
+            if self._asset_transform_dirty:
+                self._apply_asset_transform()
 
             t0 = time.perf_counter()
             products = self._renderer.step(

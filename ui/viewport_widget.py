@@ -11,6 +11,7 @@ from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QLabel, QProgressBar, QSizePolicy, QVBoxLayout, QWidget
 
 from core.camera_controller import SphericalCamera
+from core.physics_controller import PhysicsController
 from styles.nvidia_theme import COLOR_ACCENT, COLOR_TEXT_SECONDARY, COLOR_VIEWPORT_BG
 
 LOAD_START_DELAY_MS = 150
@@ -23,6 +24,8 @@ class ViewportWidget(QWidget):
     fps_updated = pyqtSignal(float)
     status_msg = pyqtSignal(str)
     loading_changed = pyqtSignal(bool, str)
+    physics_status_changed = pyqtSignal(str)
+    physics_running_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -40,6 +43,16 @@ class ViewportWidget(QWidget):
         self._pending_dir_light = (0.8, 45.0, 60.0)
         self._load_generation = 0
         self._loading_asset = False
+        self._physics = PhysicsController(self)
+        self._physics.pose_changed.connect(self._on_physics_pose)
+        self._physics.status_changed.connect(self._on_physics_status)
+        self._physics.running_changed.connect(self.physics_running_changed)
+        self._physics_current_transform = np.eye(4, dtype=np.float64)
+        self._physics_grab_enabled = False
+        self._physics_grabbing = False
+        self._physics_resume_after_grab = False
+        self._physics_drag_start: Optional[QPoint] = None
+        self._physics_drag_matrix = np.eye(4, dtype=np.float64)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -62,6 +75,9 @@ class ViewportWidget(QWidget):
         self._canvas.setFocus(Qt.OtherFocusReason)
         self._last_bounds = None
         self._camera.reset()
+        self._physics.clear_asset()
+        self._physics_current_transform = np.eye(4, dtype=np.float64)
+        self._physics_grabbing = False
         self._loading_asset = True
         self._load_generation += 1
         generation = self._load_generation
@@ -75,6 +91,10 @@ class ViewportWidget(QWidget):
     @property
     def camera(self) -> SphericalCamera:
         return self._camera
+
+    @property
+    def physics_status(self) -> str:
+        return self._physics.status_text
 
     def reset_camera(self) -> None:
         if self._last_bounds:
@@ -101,10 +121,33 @@ class ViewportWidget(QWidget):
             self._renderer.set_directional_light(intensity, azimuth, elevation)
             self._renderer.request_render()
 
+    def set_physics_playing(self, playing: bool) -> None:
+        self._physics.set_playing(playing)
+
+    def restart_physics(self) -> None:
+        if self._last_bounds is None:
+            self._on_physics_status("Load an asset before starting physics.")
+            self.physics_running_changed.emit(False)
+            return
+        self._physics.restart(play=True)
+
+    def step_physics(self) -> None:
+        self._physics.step_once()
+
+    def set_physics_grab_enabled(self, enabled: bool) -> None:
+        self._physics_grab_enabled = bool(enabled)
+        if enabled:
+            self._on_physics_status("Grab/drop mode enabled. Drag the asset, then release to drop.")
+        elif self._physics_grabbing:
+            self._finish_physics_grab(drop=True)
+        else:
+            self._on_physics_status(self._physics.status_text)
+
     def shutdown(self, timeout_ms: int = 20000) -> bool:
         self._load_generation += 1
         self._loading_asset = False
         self._set_loading(False)
+        self._physics.shutdown()
 
         if not self._renderer:
             return True
@@ -206,6 +249,8 @@ class ViewportWidget(QWidget):
 
     def _on_bounds_ready(self, bounds: dict) -> None:
         self._last_bounds = bounds
+        self._physics.configure_asset(bounds)
+        self._physics_current_transform = np.eye(4, dtype=np.float64)
         center = np.array(bounds.get("center", [0.0, 0.0, 0.0]), dtype=np.float64)
         extent = float(bounds.get("extent", 1.0))
         self._camera.frame_bounds(center, extent)
@@ -218,7 +263,19 @@ class ViewportWidget(QWidget):
         self._renderer.set_camera_transform(self._camera.get_transform())
         self._renderer.request_render()
 
+    def _on_physics_pose(self, matrix: np.ndarray) -> None:
+        self._physics_current_transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+        if self._renderer:
+            self._renderer.set_asset_transform(self._physics_current_transform)
+            self._renderer.request_render()
+
+    def _on_physics_status(self, msg: str) -> None:
+        self.physics_status_changed.emit(msg)
+        self.status_msg.emit(msg)
+
     def mousePressEvent(self, event) -> None:
+        if self._try_start_physics_grab(event):
+            return
         self._last_pos = event.pos()
         self._active_button = event.button()
         self._active_mode = self._navigation_mode(event.button(), event.modifiers())
@@ -227,6 +284,11 @@ class ViewportWidget(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
+        if self._physics_grabbing:
+            self._update_physics_grab(event.pos())
+            event.accept()
+            return
+
         if self._last_pos is None or not self._active_mode:
             return
 
@@ -247,6 +309,10 @@ class ViewportWidget(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._physics_grabbing:
+            self._finish_physics_grab(drop=True, pos=event.pos())
+            event.accept()
+            return
         self._last_pos = None
         self._active_button = None
         self._active_mode = None
@@ -338,6 +404,61 @@ class ViewportWidget(QWidget):
 
     def _hide_hint(self) -> None:
         self._canvas.set_overlay_text("")
+
+    def _try_start_physics_grab(self, event) -> bool:
+        if not self._physics_grab_enabled or self._last_bounds is None:
+            return False
+        if event.button() != Qt.LeftButton or event.modifiers() & Qt.AltModifier:
+            return False
+
+        self._physics_grabbing = True
+        self._physics_resume_after_grab = self._physics.is_running
+        self._physics.set_playing(False)
+        self._physics_drag_start = event.pos()
+        self._physics_drag_matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True)
+        self.setFocus()
+        self._canvas.setFocus()
+        self._on_physics_status("Dragging asset. Release to drop into physics.")
+        event.accept()
+        return True
+
+    def _update_physics_grab(self, pos: QPoint) -> None:
+        if self._physics_drag_start is None:
+            return
+
+        dx = pos.x() - self._physics_drag_start.x()
+        dy = pos.y() - self._physics_drag_start.y()
+        right, up, _forward = self._camera._camera_axes()
+        extent = 1.0
+        if self._last_bounds:
+            extent = float(self._last_bounds.get("extent", 1.0))
+        scale = max(self._camera.radius * 0.0018, extent * 0.003, 0.005)
+        delta = (-dx * right + dy * up) * scale
+        matrix = np.array(self._physics_drag_matrix, dtype=np.float64, copy=True)
+        matrix[3, :3] += delta
+        self._physics.set_visual_transform(matrix, zero_velocity=True)
+
+    def _finish_physics_grab(self, drop: bool, pos: Optional[QPoint] = None) -> None:
+        if pos is not None:
+            self._update_physics_grab(pos)
+
+        self._physics_grabbing = False
+        self._physics_drag_start = None
+        self._last_pos = None
+        self._active_button = None
+        self._active_mode = None
+
+        if drop:
+            self._physics.set_visual_transform(self._physics_current_transform, zero_velocity=True)
+            dropped = True
+            if self._physics.has_scene:
+                self._physics.set_playing(True)
+            else:
+                dropped = self._physics.restart(visual_transform=self._physics_current_transform, play=True)
+            if dropped:
+                self._on_physics_status("Dropped asset into physics.")
+        elif self._physics_resume_after_grab:
+            self._physics.set_playing(True)
 
     def _set_loading(self, active: bool, text: str = "", progress: Optional[int] = None) -> None:
         self._canvas.set_loading(False)

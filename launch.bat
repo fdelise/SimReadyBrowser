@@ -128,6 +128,18 @@ if errorlevel 1 (
     echo  OVRTX installed successfully.
 )
 
+:: Step 5c: Try to install OVPhysX from PyPI
+echo  Installing OVPhysX physics runtime...
+uv pip install ovphysx --quiet
+if errorlevel 1 (
+    echo  WARNING: OVPhysX install failed.
+    echo  Physics play/restart/grab controls will stay disabled until OVPhysX is installed.
+    echo  To retry OVPhysX install manually:
+    echo    .venv\Scripts\pip install ovphysx
+) else (
+    echo  OVPhysX installed successfully.
+)
+
 echo  All dependencies ready.
 
 :: ── 6. Launch application ──────────────────────────────────────────────────────

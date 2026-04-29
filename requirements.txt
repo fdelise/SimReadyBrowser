@@ -15,3 +15,6 @@ pynvml>=11.5
 
 # OVRTX is installed separately from NVIDIA's PyPI index:
 # pip install ovrtx --extra-index-url https://pypi.nvidia.com
+
+# OVPhysX is optional at runtime; physics controls are disabled if missing.
+ovphysx>=0.3.7

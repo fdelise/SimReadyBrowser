@@ -59,6 +59,10 @@ class ControlsPanel(QWidget):
     material_changed       = pyqtSignal(float, float)
     reset_camera_requested = pyqtSignal()
     load_asset_requested   = pyqtSignal(object)  # AssetInfo
+    physics_play_changed   = pyqtSignal(bool)
+    physics_step_requested = pyqtSignal()
+    physics_restart_requested = pyqtSignal()
+    physics_grab_changed   = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +92,7 @@ class ControlsPanel(QWidget):
         inner_layout.setSpacing(10)
 
         inner_layout.addWidget(self._build_lighting_group())
+        inner_layout.addWidget(self._build_physics_group())
         inner_layout.addWidget(self._build_camera_group())
         inner_layout.addWidget(self._build_asset_info_group())
         inner_layout.addStretch(1)
@@ -164,6 +169,45 @@ class ControlsPanel(QWidget):
     def _apply_light_preset(self, azimuth: int, elevation: int):
         self._dir_az_slider.setValue(azimuth)
         self._dir_el_slider.setValue(elevation)
+
+    # Physics
+
+    def _build_physics_group(self) -> QGroupBox:
+        grp = QGroupBox("Physics")
+        lay = QVBoxLayout(grp)
+        lay.setContentsMargins(10, 30, 10, 10)
+        lay.setSpacing(8)
+
+        self._physics_status = QLabel("Load an asset, then Play or Restart physics.")
+        self._physics_status.setWordWrap(True)
+        self._physics_status.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        lay.addWidget(self._physics_status)
+
+        self._physics_play = QCheckBox("Play physics")
+        self._physics_play.toggled.connect(self.physics_play_changed)
+        lay.addWidget(self._physics_play)
+
+        self._physics_grab = QCheckBox("Grab/drop mode")
+        self._physics_grab.toggled.connect(self.physics_grab_changed)
+        lay.addWidget(self._physics_grab)
+
+        button_row = QHBoxLayout()
+        restart_btn = _small_button("Restart")
+        restart_btn.clicked.connect(self.physics_restart_requested)
+        button_row.addWidget(restart_btn)
+
+        step_btn = _small_button("Step")
+        step_btn.clicked.connect(self.physics_step_requested)
+        button_row.addWidget(step_btn)
+
+        row_widget = QWidget()
+        row_widget.setStyleSheet("background: transparent;")
+        row_widget.setLayout(button_row)
+        lay.addWidget(row_widget)
+
+        return grp
 
     # ── Materials ──────────────────────────────────────────────────────────────
 
@@ -294,6 +338,14 @@ class ControlsPanel(QWidget):
         self._info_tags.setText(", ".join(asset.tags) if asset.tags else "—")
         self._info_path.setText(asset.usd_key)
         self._load_btn.setEnabled(True)
+
+    def set_physics_status(self, text: str):
+        self._physics_status.setText(text)
+
+    def set_physics_running(self, running: bool):
+        old = self._physics_play.blockSignals(True)
+        self._physics_play.setChecked(bool(running))
+        self._physics_play.blockSignals(old)
 
     def _request_load(self):
         if self._current_asset:
