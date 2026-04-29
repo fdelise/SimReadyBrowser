@@ -28,6 +28,8 @@ class PhysicsWorker:
         self._velocity_buffer: Optional[np.ndarray] = None
         self._wrench_buffer: Optional[np.ndarray] = None
         self._magnet: Optional[dict] = None
+        self._body_patterns = [PROXY_PATH]
+        self._active_body_pattern = PROXY_PATH
 
     def run(self) -> None:
         for line in sys.stdin:
@@ -38,7 +40,11 @@ class PhysicsWorker:
                 message = json.loads(line)
                 cmd = message.get("cmd")
                 if cmd == "start":
-                    self.start(message["scene"])
+                    self.start(
+                        message["scene"],
+                        message.get("body_patterns", message.get("body_pattern", PROXY_PATH)),
+                        message.get("initial_pose"),
+                    )
                 elif cmd == "step":
                     self.step(float(message.get("dt", 1.0 / 60.0)), float(message.get("time", 0.0)))
                 elif cmd == "set_pose":
@@ -54,8 +60,10 @@ class PhysicsWorker:
             except Exception as exc:
                 self._emit({"type": "error", "message": str(exc)})
 
-    def start(self, scene_path: str) -> None:
+    def start(self, scene_path: str, body_patterns=None, initial_pose=None) -> None:
         self.shutdown()
+        self._body_patterns = self._normalize_patterns(body_patterns)
+        self._active_body_pattern = self._body_patterns[0]
 
         import ovphysx  # noqa: F401
         from ovphysx import PhysX
@@ -76,6 +84,10 @@ class PhysicsWorker:
 
         self._pose_binding = self._create_tensor_binding(TensorType.RIGID_BODY_POSE)
         self._pose_buffer = np.zeros(self._pose_binding.shape, dtype=np.float32)
+        try:
+            self._pose_binding.read(self._pose_buffer)
+        except Exception:
+            pass
 
         try:
             self._velocity_binding = self._create_tensor_binding(TensorType.RIGID_BODY_VELOCITY)
@@ -91,7 +103,16 @@ class PhysicsWorker:
             self._wrench_binding = None
             self._wrench_buffer = None
 
-        self._emit({"type": "started"})
+        if initial_pose is not None:
+            self._write_pose(initial_pose, zero_velocity=True, emit=False)
+
+        self._emit(
+            {
+                "type": "started",
+                "body_pattern": self._active_body_pattern,
+                "body_count": self._binding_count(self._pose_binding),
+            }
+        )
         self._emit_pose()
 
     def step(self, dt: float, sim_time: float) -> None:
@@ -110,6 +131,9 @@ class PhysicsWorker:
         self._emit_pose()
 
     def set_pose(self, pose, zero_velocity: bool) -> None:
+        self._write_pose(pose, zero_velocity=zero_velocity, emit=True)
+
+    def _write_pose(self, pose, zero_velocity: bool, emit: bool) -> None:
         if self._pose_binding is None or self._pose_buffer is None:
             return
         arr = np.array(pose, dtype=np.float32).reshape(7)
@@ -118,7 +142,8 @@ class PhysicsWorker:
         if zero_velocity and self._velocity_binding is not None and self._velocity_buffer is not None:
             self._velocity_buffer.fill(0.0)
             self._velocity_binding.write(self._velocity_buffer)
-        self._emit_pose()
+        if emit:
+            self._emit_pose()
 
     def set_magnet(self, message: dict) -> None:
         target = np.array(message.get("target", []), dtype=np.float32)
@@ -191,21 +216,62 @@ class PhysicsWorker:
         self._usd_handle = None
 
     def _create_tensor_binding(self, tensor_type):
-        attempts = (
-            lambda: self._physx.create_tensor_binding(prim_paths=[PROXY_PATH], tensor_type=tensor_type),
-            lambda: self._physx.create_tensor_binding(pattern=PROXY_PATH, tensor_type=tensor_type),
-            lambda: self._physx.create_tensor_binding(PROXY_PATH, tensor_type=tensor_type),
-        )
         last_exc: Optional[Exception] = None
-        for attempt in attempts:
+        for pattern in self._body_patterns:
+            attempts = [
+                lambda p=pattern: self._physx.create_tensor_binding(pattern=p, tensor_type=tensor_type),
+            ]
+            if "*" not in pattern and "?" not in pattern:
+                attempts.extend(
+                    [
+                        lambda p=pattern: self._physx.create_tensor_binding(prim_paths=[p], tensor_type=tensor_type),
+                        lambda p=pattern: self._physx.create_tensor_binding(p, tensor_type=tensor_type),
+                    ]
+                )
+
+            for attempt in attempts:
+                try:
+                    binding = attempt()
+                    if self._binding_count(binding) <= 0:
+                        raise RuntimeError(f"No rigid bodies matched {pattern}")
+                    self._active_body_pattern = pattern
+                    return binding
+                except Exception as exc:
+                    last_exc = exc
+        joined = ", ".join(self._body_patterns)
+        raise RuntimeError(f"Could not bind tensor for {joined}: {last_exc}")
+
+    @staticmethod
+    def _normalize_patterns(patterns) -> list[str]:
+        if isinstance(patterns, str):
+            raw = [patterns]
+        else:
             try:
-                binding = attempt()
-                if getattr(binding, "count", 1) == 0:
-                    raise RuntimeError(f"No rigid bodies matched {PROXY_PATH}")
-                return binding
-            except Exception as exc:
-                last_exc = exc
-        raise RuntimeError(f"Could not bind tensor for {PROXY_PATH}: {last_exc}")
+                raw = list(patterns or [])
+            except TypeError:
+                raw = []
+        normalized = []
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in normalized:
+                normalized.append(text)
+        return normalized or [PROXY_PATH]
+
+    @staticmethod
+    def _binding_count(binding) -> int:
+        count = getattr(binding, "count", None)
+        if count is not None:
+            try:
+                return int(count)
+            except Exception:
+                pass
+        shape = getattr(binding, "shape", None)
+        if shape is not None:
+            try:
+                return int(shape[0])
+            except Exception:
+                pass
+        return 1
 
     def _emit_pose(self) -> None:
         if self._pose_binding is None or self._pose_buffer is None:

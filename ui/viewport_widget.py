@@ -46,6 +46,7 @@ class ViewportWidget(QWidget):
         self._pending_collision_overlay = False
         self._load_generation = 0
         self._loading_asset = False
+        self._current_usd_source: Optional[str] = None
         self._physics = PhysicsController(self)
         self._physics.pose_changed.connect(self._on_physics_pose)
         self._physics.status_changed.connect(self._on_physics_status)
@@ -79,6 +80,7 @@ class ViewportWidget(QWidget):
         self._hide_hint()
         self.setFocus(Qt.OtherFocusReason)
         self._canvas.setFocus(Qt.OtherFocusReason)
+        self._current_usd_source = str(path)
         self._last_bounds = None
         self._camera.reset()
         self._physics.clear_asset()
@@ -265,7 +267,7 @@ class ViewportWidget(QWidget):
 
     def _on_bounds_ready(self, bounds: dict) -> None:
         self._last_bounds = bounds
-        self._physics.configure_asset(bounds)
+        self._physics.configure_asset(bounds, usd_source=self._current_usd_source)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
         if self._renderer:
             self._renderer.set_collision_proxy_bounds(bounds)

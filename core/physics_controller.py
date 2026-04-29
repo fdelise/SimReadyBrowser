@@ -19,6 +19,15 @@ from PyQt5.QtCore import QObject, QProcess, QTimer, pyqtSignal
 
 
 PROXY_PATH = "/World/AssetProxy"
+AUTHORED_BODY_PATTERNS = [
+    "/RootNode/Geometry/*",
+    "/RootNode",
+    "/RootNode/*",
+    "/*/Geometry/*",
+    "/*",
+]
+PHYSICS_MODE_AUTHORED = "authored"
+PHYSICS_MODE_PROXY = "proxy"
 GROUND_HALF_SIZE = 20.0
 GROUND_THICKNESS = 0.05
 GROUND_TOP_Z = 0.0
@@ -59,6 +68,7 @@ class PhysicsController(QObject):
         self._step_in_flight = False
 
         self._bounds: Optional[dict] = None
+        self._usd_source: Optional[str] = None
         self._center = np.zeros(3, dtype=np.float64)
         self._size = np.ones(3, dtype=np.float64)
         self._sim_time = 0.0
@@ -69,6 +79,10 @@ class PhysicsController(QObject):
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._base_scene = "plane"
         self._pending_magnet: Optional[dict] = None
+        self._physics_mode = PHYSICS_MODE_PROXY
+        self._authored_fallback_attempted = False
+        self._last_start_visual_transform = np.eye(4, dtype=np.float64)
+        self._last_start_play = False
 
     @property
     def status_text(self) -> str:
@@ -86,41 +100,66 @@ class PhysicsController(QObject):
     def current_visual_transform(self) -> np.ndarray:
         return np.array(self._current_visual_transform, dtype=np.float64, copy=True)
 
-    def configure_asset(self, bounds: dict) -> None:
+    def configure_asset(self, bounds: dict, usd_source: Optional[str] = None) -> None:
         self.shutdown()
         self._pending_magnet = None
         self._bounds = self._normalize_bounds(bounds)
+        self._usd_source = str(usd_source) if usd_source else None
         self._center = np.array(self._bounds["center"], dtype=np.float64)
         self._size = np.array(self._bounds["size"], dtype=np.float64)
         self._current_visual_transform = np.eye(4, dtype=np.float64)
-        self._set_status("Physics ready. Play drops the asset proxy onto the ground.")
+        self._physics_mode = PHYSICS_MODE_AUTHORED if self._usd_source else PHYSICS_MODE_PROXY
+        self._authored_fallback_attempted = False
+        if self._usd_source:
+            self._set_status("Physics ready. Play uses the asset's authored SimReady colliders.")
+        else:
+            self._set_status("Physics ready. Play drops the asset proxy onto the ground.")
 
     def clear_asset(self) -> None:
         self.shutdown()
         self._bounds = None
+        self._usd_source = None
         self._pending_magnet = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
+        self._physics_mode = PHYSICS_MODE_PROXY
+        self._authored_fallback_attempted = False
         self._set_status("Load an asset, then use Play or Restart physics.")
 
-    def restart(self, visual_transform: Optional[np.ndarray] = None, play: bool = True) -> bool:
+    def restart(self, visual_transform: Optional[np.ndarray] = None, play: bool = True, force_proxy: bool = False) -> bool:
         if self._bounds is None:
             self._set_status("Load an asset before starting physics.")
             self.running_changed.emit(False)
             return False
 
+        if not force_proxy:
+            self._authored_fallback_attempted = False
+
         self._release_scene()
         self._sim_time = 0.0
         self._pending_play = bool(play)
         self._pending_step_after_start = False
+        self._physics_mode = (
+            PHYSICS_MODE_AUTHORED
+            if self._usd_source and not force_proxy
+            else PHYSICS_MODE_PROXY
+        )
 
         visual = (
             np.array(visual_transform, dtype=np.float64, copy=True)
             if visual_transform is not None
             else self._default_drop_visual_transform()
         )
+        self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
+        self._last_start_play = bool(play)
         body_matrix = self._body_from_visual(visual)
+        initial_pose = self._pose_from_body(body_matrix)
+
+        if self._physics_mode == PHYSICS_MODE_AUTHORED:
+            scene_path = self._write_authored_scene()
+            return self._start_worker(scene_path, AUTHORED_BODY_PATTERNS, initial_pose)
+
         scene_path = self._write_proxy_scene(body_matrix)
-        return self._start_worker(scene_path)
+        return self._start_worker(scene_path, [PROXY_PATH], initial_pose)
 
     def set_playing(self, playing: bool) -> None:
         if playing and self._process is None:
@@ -218,8 +257,8 @@ class PhysicsController(QObject):
     def update_magnet(self, target_visual: np.ndarray, target_velocity_visual: Optional[np.ndarray] = None) -> None:
         if self._pending_magnet is None:
             return
-        self._pending_magnet["target"] = self._point_z_to_y(target_visual).astype(float).tolist()
-        self._pending_magnet["target_velocity"] = self._vector_z_to_y(
+        self._pending_magnet["target"] = self._point_visual_to_physics(target_visual).astype(float).tolist()
+        self._pending_magnet["target_velocity"] = self._vector_visual_to_physics(
             np.zeros(3, dtype=np.float64) if target_velocity_visual is None else target_velocity_visual
         ).astype(float).tolist()
         if self._worker_ready:
@@ -227,7 +266,7 @@ class PhysicsController(QObject):
 
     def end_magnet(self, throw_velocity_visual: Optional[np.ndarray] = None) -> None:
         self._pending_magnet = None
-        velocity = self._vector_z_to_y(
+        velocity = self._vector_visual_to_physics(
             np.zeros(3, dtype=np.float64) if throw_velocity_visual is None else throw_velocity_visual
         )
         if self._worker_ready:
@@ -244,7 +283,7 @@ class PhysicsController(QObject):
     def shutdown(self) -> None:
         self._release_scene()
 
-    def _start_worker(self, scene_path: Path) -> bool:
+    def _start_worker(self, scene_path: Path, body_patterns: list[str], initial_pose: np.ndarray) -> bool:
         self._set_status("Starting OVPhysX worker...")
         self._process = QProcess(self)
         self._process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
@@ -264,7 +303,14 @@ class PhysicsController(QObject):
             self.running_changed.emit(False)
             return False
 
-        self._send({"cmd": "start", "scene": str(scene_path)})
+        self._send(
+            {
+                "cmd": "start",
+                "scene": str(scene_path),
+                "body_patterns": body_patterns,
+                "initial_pose": initial_pose.astype(float).tolist(),
+            }
+        )
         return True
 
     def _send_step(self) -> None:
@@ -308,7 +354,13 @@ class PhysicsController(QObject):
         kind = message.get("type")
         if kind == "started":
             self._worker_ready = True
-            self._set_status("Physics reset and ready.")
+            body_count = int(message.get("body_count", 1) or 1)
+            if self._physics_mode == PHYSICS_MODE_AUTHORED:
+                pattern = str(message.get("body_pattern", "authored USD bodies"))
+                suffix = "body" if body_count == 1 else "bodies"
+                self._set_status(f"Physics reset with authored colliders ({body_count} {suffix}, {pattern}).")
+            else:
+                self._set_status("Physics reset with proxy collider.")
             if self._pending_magnet is not None:
                 self._send(self._pending_magnet)
             if self._pending_play:
@@ -330,6 +382,15 @@ class PhysicsController(QObject):
 
         if kind == "error":
             self._step_in_flight = False
+            if self._physics_mode == PHYSICS_MODE_AUTHORED and not self._authored_fallback_attempted:
+                self._authored_fallback_attempted = True
+                visual = np.array(self._last_start_visual_transform, dtype=np.float64, copy=True)
+                play = bool(self._last_start_play or self._pending_play or self._running)
+                self._set_status(
+                    f"Authored colliders unavailable ({message.get('message', 'unknown error')}); using proxy collider."
+                )
+                self.restart(visual_transform=visual, play=play, force_proxy=True)
+                return
             self._pending_play = False
             if self._timer.isActive():
                 self._timer.stop()
@@ -393,16 +454,24 @@ class PhysicsController(QObject):
         drop_height = max(float(self._size[2]) * 1.5, 0.75)
         body_z[3, :3] = self._center
         body_z[3, 2] = max(body_z[3, 2], GROUND_TOP_Z + half_z + drop_height)
+        if self._physics_mode == PHYSICS_MODE_AUTHORED:
+            visual = np.eye(4, dtype=np.float64)
+            visual[3, :3] = body_z[3, :3] - self._center
+            return visual
         return self._visual_from_body(self._z_to_y_matrix(body_z))
 
     def _body_from_visual(self, visual_matrix: np.ndarray) -> np.ndarray:
         visual = np.array(visual_matrix, dtype=np.float64, copy=True)
+        if self._physics_mode == PHYSICS_MODE_AUTHORED:
+            return visual
         body_z = np.eye(4, dtype=np.float64)
         body_z[:3, :3] = visual[:3, :3]
         body_z[3, :3] = self._center @ visual[:3, :3] + visual[3, :3]
         return self._z_to_y_matrix(body_z)
 
     def _visual_from_body(self, body_matrix: np.ndarray) -> np.ndarray:
+        if self._physics_mode == PHYSICS_MODE_AUTHORED:
+            return np.array(body_matrix, dtype=np.float64, copy=True)
         body = self._y_to_z_matrix(body_matrix)
         visual = np.eye(4, dtype=np.float64)
         visual[:3, :3] = body[:3, :3]
@@ -411,6 +480,10 @@ class PhysicsController(QObject):
 
     def _pose_from_visual(self, visual_matrix: np.ndarray) -> np.ndarray:
         body = self._body_from_visual(visual_matrix)
+        return self._pose_from_body(body)
+
+    def _pose_from_body(self, body_matrix: np.ndarray) -> np.ndarray:
+        body = np.asarray(body_matrix, dtype=np.float64).reshape(4, 4)
         quat = self._quat_xyzw_from_row_rotation(body[:3, :3])
         pose = np.zeros(7, dtype=np.float32)
         pose[:3] = body[3, :3].astype(np.float32)
@@ -430,13 +503,51 @@ class PhysicsController(QObject):
         )
         return {
             "cmd": "set_magnet",
-            "anchor": self._vector_z_to_y(anchor_local_visual).astype(float).tolist(),
-            "target": self._point_z_to_y(target_visual).astype(float).tolist(),
-            "target_velocity": self._vector_z_to_y(target_velocity).astype(float).tolist(),
+            "anchor": self._vector_visual_to_physics(anchor_local_visual).astype(float).tolist(),
+            "target": self._point_visual_to_physics(target_visual).astype(float).tolist(),
+            "target_velocity": self._vector_visual_to_physics(target_velocity).astype(float).tolist(),
             "stiffness": 520.0,
             "damping": 62.0,
             "max_force": 3200.0,
         }
+
+    def _write_authored_scene(self) -> Path:
+        if not self._usd_source:
+            raise RuntimeError("No USD source is configured for authored collider physics")
+
+        temp_dir = Path(tempfile.gettempdir()) / "simready_browser_physx"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        self._scene_path = temp_dir / "authored_asset_scene.usda"
+
+        asset_ref = self._usd_asset_reference(self._usd_source)
+        base_scene = self._base_scene_usda_z_up()
+        text = f"""#usda 1.0
+(
+    defaultPrim = "World"
+    doc = "SimReady Browser OVPhysX authored-collider scene"
+    metersPerUnit = 1
+    upAxis = "Z"
+    kilogramsPerMass = 1
+    subLayers = [
+        @{asset_ref}@
+    ]
+)
+
+def Xform "World" (
+    kind = "component"
+)
+{{
+    def PhysicsScene "PhysicsScene"
+    {{
+        vector3f physics:gravityDirection = (0, 0, -1)
+        float physics:gravityMagnitude = 9.81
+    }}
+
+{base_scene}
+}}
+"""
+        self._scene_path.write_text(text, encoding="utf-8")
+        return self._scene_path
 
     def _write_proxy_scene(self, body_matrix: np.ndarray) -> Path:
         temp_dir = Path(tempfile.gettempdir()) / "simready_browser_physx"
@@ -496,6 +607,95 @@ def Xform "World" (
 """
         self._scene_path.write_text(text, encoding="utf-8")
         return self._scene_path
+
+    @staticmethod
+    def _usd_asset_reference(source: str) -> str:
+        text = str(source or "").strip().replace("\\", "/")
+        if "://" not in text and text:
+            try:
+                text = Path(text).expanduser().resolve().as_posix()
+            except Exception:
+                pass
+        return text.replace("@", "%40")
+
+    def _base_scene_usda_z_up(self) -> str:
+        parts = [self._ground_usda_z_up()]
+        if self._base_scene == "ramp":
+            parts.append(self._ramp_usda_z_up())
+        elif self._base_scene == "obstacles":
+            parts.extend(
+                [
+                    self._box_usda_z_up("ObstacleA", (-2.4, -1.4, 0.35), (1.2, 1.2, 0.7)),
+                    self._box_usda_z_up("ObstacleB", (1.8, 1.2, 0.6), (1.0, 1.6, 1.2)),
+                    self._box_usda_z_up("ObstacleC", (0.0, -2.8, 0.25), (2.0, 0.6, 0.5)),
+                ]
+            )
+        return "\n".join(parts)
+
+    def _ground_usda_z_up(self) -> str:
+        ground_z = -GROUND_THICKNESS * 0.5
+        return f"""    def Xform "Ground" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {{
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cube "GroundGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:translate = (0, 0, {self._fmt(ground_z)})
+            double3 xformOp:scale = ({self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_THICKNESS)})
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }}
+    }}"""
+
+    def _ramp_usda_z_up(self) -> str:
+        angle = math.radians(34.0)
+        return f"""    def Xform "Ramp" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {{
+        double3 xformOp:translate = (0, 0, 0.96)
+        quatd xformOp:orient = ({self._fmt(math.cos(angle * 0.5))}, 0, {self._fmt(math.sin(angle * 0.5))}, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Cube "RampGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:scale = (3.4, 2.2, 0.22)
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+        }}
+    }}"""
+
+    def _box_usda_z_up(self, name: str, translate: tuple[float, float, float], scale: tuple[float, float, float]) -> str:
+        tx, ty, tz = translate
+        sx, sy, sz = scale
+        return f"""    def Xform "{name}" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {{
+        double3 xformOp:translate = ({self._fmt(tx)}, {self._fmt(ty)}, {self._fmt(tz)})
+        double3 xformOp:scale = (1, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+
+        def Cube "Geom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:scale = ({self._fmt(sx)}, {self._fmt(sy)}, {self._fmt(sz)})
+            uniform token[] xformOpOrder = ["xformOp:scale"]
+        }}
+    }}"""
 
     def _base_scene_usda(self) -> str:
         parts = [self._ground_usda()]
@@ -674,6 +874,18 @@ def Xform "World" (
     @staticmethod
     def _point_z_to_y(point: np.ndarray) -> np.ndarray:
         return np.asarray(point, dtype=np.float64).reshape(3) @ Z_TO_Y_ROTATION
+
+    def _vector_visual_to_physics(self, vector: np.ndarray) -> np.ndarray:
+        arr = np.asarray(vector, dtype=np.float64).reshape(3)
+        if self._physics_mode == PHYSICS_MODE_AUTHORED:
+            return arr
+        return arr @ Z_TO_Y_ROTATION
+
+    def _point_visual_to_physics(self, point: np.ndarray) -> np.ndarray:
+        arr = np.asarray(point, dtype=np.float64).reshape(3)
+        if self._physics_mode == PHYSICS_MODE_AUTHORED:
+            return arr
+        return arr @ Z_TO_Y_ROTATION
 
     @staticmethod
     def _fmt(value: float) -> str:
