@@ -80,7 +80,6 @@ class PhysicsController(QObject):
         self._base_scene = "plane"
         self._pending_magnet: Optional[dict] = None
         self._physics_mode = PHYSICS_MODE_PROXY
-        self._authored_fallback_attempted = False
         self._last_start_visual_transform = np.eye(4, dtype=np.float64)
         self._last_start_play = False
 
@@ -109,11 +108,10 @@ class PhysicsController(QObject):
         self._size = np.array(self._bounds["size"], dtype=np.float64)
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._physics_mode = PHYSICS_MODE_AUTHORED if self._usd_source else PHYSICS_MODE_PROXY
-        self._authored_fallback_attempted = False
         if self._usd_source:
             self._set_status("Physics ready. Play uses the asset's authored SimReady colliders.")
         else:
-            self._set_status("Physics ready. Play drops the asset proxy onto the ground.")
+            self._set_status("Physics unavailable: no USD source to inspect authored colliders.")
 
     def clear_asset(self) -> None:
         self.shutdown()
@@ -122,27 +120,24 @@ class PhysicsController(QObject):
         self._pending_magnet = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._physics_mode = PHYSICS_MODE_PROXY
-        self._authored_fallback_attempted = False
         self._set_status("Load an asset, then use Play or Restart physics.")
 
-    def restart(self, visual_transform: Optional[np.ndarray] = None, play: bool = True, force_proxy: bool = False) -> bool:
+    def restart(self, visual_transform: Optional[np.ndarray] = None, play: bool = True) -> bool:
         if self._bounds is None:
             self._set_status("Load an asset before starting physics.")
             self.running_changed.emit(False)
             return False
 
-        if not force_proxy:
-            self._authored_fallback_attempted = False
+        if not self._usd_source:
+            self._set_status("Physics not started: this asset has no USD source with authored colliders.")
+            self.running_changed.emit(False)
+            return False
 
         self._release_scene()
         self._sim_time = 0.0
         self._pending_play = bool(play)
         self._pending_step_after_start = False
-        self._physics_mode = (
-            PHYSICS_MODE_AUTHORED
-            if self._usd_source and not force_proxy
-            else PHYSICS_MODE_PROXY
-        )
+        self._physics_mode = PHYSICS_MODE_AUTHORED
 
         visual = (
             np.array(visual_transform, dtype=np.float64, copy=True)
@@ -154,12 +149,8 @@ class PhysicsController(QObject):
         body_matrix = self._body_from_visual(visual)
         initial_pose = self._pose_from_body(body_matrix)
 
-        if self._physics_mode == PHYSICS_MODE_AUTHORED:
-            scene_path = self._write_authored_scene()
-            return self._start_worker(scene_path, AUTHORED_BODY_PATTERNS, initial_pose)
-
-        scene_path = self._write_proxy_scene(body_matrix)
-        return self._start_worker(scene_path, [PROXY_PATH], initial_pose)
+        scene_path = self._write_authored_scene()
+        return self._start_worker(scene_path, AUTHORED_BODY_PATTERNS, initial_pose)
 
     def set_playing(self, playing: bool) -> None:
         if playing and self._process is None:
@@ -382,22 +373,18 @@ class PhysicsController(QObject):
 
         if kind == "error":
             self._step_in_flight = False
-            if self._physics_mode == PHYSICS_MODE_AUTHORED and not self._authored_fallback_attempted:
-                self._authored_fallback_attempted = True
-                visual = np.array(self._last_start_visual_transform, dtype=np.float64, copy=True)
-                play = bool(self._last_start_play or self._pending_play or self._running)
-                self._set_status(
-                    f"Authored colliders unavailable ({message.get('message', 'unknown error')}); using proxy collider."
-                )
-                self.restart(visual_transform=visual, play=play, force_proxy=True)
-                return
             self._pending_play = False
             if self._timer.isActive():
                 self._timer.stop()
             if self._running:
                 self._running = False
                 self.running_changed.emit(False)
-            self._set_status(f"OVPhysX failed: {message.get('message', 'unknown error')}")
+            detail = message.get("message", "unknown error")
+            if self._physics_mode == PHYSICS_MODE_AUTHORED:
+                self._set_status(f"No authored collision body found for this asset; physics not started. {detail}")
+            else:
+                self._set_status(f"OVPhysX failed: {detail}")
+            self._release_scene()
             return
 
         if kind == "stopped":
