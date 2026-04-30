@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import tempfile
 from pathlib import Path
 import sys
@@ -702,6 +704,82 @@ def _test_https_simready_cooks(use_overrides: bool = True, drop: bool = False) -
             worker.shutdown()
 
 
+def _test_selected_multi_simready_cooks() -> None:
+    from PyQt5.QtCore import QCoreApplication
+
+    from core.physics_controller import PhysicsController
+
+    QCoreApplication.instance() or QCoreApplication([])
+    assets = [
+        (
+            "https://omniverse-content-production.s3.us-west-2.amazonaws.com/"
+            "Assets/Isaac/6.0/Isaac/SimReady/Industrial/Hardware/Tapes/Clear_Tape/"
+            "sm_tape_clear_a02_01.usd"
+        ),
+        (
+            "https://omniverse-content-production.s3.us-west-2.amazonaws.com/"
+            "Assets/Isaac/6.0/Isaac/SimReady/Industrial/Hardware/Tapes/Tape_Dispenser_002/"
+            "sm_tape_dispenser_a02_01.usd"
+        ),
+    ]
+    transforms = []
+    for x in (0.0, 0.8):
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[3, 0] = x
+        transforms.append(matrix.tolist())
+
+    controller = PhysicsController()
+    bounds = {
+        "center": [0.4, 0.0, 0.15],
+        "size": [1.2, 0.5, 0.4],
+        "extent": 0.75,
+        "_multi_asset": True,
+        "_asset_count": len(assets),
+        "_asset_sources": assets,
+        "_asset_layout_transforms": transforms,
+    }
+    controller.configure_asset(bounds, usd_source=None)
+    discoveries = [
+        controller._authored_collider_discovery(controller._usd_asset_reference(asset))
+        for asset in assets
+    ]
+    scene = controller._write_authored_scene(discoveries)
+    scene_text = scene.read_text(encoding="utf-8")
+    assert "</World/Asset_02/Geometry/sm_support_a02_obj_00>" in scene_text
+    assert "</World/Asset_02/Geometry/sm_pakingtape_a02_obj_00>" in scene_text
+
+    start_message = {
+        "cmd": "start",
+        "scene": str(scene),
+        "body_patterns": controller._current_body_patterns,
+        "body_paths": controller._current_body_paths,
+        "articulation_paths": controller._current_articulation_paths,
+        "instance_paths": controller._instance_root_paths(len(assets)),
+        "instance_reference_poses": controller._instance_reference_poses(),
+        "initial_pose": None,
+        "contact_offset": 0.02,
+        "cook_only": True,
+        "ccd_enabled": False,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-m", "core.physics_worker"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate(
+        json.dumps(start_message, separators=(",", ":")) + "\n" + json.dumps({"cmd": "shutdown"}) + "\n",
+        timeout=240,
+    )
+    messages = [json.loads(line) for line in stdout.splitlines() if line.startswith("{")]
+    cooked = [message for message in messages if message.get("type") == "cooked"][-1]
+    assert int(cooked.get("body_count", 0)) >= 3, cooked
+    assert int(cooked.get("shape_count", 0)) > 0, cooked
+    assert "body relationship /World/Asset/Geometry" not in stderr
+
+
 def main() -> int:
     if len(sys.argv) > 1:
         mode = sys.argv[1].strip().lower()
@@ -754,6 +832,10 @@ def main() -> int:
         if mode == "https-drop":
             _test_https_simready_cooks(drop=True)
             print("HTTPS SimReady authored-collider drop test passed")
+            return 0
+        if mode == "selected-multi":
+            _test_selected_multi_simready_cooks()
+            print("selected multi-asset authored-collider cook test passed")
             return 0
         raise SystemExit(f"unknown mode: {mode}")
 

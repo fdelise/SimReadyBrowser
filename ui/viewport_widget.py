@@ -123,6 +123,41 @@ class ViewportWidget(QWidget):
             lambda source=str(path), gen=generation: self._load_usd_after_overlay(source, gen),
         )
 
+    def load_usds(self, items) -> None:
+        normalized = self._normalize_stage_items(items)
+        if not normalized:
+            return
+        if len(normalized) == 1:
+            self.load_usd(normalized[0]["source"])
+            return
+
+        self._hide_hint()
+        self.setFocus(Qt.OtherFocusReason)
+        self._canvas.setFocus(Qt.OtherFocusReason)
+        self._current_usd_source = None
+        self._current_load_name = ""
+        self._last_bounds = None
+        self._camera.reset()
+        self._reset_physics_interaction_state()
+        self._physics.clear_asset()
+        self._physics_cooking_active = False
+        self._physics_auto_cook_started = False
+        self._pending_asset_instance_count = 1
+        if self._renderer:
+            self._renderer.set_asset_instance_count(1)
+            self._renderer.set_asset_transform(np.eye(4, dtype=np.float64))
+            self._renderer.set_physics_body_transforms([])
+        self._loading_asset = True
+        self._load_generation += 1
+        generation = self._load_generation
+        msg = f"Queued {len(normalized)} selected assets for OVRTX..."
+        self._set_loading(True, msg)
+        self.loading_changed.emit(True, msg)
+        QTimer.singleShot(
+            LOAD_START_DELAY_MS,
+            lambda stage_items=normalized, gen=generation: self._load_usds_after_overlay(stage_items, gen),
+        )
+
     @property
     def camera(self) -> SphericalCamera:
         return self._camera
@@ -301,6 +336,14 @@ class ViewportWidget(QWidget):
         renderer.load_stage(path)
         self.asset_loaded.emit(path)
 
+    def _load_usds_after_overlay(self, items: list[dict], generation: int) -> None:
+        if generation != self._load_generation:
+            return
+        renderer = self._ensure_renderer()
+        self._push_camera()
+        renderer.load_stage_items(items)
+        self.asset_loaded.emit(f"{len(items)} assets")
+
     def _on_frame(self, img: QImage) -> None:
         self._canvas.set_image(img)
 
@@ -343,7 +386,8 @@ class ViewportWidget(QWidget):
         if source and self._current_usd_source and source != self._current_usd_source:
             return
         self._last_bounds = bounds
-        self._physics.configure_asset(bounds, usd_source=self._current_usd_source)
+        usd_source = None if bounds.get("_multi_asset") else self._current_usd_source
+        self._physics.configure_asset(bounds, usd_source=usd_source)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
         if self._renderer:
             self._renderer.set_collision_proxy_bounds(bounds)
@@ -357,13 +401,20 @@ class ViewportWidget(QWidget):
     def _cook_physics_after_load(self) -> None:
         if self._loading_asset or self._physics_auto_cook_started:
             return
-        if self._last_bounds is None or not self._current_usd_source:
+        if self._last_bounds is None:
+            return
+        has_multi_sources = bool(self._last_bounds.get("_asset_sources")) if isinstance(self._last_bounds, dict) else False
+        if not self._current_usd_source and not has_multi_sources:
             return
         if self._physics.has_scene or self._physics_cooking_active:
             return
 
         self._physics_auto_cook_started = True
-        self._begin_physics_progress("Cooking physics colliders for loaded asset...", 0)
+        if has_multi_sources:
+            count = len(self._last_bounds.get("_asset_sources", []) or [])
+            self._begin_physics_progress(f"Cooking physics colliders for {count} selected assets...", 0)
+        else:
+            self._begin_physics_progress("Cooking physics colliders for loaded asset...", 0)
         if not self._physics.cook_colliders():
             self._physics_cooking_active = False
             self.loading_changed.emit(False, self._physics.status_text)
@@ -758,6 +809,27 @@ class ViewportWidget(QWidget):
                 continue
             bodies.append({"path": path, "matrix": matrix})
         return bodies
+
+    @staticmethod
+    def _normalize_stage_items(items) -> list[dict]:
+        normalized: list[dict] = []
+        try:
+            raw_items = list(items or [])
+        except TypeError:
+            raw_items = []
+
+        for item in raw_items:
+            if isinstance(item, dict):
+                source = str(item.get("source") or item.get("usd_source") or item.get("path") or "").strip()
+                name = str(item.get("name") or Path(source.split("?", 1)[0]).name or source).strip()
+                key = str(item.get("key") or source).strip()
+            else:
+                source = str(item or "").strip()
+                name = Path(source.split("?", 1)[0]).name or source
+                key = source
+            if source:
+                normalized.append({"source": source, "name": name, "key": key})
+        return normalized[:100]
 
     def _select_physics_body(self, pos: QPoint) -> Optional[dict]:
         if not self._physics_body_transforms:

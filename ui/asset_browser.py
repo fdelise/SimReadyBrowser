@@ -2,12 +2,13 @@
 Asset Browser panel – left-hand side of the SimReady Browser.
 
 Shows a searchable, filterable grid of asset thumbnails pulled from S3.
-Emits asset_selected(AssetInfo) when the user clicks a card.
+Emits asset_selected(AssetInfo) when the user clicks a card, and
+load_selected_requested(list[AssetInfo]) when the user loads a multi-selection.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
@@ -80,6 +81,7 @@ class AssetBrowserPanel(QWidget):
 
     asset_selected = pyqtSignal(object)   # AssetInfo
     asset_activated = pyqtSignal(object)  # AssetInfo
+    load_selected_requested = pyqtSignal(object)  # list[AssetInfo]
     status_message = pyqtSignal(str)
 
     def __init__(self, s3_client: S3Client, parent=None):
@@ -89,7 +91,8 @@ class AssetBrowserPanel(QWidget):
         self._visible_assets: List[AssetInfo] = []
         self._cards:  List[AssetCard] = []
         self._card_by_usd: Dict[str, AssetCard] = {}
-        self._selected: Optional[AssetCard] = None
+        self._selected_usd_keys: Set[str] = set()
+        self._last_clicked_index: Optional[int] = None
         self._render_generation = 0
         self._render_index = 0
         self._render_target_index = 0
@@ -170,6 +173,26 @@ class AssetBrowserPanel(QWidget):
         self._count_label.setStyleSheet(f"color: {COLOR_TEXT_DISABLED}; font-size: 10px;")
         root.addWidget(self._count_label)
 
+        selection_row = QHBoxLayout()
+        selection_row.setSpacing(6)
+
+        self._selection_label = QLabel("No assets selected")
+        self._selection_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px;")
+        selection_row.addWidget(self._selection_label, 1)
+
+        self._load_selected_btn = QPushButton("Load Selected")
+        self._load_selected_btn.setEnabled(False)
+        self._load_selected_btn.setToolTip("Load all selected assets into the viewport")
+        self._load_selected_btn.clicked.connect(self._request_load_selected)
+        self._load_selected_btn.setStyleSheet(
+            f"QPushButton {{ background: {COLOR_ACCENT}; color: #101010; border: none; "
+            f"border-radius: 4px; padding: 5px 8px; font-size: 10px; font-weight: 700; }}"
+            f"QPushButton:disabled {{ background: #3a3a3a; color: {COLOR_TEXT_DISABLED}; }}"
+            "QPushButton:enabled:hover { background: #8bd100; }"
+        )
+        selection_row.addWidget(self._load_selected_btn)
+        root.addLayout(selection_row)
+
         # ── Scrollable grid ───────────────────────────────────────────────────
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -228,11 +251,17 @@ class AssetBrowserPanel(QWidget):
         self._render_generation += 1
         self._visible_assets = []
         self._render_index = 0
+        self._selected_usd_keys.clear()
+        self._last_clicked_index = None
+        self._update_selection_ui()
         self._clear_grid()
         self._client.refresh(force_network=True)
 
     def _on_assets_loaded(self, assets: List[AssetInfo]):
         self._assets = assets
+        valid_keys = {asset.usd_key for asset in assets}
+        self._selected_usd_keys.intersection_update(valid_keys)
+        self._update_selection_ui()
         self._update_category_filter()
         self._filter_assets()
         self._status.setText(f"{len(assets)} assets available")
@@ -310,6 +339,7 @@ class AssetBrowserPanel(QWidget):
                           or any(query in t.lower() for t in a.tags))
             and (cat == "All" or a.category == cat)
         ]
+        self._last_clicked_index = None
 
         self._render_generation += 1
         generation = self._render_generation
@@ -321,9 +351,7 @@ class AssetBrowserPanel(QWidget):
         self._thumb_request_timer.stop()
         self._clear_grid()
         self._scroll.verticalScrollBar().setValue(0)
-        self._count_label.setText(
-            f"Showing 0 of {len(self._visible_assets)} filtered assets"
-        )
+        self._update_selection_ui()
 
         if self._visible_assets:
             self._progress.hide()
@@ -353,14 +381,13 @@ class AssetBrowserPanel(QWidget):
             card.grid_row = row
             card.clicked.connect(self._on_card_clicked)
             card.double_clicked.connect(self._on_card_double_clicked)
+            card.set_selected(asset.usd_key in self._selected_usd_keys)
             self._grid.addWidget(card, row, col)
             self._cards.append(card)
             self._card_by_usd[asset.usd_key] = card
 
         self._render_index = batch_end
-        self._count_label.setText(
-            f"Showing {self._render_index} of {len(self._visible_assets)} filtered assets"
-        )
+        self._update_selection_ui()
         self._progress.hide()
 
         if self._render_index < self._render_target_index:
@@ -375,7 +402,6 @@ class AssetBrowserPanel(QWidget):
                 item.widget().deleteLater()
         self._cards = []
         self._card_by_usd = {}
-        self._selected = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -446,23 +472,76 @@ class AssetBrowserPanel(QWidget):
 
     # ── Card selection ─────────────────────────────────────────────────────────
 
-    def _on_card_clicked(self, asset: AssetInfo):
-        # Deselect previous
-        if self._selected:
-            self._selected.set_selected(False)
+    def _on_card_clicked(self, asset: AssetInfo, modifiers=Qt.NoModifier):
+        try:
+            index = self._visible_assets.index(asset)
+        except ValueError:
+            index = None
 
-        # Select new
-        for card in self._cards:
-            if card.asset is asset:
-                card.set_selected(True)
-                self._selected = card
-                break
+        ctrl_down = bool(modifiers & Qt.ControlModifier)
+        shift_down = bool(modifiers & Qt.ShiftModifier)
 
+        if shift_down and index is not None and self._last_clicked_index is not None:
+            if not ctrl_down:
+                self._selected_usd_keys.clear()
+            lo, hi = sorted((self._last_clicked_index, index))
+            for item in self._visible_assets[lo : hi + 1]:
+                self._selected_usd_keys.add(item.usd_key)
+        elif ctrl_down:
+            if asset.usd_key in self._selected_usd_keys:
+                self._selected_usd_keys.remove(asset.usd_key)
+            else:
+                self._selected_usd_keys.add(asset.usd_key)
+            self._last_clicked_index = index
+        else:
+            self._selected_usd_keys = {asset.usd_key}
+            self._last_clicked_index = index
+
+        self._update_selection_ui()
         self.asset_selected.emit(asset)
 
     def _on_card_double_clicked(self, asset: AssetInfo):
-        self._on_card_clicked(asset)
+        self._selected_usd_keys = {asset.usd_key}
+        try:
+            self._last_clicked_index = self._visible_assets.index(asset)
+        except ValueError:
+            self._last_clicked_index = None
+        self._update_selection_ui()
+        self.asset_selected.emit(asset)
         self.asset_activated.emit(asset)
+
+    def _request_load_selected(self):
+        selected = self._selected_assets()
+        if selected:
+            self.load_selected_requested.emit(selected)
+
+    def _selected_assets(self) -> List[AssetInfo]:
+        selected = set(self._selected_usd_keys)
+        return [asset for asset in self._assets if asset.usd_key in selected]
+
+    def _update_selection_ui(self):
+        selected_count = len(self._selected_usd_keys)
+
+        if hasattr(self, "_selection_label"):
+            if selected_count == 1:
+                self._selection_label.setText("1 asset selected")
+            elif selected_count:
+                self._selection_label.setText(f"{selected_count} assets selected")
+            else:
+                self._selection_label.setText("No assets selected")
+
+        if hasattr(self, "_load_selected_btn"):
+            self._load_selected_btn.setEnabled(selected_count > 0)
+            self._load_selected_btn.setText("Load Asset" if selected_count == 1 else "Load Selected")
+
+        if hasattr(self, "_count_label"):
+            suffix = f" | selected {selected_count}" if selected_count else ""
+            self._count_label.setText(
+                f"Showing {self._render_index} of {len(self._visible_assets)} filtered assets{suffix}"
+            )
+
+        for card in self._cards:
+            card.set_selected(card.asset.usd_key in self._selected_usd_keys)
 
 
 # ── Asset card widget ───────────────────────────────────────────────────────────
@@ -470,7 +549,7 @@ class AssetBrowserPanel(QWidget):
 class AssetCard(QFrame):
     """Single asset thumbnail + name card in the grid."""
 
-    clicked = pyqtSignal(object)  # AssetInfo
+    clicked = pyqtSignal(object, object)  # AssetInfo, keyboard modifiers
     double_clicked = pyqtSignal(object)  # AssetInfo
 
     _PLACEHOLDER: Optional[QPixmap] = None
@@ -555,7 +634,7 @@ class AssetCard(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.asset)
+            self.clicked.emit(self.asset, event.modifiers())
             event.accept()
 
     def mouseDoubleClickEvent(self, event):

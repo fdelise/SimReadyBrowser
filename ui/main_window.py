@@ -261,6 +261,7 @@ class MainWindow(QMainWindow):
         # Browser → controls & viewport
         self._browser.asset_selected.connect(self._on_asset_selected)
         self._browser.asset_activated.connect(self._load_asset)
+        self._browser.load_selected_requested.connect(self._load_assets)
         self._browser.status_message.connect(self._set_status)
 
         # Viewport → status / FPS
@@ -298,6 +299,22 @@ class MainWindow(QMainWindow):
         """Load the selected USD directly from S3."""
         self._set_status(f"Loading {asset.display_name} in OVRTX...")
         self._viewport.load_usd(asset.usd_url)
+
+    def _load_assets(self, assets):
+        selected = [asset for asset in assets if isinstance(asset, AssetInfo)]
+        if not selected:
+            return
+        if len(selected) == 1:
+            self._load_asset(selected[0])
+            return
+
+        self._set_status(f"Loading {len(selected)} selected assets in OVRTX...")
+        self._viewport.load_usds(
+            [
+                {"name": asset.display_name, "source": asset.usd_url, "key": asset.usd_key}
+                for asset in selected
+            ]
+        )
 
     def _set_status(self, msg: str):
         self._status_left.setText(msg)

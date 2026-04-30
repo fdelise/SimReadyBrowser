@@ -12,8 +12,8 @@ import gc
 import hashlib
 import json
 import os
+import random
 import re
-import subprocess
 import struct
 import sys
 import tempfile
@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QCoreApplication, QObject, QProcess, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage
 
 from core.camera_controller import SphericalCamera
@@ -116,6 +116,7 @@ class OVRTXRenderer(QObject):
     loading_finished = pyqtSignal(bool, str)
 
     _load_stage_requested = pyqtSignal(str)
+    _load_stage_items_requested = pyqtSignal(object)
     _resolution_requested = pyqtSignal(int, int)
     _camera_transform_requested = pyqtSignal(object)
     _asset_transform_requested = pyqtSignal(object)
@@ -140,6 +141,7 @@ class OVRTXRenderer(QObject):
         self._renderer = None
         self._stage_loaded = False
         self._pending_stage: Optional[str] = None
+        self._pending_stage_items: Optional[list[dict]] = None
         self._render_timer: Optional[QTimer] = None
         self._placeholder_timer: Optional[QTimer] = None
         self._placeholder_frame = 0
@@ -153,6 +155,7 @@ class OVRTXRenderer(QObject):
         self._camera_dirty = True
         self._asset_transform = np.eye(4, dtype=np.float64)
         self._asset_transform_dirty = True
+        self._asset_layout_transforms: list[np.ndarray] = []
         self._asset_transform_warning_shown = False
         self._asset_instance_count = 1
         self._loaded_asset_instance_count = 1
@@ -167,6 +170,13 @@ class OVRTXRenderer(QObject):
         self._collision_proxy_bounds: Optional[dict] = None
         self._collision_asset_overlay_loaded = False
         self._collision_asset_overlay_path: Optional[Path] = None
+        self._collision_overlay_process: Optional[QProcess] = None
+        self._collision_overlay_process_asset: Optional[str] = None
+        self._collision_overlay_process_path: Optional[Path] = None
+        self._collision_overlay_stats_path: Optional[Path] = None
+        self._collision_overlay_buffer = ""
+        self._collision_overlay_error = ""
+        self._collision_overlay_build_announced = False
         self._collision_overlay_dirty = True
         self._collision_overlay_warning_shown = False
         self._current_usd_source: Optional[str] = None
@@ -185,6 +195,7 @@ class OVRTXRenderer(QObject):
 
     def _connect_requests(self) -> None:
         self._load_stage_requested.connect(self._load_stage, Qt.QueuedConnection)
+        self._load_stage_items_requested.connect(self._load_stage_items, Qt.QueuedConnection)
         self._resolution_requested.connect(self._set_resolution, Qt.QueuedConnection)
         self._camera_transform_requested.connect(self._set_camera_transform, Qt.QueuedConnection)
         self._asset_transform_requested.connect(self._set_asset_transform, Qt.QueuedConnection)
@@ -204,6 +215,11 @@ class OVRTXRenderer(QObject):
         if self._shutdown_started:
             return
         self._load_stage_requested.emit(str(usd_source))
+
+    def load_stage_items(self, items) -> None:
+        if self._shutdown_started:
+            return
+        self._load_stage_items_requested.emit(self._normalize_stage_items(items))
 
     def set_resolution(self, width: int, height: int) -> None:
         if self._shutdown_started:
@@ -290,9 +306,10 @@ class OVRTXRenderer(QObject):
             detail = f" ({OVRTX_IMPORT_ERROR})" if OVRTX_IMPORT_ERROR else ""
             msg = f"ovrtx is not installed; showing preview mode.{detail}"
             self.status_changed.emit(msg)
-            if self._pending_stage:
+            if self._pending_stage or self._pending_stage_items:
                 self.loading_finished.emit(False, msg)
                 self._pending_stage = None
+                self._pending_stage_items = None
             self._start_placeholder_timer()
             return
 
@@ -305,25 +322,44 @@ class OVRTXRenderer(QObject):
             )
             self._renderer = Renderer(cfg)
             self.status_changed.emit("OVRTX renderer ready.")
-            if self._pending_stage:
+            if self._pending_stage_items:
+                pending_items = self._pending_stage_items
+                self._pending_stage_items = None
+                self._pending_stage = None
+                self._load_stage_items(pending_items)
+            elif self._pending_stage:
                 pending_stage = self._pending_stage
                 self._pending_stage = None
                 self._load_stage(pending_stage)
         except Exception as exc:
-            if self._pending_stage:
+            if self._pending_stage or self._pending_stage_items:
                 msg = f"OVRTX init failed before loading asset: {exc}"
                 self.loading_finished.emit(False, msg)
                 self._pending_stage = None
+                self._pending_stage_items = None
             self.error_occurred.emit(f"OVRTX init failed: {exc}")
             self._start_placeholder_timer()
 
     def _load_stage(self, usd_source: str) -> None:
+        self._load_stage_items([{"source": str(usd_source)}])
+
+    def _load_stage_items(self, items) -> None:
         if self._shutdown_started:
             return
-        display_name = Path(usd_source).name or usd_source
+
+        stage_items = self._normalize_stage_items(items)
+        if not stage_items:
+            msg = "No USD assets were selected."
+            self.error_occurred.emit(msg)
+            self.loading_finished.emit(False, msg)
+            return
+
+        count = len(stage_items)
+        display_name = stage_items[0]["name"] if count == 1 else f"{count} selected assets"
         if not self._renderer:
             if OVRTX_AVAILABLE is not False:
-                self._pending_stage = usd_source
+                self._pending_stage_items = stage_items
+                self._pending_stage = stage_items[0]["source"] if count == 1 else None
                 msg = "Waiting for OVRTX renderer to finish initializing..."
                 self.loading_started.emit(f"Loading {display_name} in OVRTX...")
                 self.loading_progress.emit(0, msg)
@@ -336,19 +372,23 @@ class OVRTXRenderer(QObject):
 
         try:
             self._stage_loaded = False
-            self._current_usd_source = usd_source
+            self._current_usd_source = stage_items[0]["source"] if count == 1 else None
             self._asset_transform = np.eye(4, dtype=np.float64)
             self._asset_transform_dirty = True
+            self._asset_layout_transforms = []
             self._asset_transform_warning_shown = False
-            self._asset_instance_count = 1
-            self._loaded_asset_instance_count = 1
+            self._asset_instance_count = count
+            self._loaded_asset_instance_count = 0
             self._asset_instance_warning_shown = False
             self._physics_body_transforms = []
             self._physics_body_transform_dirty = False
             self._physics_body_reset_paths = set()
             self._physics_body_transform_warning_shown = False
+            self._release_collision_overlay_process()
             self._collision_asset_overlay_loaded = False
             self._collision_asset_overlay_path = None
+            self._collision_proxy_bounds = None
+            self._collision_overlay_build_announced = False
             self._base_scene_dirty = True
             self._collision_overlay_dirty = True
             self._collision_overlay_warning_shown = False
@@ -363,17 +403,26 @@ class OVRTXRenderer(QObject):
             self.loading_progress.emit(25, "Applying Isaac Z-up stage settings...")
             self._renderer.add_usd_layer(self._stage_settings_layer())
 
-            self.loading_progress.emit(35, "Streaming USD, payloads, and materials...")
-            self._renderer.add_usd(usd_source, path_prefix=ASSET_ROOT)
+            for index, item in enumerate(stage_items):
+                progress = 35 + int(25 * index / max(1, count))
+                self.loading_progress.emit(progress, f"Streaming {index + 1} of {count}: {item['name']}")
+                self._renderer.add_usd(item["source"], path_prefix=self._asset_render_root(index))
+                self._loaded_asset_instance_count = index + 1
 
             self.loading_progress.emit(60, "Adding review camera and lights...")
             self._renderer.add_usd_layer(self._review_layer(), path_prefix=REVIEW_ROOT)
 
+            bounds_entries: list[dict] = []
+            if count > 1:
+                self.loading_progress.emit(68, "Reading selected asset bounds...")
+                for item in stage_items:
+                    bounds_entries.append(self._read_stage_bounds(item["source"]) or DEFAULT_FRAME_BOUNDS.copy())
+                self._asset_layout_transforms = self._layout_asset_transforms(bounds_entries)
+
             self._stage_loaded = True
             self._camera_dirty = True
-            self.loading_progress.emit(72, "Applying viewport settings...")
+            self.loading_progress.emit(76, "Applying viewport settings...")
             self._apply_resolution()
-            self._ensure_asset_instances()
             self._apply_asset_transform()
             self._apply_physics_body_transforms()
             self._apply_base_scene()
@@ -381,13 +430,24 @@ class OVRTXRenderer(QObject):
             self._apply_dome_light()
             self._apply_directional_light()
 
-            self.loading_progress.emit(84, "Framing asset bounds...")
-            bounds = self._read_stage_bounds(usd_source)
-            if bounds:
-                bounds = dict(bounds)
-                bounds["_usd_source"] = usd_source
-                self._frame_initial_camera(bounds)
-                self.bounds_ready.emit(bounds)
+            self.loading_progress.emit(86, "Framing asset bounds...")
+            if count == 1:
+                bounds = dict(self._read_stage_bounds(stage_items[0]["source"]) or DEFAULT_FRAME_BOUNDS.copy())
+                bounds["_usd_source"] = stage_items[0]["source"]
+            else:
+                bounds = self._combined_layout_bounds(bounds_entries, self._asset_layout_transforms)
+                bounds["_multi_asset"] = True
+                bounds["_asset_count"] = count
+                bounds["_asset_sources"] = [item["source"] for item in stage_items]
+                bounds["_asset_names"] = [item["name"] for item in stage_items]
+                bounds["_asset_bounds"] = bounds_entries
+                bounds["_asset_layout_transforms"] = [
+                    np.asarray(matrix, dtype=np.float64).reshape(4, 4).tolist()
+                    for matrix in self._asset_layout_transforms
+                ]
+
+            self._frame_initial_camera(bounds)
+            self.bounds_ready.emit(bounds)
 
             self.loading_progress.emit(95, "Rendering first frame...")
             self._render_one()
@@ -880,7 +940,9 @@ def Xform "SimReadyReview"
             hidden = self._hidden_base_transform()
             for index in range(max(1, self._loaded_asset_instance_count)):
                 paths.append(self._asset_render_root(index))
-                if index == 0 and self._asset_instance_count <= 1:
+                if index < self._asset_instance_count and index < len(self._asset_layout_transforms):
+                    matrices.append(np.array(self._asset_layout_transforms[index], dtype=np.float64, copy=True).reshape(4, 4))
+                elif index == 0 and self._asset_instance_count <= 1:
                     matrices.append(np.array(self._asset_transform, dtype=np.float64, copy=True).reshape(4, 4))
                 elif index < self._asset_instance_count:
                     matrices.append(np.eye(4, dtype=np.float64))
@@ -1057,67 +1119,173 @@ def Xform "SimReadyReview"
             return False
 
         try:
-            overlay_path, stats = self._build_collision_wire_overlay_usd(self._current_usd_source)
-            if not overlay_path or not overlay_path.exists():
+            overlay_path, stats_path = self._collision_wire_overlay_paths(self._current_usd_source)
+            if overlay_path.exists() and overlay_path.stat().st_size > 0:
+                stats = self._read_collision_wire_overlay_stats(stats_path)
+                return self._load_collision_wire_overlay(overlay_path, stats)
+            if self._collision_overlay_process is not None:
                 return False
-            self._renderer.add_usd(str(overlay_path))
-            self._collision_asset_overlay_path = overlay_path
-            self._collision_asset_overlay_loaded = True
-            collider_count = int(stats.get("collider_count", 0) or 0)
-            edge_count = int(stats.get("edge_count", 0) or 0)
-            self.status_changed.emit(
-                f"Authored collision wire overlay ready ({collider_count} colliders, {edge_count} edges)."
-            )
-            return True
+            return self._start_collision_wire_overlay_build(self._current_usd_source, overlay_path, stats_path)
         except Exception as exc:
             if not self._collision_overlay_warning_shown:
                 self._collision_overlay_warning_shown = True
                 self.status_changed.emit(f"Authored collision mesh overlay unavailable: {exc}")
             return False
 
-    def _build_collision_wire_overlay_usd(self, usd_source: str) -> tuple[Optional[Path], dict]:
+    def _load_collision_wire_overlay(self, overlay_path: Path, stats: dict) -> bool:
+        if not self._renderer:
+            return False
+        self._renderer.add_usd(str(overlay_path))
+        self._collision_asset_overlay_path = overlay_path
+        self._collision_asset_overlay_loaded = True
+        collider_count = int(stats.get("collider_count", 0) or 0)
+        edge_count = int(stats.get("edge_count", 0) or 0)
+        if collider_count > 0 or edge_count > 0:
+            self.status_changed.emit(
+                f"Authored collision wire overlay ready ({collider_count} colliders, {edge_count} edges)."
+            )
+        else:
+            self.status_changed.emit("Authored collision wire overlay ready.")
+        return True
+
+    def _start_collision_wire_overlay_build(self, usd_source: str, output_path: Path, stats_path: Path) -> bool:
         helper_python = self._usd_discovery_python()
         if not helper_python:
-            return None, {}
+            return False
 
-        digest = hashlib.sha1(str(usd_source).encode("utf-8", "replace")).hexdigest()[:16]
-        output_path = Path(tempfile.gettempdir()) / "simready_browser_collision_overlay" / f"{digest}.usda"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        process = QProcess(self)
+        process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        process.readyReadStandardOutput.connect(self._on_collision_overlay_stdout)
+        process.readyReadStandardError.connect(self._on_collision_overlay_stderr)
+        process.finished.connect(self._on_collision_overlay_finished)
+        self._collision_overlay_process = process
+        self._collision_overlay_process_asset = str(usd_source)
+        self._collision_overlay_process_path = output_path
+        self._collision_overlay_buffer = ""
+        self._collision_overlay_error = ""
+        self._collision_overlay_stats_path = stats_path
+        if not self._collision_overlay_build_announced:
+            self._collision_overlay_build_announced = True
+            self.status_changed.emit("Building authored collision wire overlay in background...")
+        process.start(
+            helper_python,
+            [
+                "-u",
+                "-m",
+                "core.usd_collision_discovery",
+                "--wire-usd",
+                str(usd_source),
+                str(output_path),
+                "/World/Asset",
+            ],
+        )
+        if not process.waitForStarted(1000):
+            error = process.errorString()
+            self._release_collision_overlay_process()
+            raise RuntimeError(f"OpenUSD wire overlay helper failed to start: {error}")
+        return False
+
+    def _on_collision_overlay_stdout(self) -> None:
+        process = self._collision_overlay_process
+        if process is None:
+            return
+        self._collision_overlay_buffer += bytes(process.readAllStandardOutput()).decode("utf-8", "replace")
+
+    def _on_collision_overlay_stderr(self) -> None:
+        process = self._collision_overlay_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode("utf-8", "replace").strip()
+        if text:
+            self._collision_overlay_error = text
+
+    def _on_collision_overlay_finished(self, exit_code: int, _exit_status) -> None:
+        process = self._collision_overlay_process
+        asset_source = self._collision_overlay_process_asset
+        output_path = self._collision_overlay_process_path
+        stats_path = getattr(self, "_collision_overlay_stats_path", None)
+        self._collision_overlay_process = None
+        self._collision_overlay_process_asset = None
+        self._collision_overlay_process_path = None
+        self._collision_overlay_stats_path = None
+        if process is not None:
+            process.deleteLater()
+
+        if exit_code != 0 or output_path is None or not output_path.exists():
+            detail = self._collision_overlay_error.splitlines()[-1] if self._collision_overlay_error else "helper failed"
+            if not self._collision_overlay_warning_shown:
+                self._collision_overlay_warning_shown = True
+                self.status_changed.emit(f"Authored collision mesh overlay unavailable: {detail}")
+            return
+        if asset_source != self._current_usd_source or self._shutdown_started:
+            return
+
+        stats = self._stats_from_collision_overlay_stdout(self._collision_overlay_buffer)
+        if isinstance(stats_path, Path):
+            try:
+                stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         try:
-            result = subprocess.run(
-                [
-                    helper_python,
-                    "-u",
-                    "-m",
-                    "core.usd_collision_discovery",
-                    "--wire-usd",
-                    str(usd_source),
-                    str(output_path),
-                    "/World/Asset",
-                ],
-                cwd=str(Path(__file__).resolve().parents[1]),
-                capture_output=True,
-                text=True,
-                timeout=90.0,
-                check=False,
-            )
+            self._load_collision_wire_overlay(output_path, stats)
+            self._collision_overlay_dirty = True
+            self._apply_collision_overlay()
+            self._render_one()
         except Exception as exc:
-            raise RuntimeError(f"OpenUSD wire overlay helper failed to start: {exc}") from exc
+            if not self._collision_overlay_warning_shown:
+                self._collision_overlay_warning_shown = True
+                self.status_changed.emit(f"Authored collision mesh overlay unavailable: {exc}")
 
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "unknown error").strip().splitlines()
-            raise RuntimeError(detail[-1] if detail else "OpenUSD wire overlay helper failed")
-
-        stats = {}
-        for line in reversed((result.stdout or "").splitlines()):
+    @staticmethod
+    def _stats_from_collision_overlay_stdout(text: str) -> dict:
+        for line in reversed(str(text or "").splitlines()):
             line = line.strip()
             if not line.startswith("{"):
                 continue
             try:
-                stats = json.loads(line)
-                break
+                payload = json.loads(line)
+                return payload if isinstance(payload, dict) else {}
             except json.JSONDecodeError:
                 continue
-        return output_path, stats if isinstance(stats, dict) else {}
+        return {}
+
+    @staticmethod
+    def _read_collision_wire_overlay_stats(path: Path) -> dict:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _collision_wire_overlay_paths(usd_source: str) -> tuple[Path, Path]:
+        digest = hashlib.sha1(str(usd_source).encode("utf-8", "replace")).hexdigest()[:16]
+        output_path = Path(tempfile.gettempdir()) / "simready_browser_collision_overlay" / f"{digest}.usda"
+        return output_path, output_path.with_suffix(".json")
+
+    def _release_collision_overlay_process(self) -> None:
+        process = self._collision_overlay_process
+        self._collision_overlay_process = None
+        self._collision_overlay_process_asset = None
+        self._collision_overlay_process_path = None
+        self._collision_overlay_stats_path = None
+        self._collision_overlay_buffer = ""
+        self._collision_overlay_error = ""
+        if process is None:
+            return
+        try:
+            try:
+                process.finished.disconnect(self._on_collision_overlay_finished)
+            except Exception:
+                pass
+            if process.state() == QProcess.Running:
+                process.terminate()
+                if not process.waitForFinished(1000):
+                    process.kill()
+                    process.waitForFinished(1000)
+        finally:
+            process.deleteLater()
 
     @staticmethod
     def _usd_discovery_python() -> Optional[str]:
@@ -1207,6 +1375,148 @@ def Xform "SimReadyReview"
             if text.startswith(f"{physics_root}/"):
                 return render_root + text[len(physics_root) :]
         return ""
+
+    @staticmethod
+    def _normalize_stage_items(items) -> list[dict]:
+        normalized: list[dict] = []
+        try:
+            raw_items = list(items or [])
+        except TypeError:
+            raw_items = []
+
+        for item in raw_items:
+            if isinstance(item, dict):
+                source = str(item.get("source") or item.get("usd_source") or item.get("path") or "").strip()
+                name = str(item.get("name") or Path(source.split("?", 1)[0]).name or source).strip()
+                key = str(item.get("key") or source).strip()
+            else:
+                source = str(item or "").strip()
+                name = Path(source.split("?", 1)[0]).name or source
+                key = source
+            if not source:
+                continue
+            normalized.append({"source": source, "name": name or source, "key": key or source})
+
+        return normalized[:MAX_ASSET_INSTANCES]
+
+    @classmethod
+    def _layout_asset_transforms(cls, bounds_entries: list[dict]) -> list[np.ndarray]:
+        if not bounds_entries:
+            return []
+
+        normalized = [
+            cls._normalize_collision_bounds(bounds) or {"center": (0.0, 0.0, 0.0), "size": (1.0, 1.0, 1.0)}
+            for bounds in bounds_entries
+        ]
+        max_span = max(max(float(entry["size"][0]), float(entry["size"][1])) for entry in normalized)
+        clearance = max(0.08, min(0.6, max_span * 0.08))
+        rng = random.Random(time.time_ns())
+
+        rects: list[tuple[float, float, float, float]] = []
+        transforms: list[np.ndarray] = []
+
+        for index, entry in enumerate(normalized):
+            local_center = np.array(entry["center"], dtype=np.float64)
+            size = np.maximum(np.array(entry["size"], dtype=np.float64), np.array([0.05, 0.05, 0.05]))
+            half_xy = np.maximum(size[:2] * 0.5 + clearance * 0.5, np.array([0.05, 0.05], dtype=np.float64))
+            xy = np.zeros(2, dtype=np.float64) if index == 0 else cls._find_non_overlapping_xy(
+                rects,
+                half_xy,
+                max_span,
+                clearance,
+                index,
+                rng,
+            )
+            target_center = np.array([xy[0], xy[1], size[2] * 0.5], dtype=np.float64)
+
+            matrix = np.eye(4, dtype=np.float64)
+            matrix[3, :3] = target_center - local_center
+            transforms.append(matrix)
+            rects.append((xy[0] - half_xy[0], xy[1] - half_xy[1], xy[0] + half_xy[0], xy[1] + half_xy[1]))
+
+        return transforms
+
+    @staticmethod
+    def _find_non_overlapping_xy(
+        rects: list[tuple[float, float, float, float]],
+        half_xy: np.ndarray,
+        max_span: float,
+        clearance: float,
+        index: int,
+        rng: random.Random,
+    ) -> np.ndarray:
+        def candidate_rect(xy: np.ndarray) -> tuple[float, float, float, float]:
+            return (xy[0] - half_xy[0], xy[1] - half_xy[1], xy[0] + half_xy[0], xy[1] + half_xy[1])
+
+        def fits(rect: tuple[float, float, float, float]) -> bool:
+            return all(not OVRTXRenderer._rects_overlap(rect, existing) for existing in rects)
+
+        cell = max(max_span + clearance, 0.25)
+        for ring in range(1, 48):
+            candidates = []
+            for gx in range(-ring, ring + 1):
+                for gy in range(-ring, ring + 1):
+                    if max(abs(gx), abs(gy)) != ring:
+                        continue
+                    jitter = np.array(
+                        [
+                            rng.uniform(-clearance, clearance) * 0.35,
+                            rng.uniform(-clearance, clearance) * 0.35,
+                        ],
+                        dtype=np.float64,
+                    )
+                    xy = np.array([gx * cell, gy * cell], dtype=np.float64) + jitter
+                    candidates.append((float(np.linalg.norm(xy)) + rng.uniform(0.0, 0.01), xy))
+            candidates.sort(key=lambda item: item[0])
+            for _score, xy in candidates:
+                rect = candidate_rect(xy)
+                if fits(rect):
+                    return xy
+
+        slot = 0
+        columns = max(3, int(math.ceil(math.sqrt(index + 1))) * 2 + 1)
+        while True:
+            gx = (slot % columns) - columns // 2
+            gy = slot // columns
+            xy = np.array([gx * cell, gy * cell], dtype=np.float64)
+            if fits(candidate_rect(xy)):
+                return xy
+            slot += 1
+
+    @staticmethod
+    def _rects_overlap(
+        a: tuple[float, float, float, float],
+        b: tuple[float, float, float, float],
+    ) -> bool:
+        return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+    @classmethod
+    def _combined_layout_bounds(cls, bounds_entries: list[dict], transforms: list[np.ndarray]) -> dict:
+        if not bounds_entries:
+            return DEFAULT_FRAME_BOUNDS.copy()
+
+        mins = []
+        maxs = []
+        for index, bounds in enumerate(bounds_entries):
+            matrix = transforms[index] if index < len(transforms) else np.eye(4, dtype=np.float64)
+            entry = cls._normalize_collision_bounds(bounds) or {"center": (0.0, 0.0, 0.0), "size": (1.0, 1.0, 1.0)}
+            center = np.array(entry["center"], dtype=np.float64)
+            size = np.array(entry["size"], dtype=np.float64)
+            transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+            world_center = center @ transform[:3, :3] + transform[3, :3]
+            half = np.maximum(size * 0.5, np.array([0.05, 0.05, 0.05], dtype=np.float64))
+            mins.append(world_center - half)
+            maxs.append(world_center + half)
+
+        if not mins:
+            return DEFAULT_FRAME_BOUNDS.copy()
+
+        lo = np.min(np.stack(mins), axis=0)
+        hi = np.max(np.stack(maxs), axis=0)
+        center = (lo + hi) * 0.5
+        size = np.maximum(hi - lo, np.array([0.05, 0.05, 0.05], dtype=np.float64))
+        extent = max(float(np.linalg.norm(size)) * 0.5, 0.1)
+        return {"center": center.tolist(), "extent": extent, "size": size.tolist()}
 
     @staticmethod
     def _asset_render_root(index: int) -> str:
@@ -1616,6 +1926,8 @@ def Xform "SimReadyReview"
         self._shutdown_started = True
         self._stage_loaded = False
         self._pending_stage = None
+        self._pending_stage_items = None
+        self._release_collision_overlay_process()
         self._stop_timer()
         if self._placeholder_timer:
             self._placeholder_timer.stop()

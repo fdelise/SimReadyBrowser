@@ -148,7 +148,9 @@ class PhysicsWorker:
             from ovphysx import TensorType
 
         self._emit_progress(18, "Creating PhysX scene...")
-        device = os.environ.get("SIMREADY_OVPHYSX_DEVICE", "cuda")
+        device = os.environ.get("SIMREADY_OVPHYSX_DEVICE", "cpu").strip().lower() or "cpu"
+        if device.startswith("cuda"):
+            device = "gpu"
         try:
             self._physx = PhysX(device=device)
         except Exception:
@@ -1054,10 +1056,12 @@ class PhysicsWorker:
         rest_binding = None
         material_binding = None
         shape_patterns = self._shape_binding_patterns()
+        shape_prim_paths = self._bound_body_paths if self._bound_body_paths else None
         try:
             contact_binding = self._create_tensor_binding(
                 tensor_types.RIGID_BODY_CONTACT_OFFSET,
                 patterns=shape_patterns,
+                prim_paths=shape_prim_paths,
                 update_active=False,
             )
             contact_buffer = np.zeros(contact_binding.shape, dtype=np.float32)
@@ -1070,6 +1074,7 @@ class PhysicsWorker:
                 rest_binding = self._create_tensor_binding(
                     tensor_types.RIGID_BODY_REST_OFFSET,
                     patterns=shape_patterns,
+                    prim_paths=shape_prim_paths,
                     update_active=False,
                 )
                 rest_buffer = np.zeros(rest_binding.shape, dtype=np.float32)
@@ -1084,6 +1089,7 @@ class PhysicsWorker:
                 material_binding = self._create_tensor_binding(
                     tensor_types.RIGID_BODY_SHAPE_FRICTION_AND_RESTITUTION,
                     patterns=shape_patterns,
+                    prim_paths=shape_prim_paths,
                     update_active=False,
                 )
                 material_buffer = np.zeros(material_binding.shape, dtype=np.float32)

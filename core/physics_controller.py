@@ -8,6 +8,7 @@ Qt process owns UI state and converts worker poses back into OVRTX transforms.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import random
@@ -39,6 +40,8 @@ AUTHORED_BODY_PATTERNS = [
 ]
 MAX_DISCOVERED_BODY_PATTERNS = 256
 USD_DISCOVERY_PYTHON_ENV = "SIMREADY_USD_PYTHON"
+ENABLE_SLOW_USD_COLLIDER_DISCOVERY_ENV = "SIMREADY_ENABLE_SLOW_USD_COLLIDER_DISCOVERY"
+DISCOVERY_CACHE_VERSION = 4
 PHYSICS_MODE_AUTHORED = "authored"
 PHYSICS_MODE_PROXY = "proxy"
 GROUND_HALF_SIZE = 20.0
@@ -84,8 +87,22 @@ class AuthoredColliderDiscovery:
     override_count: int
 
 
+@dataclass
+class PendingPhysicsStart:
+    asset_refs: list[str]
+    initial_pose: Optional[np.ndarray]
+    cook_only: bool
+
+
 class PhysicsController(QObject):
     """Owns a worker process and streams visual transforms into the viewport."""
+
+    _DISCOVERY_CACHE: dict[str, AuthoredColliderDiscovery] = {}
+    _DISCOVERY_CACHE_ORDER: list[str] = []
+    _DISCOVERY_CACHE_LIMIT = 64
+    _PAYLOAD_TEXT_CACHE: dict[tuple[str, str], str] = {}
+    _PAYLOAD_TEXT_CACHE_ORDER: list[tuple[str, str]] = []
+    _PAYLOAD_TEXT_CACHE_LIMIT = 256
 
     pose_changed = pyqtSignal(object)
     status_changed = pyqtSignal(str)
@@ -102,6 +119,10 @@ class PhysicsController(QObject):
         self._stdout_buffer = ""
         self._intentional_stop = False
         self._worker_ready = False
+        self._discovery_process: Optional[QProcess] = None
+        self._discovery_buffer = ""
+        self._discovery_error = ""
+        self._pending_discovery_start: Optional[PendingPhysicsStart] = None
         self._pending_play = False
         self._pending_step_after_start = False
         self._step_in_flight = False
@@ -110,6 +131,8 @@ class PhysicsController(QObject):
 
         self._bounds: Optional[dict] = None
         self._usd_source: Optional[str] = None
+        self._usd_sources: list[str] = []
+        self._asset_source_transforms: list[np.ndarray] = [np.eye(4, dtype=np.float64)]
         self._center = np.zeros(3, dtype=np.float64)
         self._size = np.ones(3, dtype=np.float64)
         self._estimated_mass_kg = 10.0
@@ -157,24 +180,33 @@ class PhysicsController(QObject):
     def configure_asset(self, bounds: dict, usd_source: Optional[str] = None) -> None:
         self.shutdown()
         self._pending_magnet = None
+        self._pending_discovery_start = None
         self._bounds = self._normalize_bounds(bounds)
-        self._usd_source = str(usd_source) if usd_source else None
+        self._usd_sources = self._configured_asset_sources(bounds, usd_source)
+        self._usd_source = self._usd_sources[0] if len(self._usd_sources) == 1 else None
+        self._asset_source_transforms = self._configured_asset_transforms(bounds, len(self._usd_sources))
         self._center = np.array(self._bounds["center"], dtype=np.float64)
         self._size = np.array(self._bounds["size"], dtype=np.float64)
         self._estimated_mass_kg = self._estimate_asset_mass(self._size)
         self._current_visual_transform = np.eye(4, dtype=np.float64)
-        self._physics_mode = PHYSICS_MODE_AUTHORED if self._usd_source else PHYSICS_MODE_PROXY
+        self._physics_mode = PHYSICS_MODE_AUTHORED if self._usd_sources else PHYSICS_MODE_PROXY
         self._current_body_patterns = list(AUTHORED_BODY_PATTERNS)
         self._current_body_paths = []
         self._current_articulation_paths = []
         self._authored_collider_count = 0
         self._authored_override_count = 0
-        self._scene_instance_count = 1
-        self._last_start_instance_count = 1
-        self._last_start_instance_transforms = [np.eye(4, dtype=np.float64)]
-        self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._scene_instance_count = max(1, len(self._asset_source_transforms))
+        self._last_start_instance_count = self._scene_instance_count
+        self._last_start_instance_transforms = [
+            np.array(item, dtype=np.float64, copy=True) for item in self._asset_source_transforms
+        ]
+        self._authored_scene_instance_transforms = [
+            np.array(item, dtype=np.float64, copy=True) for item in self._asset_source_transforms
+        ]
         self._pending_instance_reset = False
-        if self._usd_source:
+        if len(self._usd_sources) > 1:
+            self._set_status(f"Physics ready for {len(self._usd_sources)} selected assets. Colliders will cook after load.")
+        elif self._usd_sources:
             self._set_status("Physics ready. Colliders will cook when asset loading finishes.")
         else:
             self._set_status("Physics unavailable: no USD source to inspect authored colliders.")
@@ -183,7 +215,10 @@ class PhysicsController(QObject):
         self.shutdown()
         self._bounds = None
         self._usd_source = None
+        self._usd_sources = []
+        self._asset_source_transforms = [np.eye(4, dtype=np.float64)]
         self._pending_magnet = None
+        self._pending_discovery_start = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._estimated_mass_kg = 10.0
         self._physics_mode = PHYSICS_MODE_PROXY
@@ -211,7 +246,7 @@ class PhysicsController(QObject):
             self.running_changed.emit(False)
             return False
 
-        if not self._usd_source:
+        if not self._usd_sources:
             self._set_status("Physics not started: this asset has no USD source with authored colliders.")
             self.running_changed.emit(False)
             return False
@@ -281,8 +316,7 @@ class PhysicsController(QObject):
             body_matrix = self._body_from_visual(visual)
             initial_pose = self._pose_from_body(body_matrix)
 
-        scene_path = self._write_authored_scene()
-        return self._start_worker(scene_path, self._current_body_patterns, initial_pose)
+        return self._start_authored_worker_after_discovery(initial_pose, cook_only=False)
 
     def cook_colliders(self) -> bool:
         if self._bounds is None:
@@ -290,7 +324,7 @@ class PhysicsController(QObject):
             self.cooking_finished.emit(False, self._status_text)
             return False
 
-        if not self._usd_source:
+        if not self._usd_sources:
             self._set_status("Physics cook skipped: this asset has no USD source with authored colliders.")
             self.cooking_finished.emit(False, self._status_text)
             return False
@@ -307,6 +341,11 @@ class PhysicsController(QObject):
             self._set_status("Physics collider cook already in progress.")
             return True
 
+        if self._discovery_process is not None:
+            self._pending_play = False
+            self._set_status("Physics collider discovery already in progress.")
+            return True
+
         self._sim_time = 0.0
         self._pending_play = False
         self._pending_step_after_start = False
@@ -317,17 +356,33 @@ class PhysicsController(QObject):
         self._set_status("Cooking authored physics colliders after asset load...")
 
         visual = np.array(self._current_visual_transform, dtype=np.float64, copy=True)
+        transforms = (
+            [np.array(item, dtype=np.float64, copy=True) for item in self._asset_source_transforms]
+            if len(self._usd_sources) > 1
+            else [np.array(visual, dtype=np.float64, copy=True)]
+        )
         self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
-        self._last_start_instance_count = 1
-        self._last_start_instance_transforms = [np.array(visual, dtype=np.float64, copy=True)]
-        self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._last_start_instance_count = len(transforms)
+        self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in transforms]
+        self._authored_scene_instance_transforms = (
+            [np.eye(4, dtype=np.float64)]
+            if len(transforms) == 1
+            else [np.array(item, dtype=np.float64, copy=True) for item in transforms]
+        )
         self._last_start_play = False
-        body_matrix = self._body_from_visual(visual)
-        initial_pose = self._pose_from_body(body_matrix)
-        scene_path = self._write_authored_scene()
-        return self._start_worker(scene_path, self._current_body_patterns, initial_pose, cook_only=False)
+        self._pending_instance_reset = len(transforms) > 1
+        initial_pose = None
+        if len(transforms) == 1:
+            body_matrix = self._body_from_visual(visual)
+            initial_pose = self._pose_from_body(body_matrix)
+        return self._start_authored_worker_after_discovery(initial_pose, cook_only=False)
 
     def set_playing(self, playing: bool) -> None:
+        if playing and self._discovery_process is not None:
+            self._pending_play = True
+            self._set_status("Physics collider discovery is in progress; playback will start when ready.")
+            return
+
         if playing and self._process is None:
             self.restart(play=True)
             return
@@ -537,6 +592,130 @@ class PhysicsController(QObject):
     def shutdown(self) -> None:
         self._release_scene()
 
+    def _start_authored_worker_after_discovery(
+        self,
+        initial_pose: Optional[np.ndarray],
+        cook_only: bool = False,
+    ) -> bool:
+        asset_refs = self._active_asset_refs()
+        if not asset_refs:
+            self._set_status("Physics not started: no USD source is loaded.")
+            self.cooking_finished.emit(False, self._status_text)
+            return False
+
+        cached_discoveries = [self._cached_discovery(asset_ref) for asset_ref in asset_refs]
+        if all(discovery is not None for discovery in cached_discoveries):
+            return self._start_worker_with_discoveries(
+                [discovery for discovery in cached_discoveries if discovery is not None],
+                initial_pose,
+                cook_only,
+            )
+
+        self._pending_discovery_start = PendingPhysicsStart(
+            asset_refs=list(asset_refs),
+            initial_pose=None if initial_pose is None else np.array(initial_pose, dtype=np.float32, copy=True),
+            cook_only=bool(cook_only),
+        )
+
+        if self._discovery_process is not None:
+            self.cooking_progress.emit(8, "Discovering authored collider metadata...")
+            self._set_status("Physics collider discovery already in progress.")
+            return True
+
+        missing_count = sum(1 for discovery in cached_discoveries if discovery is None)
+        self.cooking_progress.emit(5, "Discovering authored collider metadata...")
+        if len(asset_refs) > 1:
+            self._set_status(
+                f"Discovering authored collider metadata for {missing_count} of {len(asset_refs)} selected assets..."
+            )
+        else:
+            self._set_status("Discovering authored collider metadata in background...")
+        process = QProcess(self)
+        process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        process.readyReadStandardOutput.connect(self._on_discovery_stdout)
+        process.readyReadStandardError.connect(self._on_discovery_stderr)
+        process.finished.connect(self._on_discovery_finished)
+        self._discovery_process = process
+        self._discovery_buffer = ""
+        self._discovery_error = ""
+        args = ["-u", "-m", "core.physics_collider_discovery"]
+        if len(asset_refs) > 1:
+            args.extend(["--multi", *asset_refs])
+        else:
+            args.extend([asset_refs[0], AUTHORED_ASSET_PATH])
+        process.start(
+            sys.executable,
+            args,
+        )
+        if not process.waitForStarted(1000):
+            error = process.errorString()
+            self._discovery_process = None
+            self._pending_discovery_start = None
+            process.deleteLater()
+            discoveries = [self._empty_discovery() for _asset_ref in asset_refs]
+            self._set_status(f"Collider discovery process could not start ({error}); starting OVPhysX directly.")
+            return self._start_worker_with_discoveries(discoveries, initial_pose, cook_only)
+        return True
+
+    def _start_worker_with_discovery(
+        self,
+        discovery: AuthoredColliderDiscovery,
+        initial_pose: Optional[np.ndarray],
+        cook_only: bool,
+    ) -> bool:
+        return self._start_worker_with_discoveries([discovery], initial_pose, cook_only)
+
+    def _start_worker_with_discoveries(
+        self,
+        discoveries: list[AuthoredColliderDiscovery],
+        initial_pose: Optional[np.ndarray],
+        cook_only: bool,
+    ) -> bool:
+        try:
+            scene_path = self._write_authored_scene(discoveries)
+        except Exception as exc:
+            self._set_status(f"Could not prepare authored physics scene: {exc}")
+            self.cooking_finished.emit(False, self._status_text)
+            return False
+        return self._start_worker(scene_path, self._current_body_patterns, initial_pose, cook_only=cook_only)
+
+    def _on_discovery_stdout(self) -> None:
+        if self._discovery_process is None:
+            return
+        self._discovery_buffer += bytes(self._discovery_process.readAllStandardOutput()).decode("utf-8", "replace")
+
+    def _on_discovery_stderr(self) -> None:
+        if self._discovery_process is None:
+            return
+        text = bytes(self._discovery_process.readAllStandardError()).decode("utf-8", "replace").strip()
+        if text:
+            self._discovery_error = text
+
+    def _on_discovery_finished(self, exit_code: int, _exit_status) -> None:
+        process = self._discovery_process
+        self._discovery_process = None
+        if process is not None:
+            process.deleteLater()
+
+        pending = self._pending_discovery_start
+        self._pending_discovery_start = None
+        if pending is None:
+            return
+        if pending.asset_refs != self._active_asset_refs():
+            return
+
+        discoveries = self._discoveries_from_stdout(self._discovery_buffer, pending.asset_refs)
+        if exit_code != 0 or discoveries is None:
+            detail = self._discovery_error.splitlines()[-1] if self._discovery_error else "no discovery payload returned"
+            self._set_status(f"Collider metadata discovery skipped ({detail}); starting OVPhysX directly.")
+            discoveries = [self._empty_discovery() for _asset_ref in pending.asset_refs]
+        else:
+            for asset_ref, discovery in zip(pending.asset_refs, discoveries):
+                self._store_discovery(asset_ref, discovery)
+
+        self.cooking_progress.emit(18, "Starting OVPhysX with discovered colliders...")
+        self._start_worker_with_discoveries(discoveries, pending.initial_pose, pending.cook_only)
+
     def _start_worker(
         self,
         scene_path: Path,
@@ -644,7 +823,7 @@ class PhysicsController(QObject):
                 shape_text = "zero usable collider shapes"
             ccd_text = ", CCD on" if bool(message.get("ccd_enabled", False)) else ""
             authored_text = (
-                f"{self._authored_collider_count} authored collider prims traversed, "
+                f"{self._authored_collider_count} authored collider prims found, "
                 if self._authored_collider_count > 0
                 else ""
             )
@@ -676,7 +855,7 @@ class PhysicsController(QObject):
                 warning = str(message.get("cook_warning", "") or "")
                 if shape_count <= 0:
                     authored_text = (
-                        f"Traversal found {self._authored_collider_count} authored collider prims, but "
+                        f"Discovery found {self._authored_collider_count} authored collider prims, but "
                         if self._authored_collider_count > 0
                         else ""
                     )
@@ -839,6 +1018,7 @@ class PhysicsController(QObject):
         self._startup_progress_active = False
 
     def _release_scene(self) -> None:
+        self._release_discovery_process()
         if self._timer.isActive():
             self._timer.stop()
         self._pending_magnet = None
@@ -870,6 +1050,23 @@ class PhysicsController(QObject):
                     if not process.waitForFinished(1500):
                         process.kill()
                         process.waitForFinished(1500)
+        finally:
+            process.deleteLater()
+
+    def _release_discovery_process(self) -> None:
+        process = self._discovery_process
+        self._discovery_process = None
+        self._discovery_buffer = ""
+        self._discovery_error = ""
+        self._pending_discovery_start = None
+        if process is None:
+            return
+        try:
+            if process.state() == QProcess.Running:
+                process.terminate()
+                if not process.waitForFinished(1000):
+                    process.kill()
+                    process.waitForFinished(1000)
         finally:
             process.deleteLater()
 
@@ -931,46 +1128,91 @@ class PhysicsController(QObject):
             message["body_path"] = str(body_path)
         return message
 
-    def _write_authored_scene(self) -> Path:
-        if not self._usd_source:
+    def _write_authored_scene(
+        self,
+        discovery: Optional[AuthoredColliderDiscovery | list[AuthoredColliderDiscovery]] = None,
+    ) -> Path:
+        asset_refs = self._active_asset_refs()
+        if not asset_refs:
             raise RuntimeError("No USD source is configured for authored collider physics")
 
         temp_dir = Path(tempfile.gettempdir()) / "simready_browser_physx"
         temp_dir.mkdir(parents=True, exist_ok=True)
         self._scene_path = temp_dir / "authored_asset_scene.usda"
 
-        asset_ref = self._usd_asset_reference(self._usd_source)
         base_scene = self._base_scene_usda_z_up()
-        discovery = self._authored_collider_discovery(asset_ref)
+        if discovery is None:
+            discoveries = [
+                self._cached_discovery(asset_ref) or self._authored_collider_discovery(asset_ref)
+                for asset_ref in asset_refs
+            ]
+        elif isinstance(discovery, AuthoredColliderDiscovery):
+            discoveries = [discovery]
+        else:
+            discoveries = list(discovery or [])
+
         instance_transforms = self._normalize_instance_transforms(
             self._authored_scene_instance_transforms,
             np.eye(4, dtype=np.float64),
         )
         instance_count = len(instance_transforms)
+        if len(asset_refs) == 1 and instance_count > 1:
+            scene_asset_refs = [asset_refs[0] for _index in range(instance_count)]
+            scene_discoveries = [discoveries[0] if discoveries else self._empty_discovery() for _index in range(instance_count)]
+        else:
+            scene_asset_refs = list(asset_refs)
+            scene_discoveries = [
+                discoveries[index] if index < len(discoveries) else self._empty_discovery()
+                for index in range(len(scene_asset_refs))
+            ]
+            if len(instance_transforms) != len(scene_asset_refs):
+                instance_transforms = self._normalize_instance_transforms(
+                    self._asset_source_transforms[: len(scene_asset_refs)],
+                    np.eye(4, dtype=np.float64),
+                )
+            instance_count = len(scene_asset_refs)
+
         self._scene_instance_count = instance_count
-        self._current_body_patterns = self._expand_authored_paths(
-            discovery.body_patterns or list(AUTHORED_BODY_PATTERNS),
-            instance_count,
-        )
-        self._current_body_paths = self._expand_authored_paths(discovery.body_paths, instance_count)
+        self._current_body_patterns = []
+        self._current_body_paths = []
+        self._current_articulation_paths = []
+        for index, item_discovery in enumerate(scene_discoveries):
+            self._extend_unique(
+                self._current_body_patterns,
+                self._map_authored_paths_for_index(
+                    item_discovery.body_patterns or list(AUTHORED_BODY_PATTERNS),
+                    index,
+                ),
+            )
+            self._extend_unique(
+                self._current_body_paths,
+                self._map_authored_paths_for_index(item_discovery.body_paths, index),
+            )
+            self._extend_unique(
+                self._current_articulation_paths,
+                self._map_authored_paths_for_index(item_discovery.articulation_paths, index),
+            )
         if not self._current_body_paths and instance_count > 1:
             self._current_body_paths = [self._authored_asset_path(index) for index in range(instance_count)]
-        self._current_articulation_paths = self._expand_authored_paths(discovery.articulation_paths, instance_count)
-        self._authored_collider_count = int(discovery.collider_count)
-        self._authored_override_count = int(discovery.override_count)
-        collision_overrides = discovery.collision_overrides
+        self._authored_collider_count = sum(int(item.collider_count) for item in scene_discoveries)
+        self._authored_override_count = sum(int(item.override_count) for item in scene_discoveries)
         scene_ccd = "1" if self._ccd_enabled else "0"
         asset_blocks = "\n\n".join(
-            self._authored_asset_usda_block(index, asset_ref, collision_overrides, instance_transforms[index])
+            self._authored_asset_usda_block(
+                index,
+                scene_asset_refs[index],
+                self._map_authored_override_text_for_index(scene_discoveries[index].collision_overrides, index),
+                instance_transforms[index],
+            )
             for index in range(instance_count)
         )
         if self._authored_collider_count > 0:
             self._set_status(
-                f"Traversed {self._authored_collider_count} authored collider prims; starting OVPhysX cook..."
+                f"Found {self._authored_collider_count} authored collider prims; starting OVPhysX cook..."
             )
         else:
             self._set_status(
-                "No authored collider prims were found in the SimReady payload traversal; OVPhysX will inspect the stage."
+                "No authored collider prims were found in the SimReady payload metadata; OVPhysX will inspect the stage."
             )
         proxy_mass = self._fmt(self._estimated_mass_kg)
 
@@ -1288,20 +1530,43 @@ def Xform "World" (
     def _expand_authored_paths(cls, paths: list[str], count: int) -> list[str]:
         expanded: list[str] = []
         for index in range(max(1, int(count))):
-            root = cls._authored_asset_path(index)
-            for path in paths or []:
-                text = str(path or "").strip()
-                if not text:
-                    continue
-                if text == AUTHORED_ASSET_PATH:
-                    mapped = root
-                elif text.startswith(f"{AUTHORED_ASSET_PATH}/"):
-                    mapped = root + text[len(AUTHORED_ASSET_PATH) :]
-                else:
-                    mapped = text
-                if mapped not in expanded:
-                    expanded.append(mapped)
+            cls._extend_unique(expanded, cls._map_authored_paths_for_index(paths, index))
         return expanded
+
+    @classmethod
+    def _map_authored_paths_for_index(cls, paths: list[str], index: int) -> list[str]:
+        mapped_paths: list[str] = []
+        root = cls._authored_asset_path(index)
+        for path in paths or []:
+            text = str(path or "").strip()
+            if not text:
+                continue
+            if text == AUTHORED_ASSET_PATH:
+                mapped = root
+            elif text.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                mapped = root + text[len(AUTHORED_ASSET_PATH) :]
+            else:
+                mapped = text
+            if mapped not in mapped_paths:
+                mapped_paths.append(mapped)
+        return mapped_paths
+
+    @classmethod
+    def _map_authored_override_text_for_index(cls, text: str, index: int) -> str:
+        if index <= 0 or not text:
+            return str(text or "")
+        root = cls._authored_asset_path(index)
+        mapped = str(text)
+        mapped = mapped.replace(f"<{AUTHORED_ASSET_PATH}/", f"<{root}/")
+        mapped = mapped.replace(f"<{AUTHORED_ASSET_PATH}>", f"<{root}>")
+        return mapped
+
+    @staticmethod
+    def _extend_unique(target: list[str], values: list[str]) -> None:
+        for value in values or []:
+            text = str(value or "").strip()
+            if text and text not in target:
+                target.append(text)
 
     @staticmethod
     def _z_up_yaw_rotation(angle: float) -> np.ndarray:
@@ -1331,10 +1596,204 @@ def Xform "World" (
 
     def _authored_collider_discovery(self, asset_ref: str) -> AuthoredColliderDiscovery:
         """Discover SimReady authored colliders and cook overrides without making new colliders."""
-        stage_discovery = self._stage_collider_discovery(asset_ref)
-        if stage_discovery is not None:
-            return stage_discovery
-        return self._payload_collider_discovery(asset_ref)
+        payload_discovery = self._payload_collider_discovery(asset_ref)
+        if payload_discovery.collider_count > 0:
+            return payload_discovery
+
+        if self._should_use_slow_usd_discovery(asset_ref):
+            stage_discovery = self._stage_collider_discovery(asset_ref)
+            if stage_discovery is not None:
+                return stage_discovery
+        return payload_discovery
+
+    def _active_asset_refs(self) -> list[str]:
+        refs = [self._usd_asset_reference(source) for source in self._usd_sources if str(source or "").strip()]
+        if not refs and self._usd_source:
+            refs = [self._usd_asset_reference(self._usd_source)]
+        return refs
+
+    @staticmethod
+    def _configured_asset_sources(bounds: dict, usd_source: Optional[str]) -> list[str]:
+        if usd_source:
+            return [str(usd_source)]
+        try:
+            raw_sources = list(bounds.get("_asset_sources", []) if isinstance(bounds, dict) else [])
+        except TypeError:
+            raw_sources = []
+        sources: list[str] = []
+        for item in raw_sources:
+            text = str(item or "").strip()
+            if text and text not in sources:
+                sources.append(text)
+        return sources
+
+    @classmethod
+    def _configured_asset_transforms(cls, bounds: dict, source_count: int) -> list[np.ndarray]:
+        if source_count <= 0:
+            return [np.eye(4, dtype=np.float64)]
+        raw_transforms = []
+        if isinstance(bounds, dict):
+            try:
+                raw_transforms = list(bounds.get("_asset_layout_transforms", []) or [])
+            except TypeError:
+                raw_transforms = []
+        transforms: list[np.ndarray] = []
+        for item in raw_transforms[:source_count]:
+            try:
+                matrix = np.array(item, dtype=np.float64, copy=True).reshape(4, 4)
+            except Exception:
+                matrix = np.eye(4, dtype=np.float64)
+            if not cls._matrix_is_valid(matrix):
+                matrix = np.eye(4, dtype=np.float64)
+            transforms.append(matrix)
+        while len(transforms) < source_count:
+            transforms.append(np.eye(4, dtype=np.float64))
+        return transforms
+
+    @staticmethod
+    def _empty_discovery() -> AuthoredColliderDiscovery:
+        return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+
+    @classmethod
+    def _cached_discovery(cls, asset_ref: str) -> Optional[AuthoredColliderDiscovery]:
+        key = str(asset_ref or "")
+        if not key:
+            return None
+        cached = cls._DISCOVERY_CACHE.get(key)
+        if cached is not None:
+            return cached
+        cached = cls._load_cached_discovery_from_disk(key)
+        if cached is not None:
+            cls._remember_discovery(key, cached)
+        return cached
+
+    @classmethod
+    def _store_discovery(cls, asset_ref: str, discovery: AuthoredColliderDiscovery) -> None:
+        key = str(asset_ref or "")
+        if not key:
+            return
+        cls._remember_discovery(key, discovery)
+        cls._write_cached_discovery_to_disk(key, discovery)
+
+    @classmethod
+    def _remember_discovery(cls, asset_ref: str, discovery: AuthoredColliderDiscovery) -> None:
+        key = str(asset_ref or "")
+        if not key:
+            return
+        cls._DISCOVERY_CACHE[key] = discovery
+        if key in cls._DISCOVERY_CACHE_ORDER:
+            cls._DISCOVERY_CACHE_ORDER.remove(key)
+        cls._DISCOVERY_CACHE_ORDER.append(key)
+        while len(cls._DISCOVERY_CACHE_ORDER) > cls._DISCOVERY_CACHE_LIMIT:
+            old_key = cls._DISCOVERY_CACHE_ORDER.pop(0)
+            cls._DISCOVERY_CACHE.pop(old_key, None)
+
+    @classmethod
+    def _load_cached_discovery_from_disk(cls, asset_ref: str) -> Optional[AuthoredColliderDiscovery]:
+        try:
+            path = cls._discovery_cache_path(asset_ref)
+            if not path.exists():
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if int(payload.get("version", 0) or 0) != DISCOVERY_CACHE_VERSION:
+                return None
+            data = payload.get("discovery")
+            if not isinstance(data, dict):
+                return None
+            return cls._discovery_from_payload(data)
+        except Exception:
+            return None
+
+    @classmethod
+    def _write_cached_discovery_to_disk(cls, asset_ref: str, discovery: AuthoredColliderDiscovery) -> None:
+        try:
+            path = cls._discovery_cache_path(asset_ref)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": DISCOVERY_CACHE_VERSION,
+                "asset_ref": asset_ref,
+                "discovery": cls._discovery_to_payload(discovery),
+            }
+            path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _discovery_cache_path(asset_ref: str) -> Path:
+        digest = hashlib.sha1(str(asset_ref or "").encode("utf-8", "replace")).hexdigest()
+        return Path(__file__).resolve().parents[1] / "cache" / "physics_discovery" / f"{digest}.json"
+
+    @staticmethod
+    def _discovery_from_stdout(text: str) -> Optional[AuthoredColliderDiscovery]:
+        payload = None
+        for line in reversed(str(text or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            return None
+        return PhysicsController._discovery_from_payload(payload)
+
+    @staticmethod
+    def _discoveries_from_stdout(text: str, asset_refs: list[str]) -> Optional[list[AuthoredColliderDiscovery]]:
+        payload = None
+        for line in reversed(str(text or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            return None
+        if "discoveries" not in payload:
+            discovery = PhysicsController._discovery_from_payload(payload)
+            return [discovery] if len(asset_refs) == 1 else None
+        raw_items = payload.get("discoveries")
+        if not isinstance(raw_items, list) or len(raw_items) != len(asset_refs):
+            return None
+        discoveries: list[AuthoredColliderDiscovery] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return None
+            discoveries.append(PhysicsController._discovery_from_payload(item))
+        return discoveries
+
+    @staticmethod
+    def _discovery_from_payload(payload: dict) -> AuthoredColliderDiscovery:
+        try:
+            collider_count = int(payload.get("collider_count", 0) or 0)
+            override_count = int(payload.get("override_count", 0) or 0)
+        except Exception:
+            collider_count = 0
+            override_count = 0
+        return AuthoredColliderDiscovery(
+            str(payload.get("collision_overrides", "") or ""),
+            [str(path) for path in payload.get("body_patterns", []) if str(path or "").strip()]
+            or list(AUTHORED_BODY_PATTERNS),
+            [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()],
+            [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
+            collider_count,
+            override_count,
+        )
+
+    @staticmethod
+    def _discovery_to_payload(discovery: AuthoredColliderDiscovery) -> dict:
+        return {
+            "collision_overrides": discovery.collision_overrides,
+            "body_patterns": list(discovery.body_patterns or []),
+            "body_paths": list(discovery.body_paths or []),
+            "articulation_paths": list(discovery.articulation_paths or []),
+            "collider_count": int(discovery.collider_count),
+            "override_count": int(discovery.override_count),
+        }
 
     def _stage_collider_discovery(self, asset_ref: str) -> Optional[AuthoredColliderDiscovery]:
         helper_python = self._usd_discovery_python()
@@ -1376,20 +1835,29 @@ def Xform "World" (
         if not isinstance(payload, dict):
             return None
 
-        override_paths = [str(path) for path in payload.get("override_paths", [])]
         body_patterns = [str(path) for path in payload.get("body_patterns", []) if str(path or "").strip()]
+        body_paths = [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()]
         collider_count = int(payload.get("collider_count", 0) or 0)
-        override_count = int(payload.get("override_count", 0) or 0)
+        override_count = len(body_paths)
         if collider_count <= 0:
             return AuthoredColliderDiscovery("", body_patterns or list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
         return AuthoredColliderDiscovery(
-            self._format_absolute_collision_overrides(override_paths),
+            self._format_rigid_body_overrides(body_paths),
             body_patterns or list(AUTHORED_BODY_PATTERNS),
-            [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()],
+            body_paths,
             [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
             collider_count,
             override_count,
         )
+
+    @staticmethod
+    def _should_use_slow_usd_discovery(asset_ref: str) -> bool:
+        if os.environ.get(ENABLE_SLOW_USD_COLLIDER_DISCOVERY_ENV) == "1":
+            return True
+        text = str(asset_ref or "")
+        if text.startswith("http://") or text.startswith("https://") or text.startswith("s3://"):
+            return False
+        return bool(text and "://" not in text)
 
     @staticmethod
     def _usd_discovery_python() -> Optional[str]:
@@ -1430,23 +1898,44 @@ def Xform "World" (
         if not collision_refs:
             return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
 
-        override_refs = [(path, name) for path, name in collision_refs if collision_instances.get(name) == "sdf"]
-        collision_overrides = self._format_collision_overrides(override_refs)
+        sdf_refs = [
+            (path, name)
+            for path, name in collision_refs
+            if collision_instances.get(name, "").lower() in {"sdf", "physxsdfmeshcollisionapi"}
+        ]
         body_patterns = self._authored_body_patterns_from_refs(collision_refs)
         body_paths = self._authored_body_paths_from_refs(collision_refs)
+        scene_overrides = self._format_payload_physics_overrides(body_paths, base_text, sdf_refs)
         return AuthoredColliderDiscovery(
-            collision_overrides,
+            scene_overrides,
             body_patterns,
             body_paths,
             [],
             len(collision_refs),
-            len(override_refs),
+            len(body_paths) + len(sdf_refs),
         )
 
     def _authored_collision_overrides(self, asset_ref: str) -> str:
         return self._authored_collider_discovery(asset_ref).collision_overrides
 
     def _format_absolute_collision_overrides(self, paths: list[str]) -> str:
+        return self._format_rigid_body_overrides(paths)
+
+    def _format_payload_physics_overrides(
+        self,
+        body_paths: list[str],
+        base_text: str,
+        sdf_refs: list[tuple[tuple[str, ...], str]],
+    ) -> str:
+        blocks = [
+            self._format_body_and_sdf_overrides(body_paths, sdf_refs),
+        ]
+        joints = self._format_payload_joint_overrides(body_paths, base_text)
+        if joints:
+            blocks.append(joints)
+        return "\n".join(block for block in blocks if block)
+
+    def _format_rigid_body_overrides(self, paths: list[str]) -> str:
         root: dict = {}
         for path in paths:
             text = str(path or "").strip()
@@ -1458,7 +1947,7 @@ def Xform "World" (
             node = root
             for part in rel_parts:
                 node = node.setdefault(part, {})
-            node["__collider__"] = True
+            node["__rigid_body__"] = True
 
         if not root:
             return ""
@@ -1467,19 +1956,21 @@ def Xform "World" (
 
         def emit_node(name: str, node: dict, indent: int) -> None:
             pad = " " * indent
-            is_collider = bool(node.get("__collider__"))
-            children = [(child, child_node) for child, child_node in node.items() if child != "__collider__"]
-            if is_collider:
+            is_body = bool(node.get("__rigid_body__"))
+            children = [(child, child_node) for child, child_node in node.items() if child != "__rigid_body__"]
+            if is_body:
                 lines.extend(
                     [
                         f'{pad}over "{name}" (',
                         ' ' * (indent + 4)
-                        + 'prepend apiSchemas = ["PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI"]',
+                        + 'prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]',
                         f"{pad})",
                         f"{pad}{{",
-                        ' ' * (indent + 4) + 'uniform token physics:approximation = "convexDecomposition"',
-                        ' ' * (indent + 4) + "int physxConvexDecompositionCollision:maxConvexHulls = 32",
-                        ' ' * (indent + 4) + "int physxConvexDecompositionCollision:hullVertexLimit = 64",
+                        ' ' * (indent + 4) + "bool physics:rigidBodyEnabled = 1",
+                        ' ' * (indent + 4) + "bool physics:kinematicEnabled = 0",
+                        ' ' * (indent + 4) + "bool physics:startsAsleep = 0",
+                        ' ' * (indent + 4) + "vector3f physics:velocity = (0, 0, 0)",
+                        ' ' * (indent + 4) + "vector3f physics:angularVelocity = (0, 0, 0)",
                     ]
                 )
             else:
@@ -1491,6 +1982,274 @@ def Xform "World" (
         for child, child_node in root.items():
             emit_node(child, child_node, 8)
         return "\n".join(lines)
+
+    def _format_body_and_sdf_overrides(
+        self,
+        body_paths: list[str],
+        sdf_refs: list[tuple[tuple[str, ...], str]],
+    ) -> str:
+        root: dict = {}
+
+        def add_path(parts: list[str], marker: str) -> None:
+            if not parts:
+                return
+            node = root
+            for part in parts:
+                node = node.setdefault(self._usd_name(part), {})
+            node[marker] = True
+
+        for path in body_paths:
+            text = str(path or "").strip()
+            if not text.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                continue
+            add_path([part for part in text[len(AUTHORED_ASSET_PATH) + 1 :].split("/") if part], "__rigid_body__")
+
+        for rel_path, instance_name in sdf_refs:
+            parts = self._sdf_ref_parts(rel_path, instance_name)
+            add_path(parts, "__sdf__")
+            clean_instance = self._usd_name(instance_name)
+            if clean_instance and parts:
+                add_path([*parts, clean_instance], "__sdf__")
+
+        if not root:
+            return ""
+
+        lines: list[str] = []
+
+        def emit_node(name: str, node: dict, indent: int) -> None:
+            pad = " " * indent
+            is_body = bool(node.get("__rigid_body__"))
+            is_sdf = bool(node.get("__sdf__"))
+            children = [
+                (child, child_node)
+                for child, child_node in node.items()
+                if child not in {"__rigid_body__", "__sdf__"}
+            ]
+            schemas = []
+            if is_body:
+                schemas.extend(["PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"])
+            if is_sdf:
+                schemas.extend(
+                    [
+                        "PhysicsCollisionAPI",
+                        "PhysicsMeshCollisionAPI",
+                        "PhysxConvexDecompositionCollisionAPI",
+                    ]
+                )
+
+            if schemas:
+                schema_text = ", ".join(f'"{schema}"' for schema in schemas)
+                lines.extend([f'{pad}over "{name}" (', " " * (indent + 4) + f"prepend apiSchemas = [{schema_text}]", f"{pad})", f"{pad}{{"])
+            else:
+                lines.extend([f'{pad}over "{name}"', f"{pad}{{"])
+
+            if is_body:
+                lines.extend(
+                    [
+                        " " * (indent + 4) + "bool physics:rigidBodyEnabled = 1",
+                        " " * (indent + 4) + "bool physics:kinematicEnabled = 0",
+                        " " * (indent + 4) + "bool physics:startsAsleep = 0",
+                        " " * (indent + 4) + "vector3f physics:velocity = (0, 0, 0)",
+                        " " * (indent + 4) + "vector3f physics:angularVelocity = (0, 0, 0)",
+                    ]
+                )
+            if is_sdf:
+                lines.extend(
+                    [
+                        " " * (indent + 4) + 'uniform token physics:approximation = "convexDecomposition"',
+                        " " * (indent + 4) + "int physxConvexDecompositionCollision:maxConvexHulls = 32",
+                        " " * (indent + 4) + "int physxConvexDecompositionCollision:hullVertexLimit = 64",
+                    ]
+                )
+            for child, child_node in children:
+                emit_node(child, child_node, indent + 4)
+            lines.append(f"{pad}}}")
+
+        for child, child_node in root.items():
+            emit_node(child, child_node, 8)
+        return "\n".join(lines)
+
+    def _sdf_ref_parts(self, rel_path: tuple[str, ...], instance_name: str) -> list[str]:
+        clean_parts = [self._usd_name(part) for part in rel_path if part]
+        instance_name = self._usd_name(instance_name)
+        if len(clean_parts) >= 3:
+            return clean_parts
+        if len(clean_parts) == 2 and clean_parts[0] == "Geometry" and instance_name:
+            return [*clean_parts, instance_name]
+        if len(clean_parts) == 1 and instance_name:
+            return [clean_parts[0], instance_name]
+        return clean_parts
+
+    def _format_sdf_cook_overrides(self, refs: list[tuple[tuple[str, ...], str]]) -> str:
+        overrides: list[tuple[str, str, str]] = []
+        for rel_path, instance_name in refs:
+            clean_parts = [self._usd_name(part) for part in rel_path if part]
+            instance_name = self._usd_name(instance_name)
+            if len(clean_parts) >= 3 and clean_parts[0] == "Geometry":
+                object_name = clean_parts[1]
+                mesh_name = clean_parts[-1]
+            elif len(clean_parts) == 2 and clean_parts[0] == "Geometry":
+                object_name = clean_parts[1]
+                mesh_name = instance_name
+            elif len(clean_parts) >= 2:
+                object_name = clean_parts[0]
+                mesh_name = clean_parts[-1]
+            elif len(clean_parts) == 1:
+                object_name = clean_parts[0]
+                mesh_name = instance_name
+            else:
+                continue
+            item = (object_name, mesh_name, instance_name)
+            if item not in overrides:
+                overrides.append(item)
+
+        if not overrides:
+            return ""
+
+        lines = ['        over "Geometry"', "        {"]
+        for object_name, mesh_name, instance_name in overrides:
+            lines.extend(
+                [
+                    f'            over "{self._usd_name(object_name)}"',
+                    "            {",
+                    f'                over "{self._usd_name(mesh_name)}" (',
+                    '                    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxSDFMeshCollisionAPI"]',
+                    "                )",
+                    "                {",
+                    '                    uniform token physics:approximation = "sdf"',
+                    "                    int physxSDFMeshCollision:sdfResolution = 128",
+                    "                    bool physxSDFMeshCollision:sdfEnableRemeshing = 1",
+                    "                    float physxSDFMeshCollision:sdfMargin = 0.01",
+                ]
+            )
+            if instance_name and instance_name != mesh_name:
+                lines.extend(
+                    [
+                        "",
+                        f'                    over "{self._usd_name(instance_name)}" (',
+                        '                        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxSDFMeshCollisionAPI"]',
+                        "                    )",
+                        "                    {",
+                        '                        uniform token physics:approximation = "sdf"',
+                        "                        int physxSDFMeshCollision:sdfResolution = 128",
+                        "                        bool physxSDFMeshCollision:sdfEnableRemeshing = 1",
+                        "                        float physxSDFMeshCollision:sdfMargin = 0.01",
+                        "                    }",
+                    ]
+                )
+            lines.extend(["                }", "            }"])
+        lines.append("        }")
+        return "\n".join(lines)
+
+    def _format_payload_joint_overrides(self, body_paths: list[str], base_text: str) -> str:
+        joints = self._payload_joint_definitions(base_text)
+        if not joints:
+            return ""
+
+        body_by_name = {}
+        for path in body_paths:
+            name = str(path or "").rstrip("/").rsplit("/", 1)[-1]
+            if name:
+                body_by_name[name] = path
+
+        lines = ['        def Scope "Joints"', "        {"]
+        emitted = 0
+        for joint in joints:
+            body0 = body_by_name.get(joint.get("body0", ""))
+            body1 = body_by_name.get(joint.get("body1", ""))
+            if not body0 or not body1:
+                continue
+            name = self._usd_name(joint.get("name", "joint") or "joint")
+            joint_type = self._usd_joint_type(joint.get("type", "fixed"))
+            lines.extend(
+                [
+                    f'            def {joint_type} "{name}"',
+                    "            {",
+                    f"                rel physics:body0 = <{body0}>",
+                    f"                rel physics:body1 = <{body1}>",
+                ]
+            )
+            if joint.get("local_pos0"):
+                lines.append(f"                point3f physics:localPos0 = {joint['local_pos0']}")
+            if joint.get("local_pos1"):
+                lines.append(f"                point3f physics:localPos1 = {joint['local_pos1']}")
+            if joint.get("break_force"):
+                lines.append(f"                float physics:breakForce = {joint['break_force']}")
+            if joint.get("break_torque"):
+                lines.append(f"                float physics:breakTorque = {joint['break_torque']}")
+            lines.append("            }")
+            emitted += 1
+
+        lines.append("        }")
+        return "\n".join(lines) if emitted else ""
+
+    @staticmethod
+    def _usd_joint_type(value: str) -> str:
+        kind = str(value or "").strip().lower()
+        return {
+            "fixed": "PhysicsFixedJoint",
+            "revolute": "PhysicsRevoluteJoint",
+            "hinge": "PhysicsRevoluteJoint",
+            "prismatic": "PhysicsPrismaticJoint",
+            "slider": "PhysicsPrismaticJoint",
+            "spherical": "PhysicsSphericalJoint",
+            "ball": "PhysicsSphericalJoint",
+            "distance": "PhysicsDistanceJoint",
+        }.get(kind, "PhysicsFixedJoint")
+
+    @staticmethod
+    def _payload_joint_definitions(base_text: str) -> list[dict[str, str]]:
+        joints: list[dict[str, str]] = []
+        if "pxr:usd:physics:joint:" not in base_text:
+            return joints
+
+        pattern = re.compile(
+            r'\b(?:def|over|class)\s+(?:\w+\s+)?"([^"]+)"\s*(?:\([^{}]*?\))?\s*\{',
+            re.MULTILINE | re.DOTALL,
+        )
+        for match in pattern.finditer(base_text):
+            name = match.group(1)
+            body_start = match.end() - 1
+            body_end = PhysicsController._matching_brace(base_text, body_start)
+            if body_end <= body_start:
+                continue
+            body = base_text[body_start + 1 : body_end]
+            if "pxr:usd:physics:joint:" not in body:
+                continue
+            direct_body = re.split(r'\b(?:def|over|class)\s+(?:\w+\s+)?"', body, maxsplit=1)[0]
+            body0 = PhysicsController._quoted_attr(direct_body, r"pxr:usd:physics:joint:body0")
+            body1 = PhysicsController._quoted_attr(direct_body, r"pxr:usd:physics:joint:body1")
+            joint_type = PhysicsController._quoted_attr(direct_body, r"pxr:usd:physics:joint:type") or "fixed"
+            if not body0 or not body1:
+                continue
+            joints.append(
+                {
+                    "name": name,
+                    "body0": body0,
+                    "body1": body1,
+                    "type": joint_type,
+                    "local_pos0": PhysicsController._tuple_attr(direct_body, r"pxr:usd:physics:localPos0"),
+                    "local_pos1": PhysicsController._tuple_attr(direct_body, r"pxr:usd:physics:localPos1"),
+                    "break_force": PhysicsController._number_attr(direct_body, r"pxr:usd:physics:breakForce"),
+                    "break_torque": PhysicsController._number_attr(direct_body, r"pxr:usd:physics:breakTorque"),
+                }
+            )
+        return joints
+
+    @staticmethod
+    def _quoted_attr(text: str, name: str) -> str:
+        match = re.search(rf'custom\s+string\s+{re.escape(name)}\s*=\s*"([^"]+)"', text)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _tuple_attr(text: str, name: str) -> str:
+        match = re.search(rf"custom\s+(?:double3|float3|point3f)\s+{re.escape(name)}\s*=\s*(\([^)]+\))", text)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _number_attr(text: str, name: str) -> str:
+        match = re.search(rf"custom\s+(?:double|float)\s+{re.escape(name)}\s*=\s*([^\s\r\n]+)", text)
+        return match.group(1).strip() if match else ""
 
     def _authored_body_patterns_from_refs(self, refs: list[tuple[tuple[str, ...], str]]) -> list[str]:
         patterns: list[str] = []
@@ -1504,14 +2263,16 @@ def Xform "World" (
             instance_name = self._usd_name(instance_name)
             if not clean_parts:
                 continue
-            full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
             if clean_parts[0] == "Geometry" and len(clean_parts) > 1:
-                object_path = "/".join(full_parts[:4])
-                if len(clean_parts) == 2 and instance_name:
+                object_path = f"{AUTHORED_ASSET_PATH}/Geometry/{clean_parts[1]}"
+                if len(clean_parts) >= 3:
+                    mesh_path = f"{object_path}/{clean_parts[-1]}"
+                elif instance_name:
                     mesh_path = f"{object_path}/{instance_name}"
                 else:
-                    mesh_path = "/".join(full_parts)
+                    mesh_path = object_path
             else:
+                full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
                 object_path = "/".join(full_parts[:2])
                 mesh_path = f"{object_path}/{instance_name}" if len(clean_parts) == 1 and instance_name else "/".join(full_parts)
             add(object_path)
@@ -1534,10 +2295,10 @@ def Xform "World" (
             clean_parts = [self._usd_name(part) for part in rel_path if part]
             if not clean_parts:
                 continue
-            full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
             if clean_parts[0] == "Geometry" and len(clean_parts) > 1:
-                add("/".join(full_parts[:4]))
+                add(f"{AUTHORED_ASSET_PATH}/Geometry/{clean_parts[1]}")
             else:
+                full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
                 add("/".join(full_parts[:2]))
         return paths
 
@@ -1608,7 +2369,7 @@ def Xform "World" (
     def _collision_instances(instances_text: str) -> dict[str, str]:
         instances: dict[str, str] = {}
         pattern = re.compile(
-            r'\bover\s+"([^"]+)"\s*(?P<meta>\([^{}]*?\))?\s*\{',
+            r'\b(?:def|over|class)\s+(?:\w+\s+)?"([^"]+)"\s*(?P<meta>\([^{}]*?\))?\s*\{',
             re.MULTILINE | re.DOTALL,
         )
         for match in pattern.finditer(instances_text):
@@ -1623,6 +2384,12 @@ def Xform "World" (
                 continue
             approximation_match = re.search(r'physics:approximation\s*=\s*"([^"]+)"', body)
             approximation = approximation_match.group(1).strip() if approximation_match else ""
+            if not approximation and "PhysxSDFMeshCollisionAPI" in f"{meta}\n{body}":
+                approximation = "sdf"
+            elif not approximation and "PhysxConvexDecompositionCollisionAPI" in f"{meta}\n{body}":
+                approximation = "convexDecomposition"
+            elif not approximation and "PhysxConvexHullCollisionAPI" in f"{meta}\n{body}":
+                approximation = "convexHull"
             instances[name] = approximation
         return instances
 
@@ -1631,7 +2398,7 @@ def Xform "World" (
         refs: list[tuple[tuple[str, ...], str]] = []
         stack: list[tuple[int, str]] = []
         prim_pattern = re.compile(r'\b(?:def|over|class)\s+\w+\s+"([^"]+)"')
-        ref_pattern = re.compile(r'references\s*=\s*@instances\.usda@</Instances/([^>]+)>')
+        ref_pattern = re.compile(r'references\s*=\s*(?:\[[^\]]*)?@[^@\r\n]*instances\.usda@</Instances/([^>]+)>')
 
         for raw_line in base_text.splitlines():
             stripped = raw_line.strip()
@@ -1676,21 +2443,29 @@ def Xform "World" (
                     return index
         return -1
 
-    @staticmethod
-    def _read_simready_payload_text(asset_ref: str, name: str) -> str:
+    @classmethod
+    def _read_simready_payload_text(cls, asset_ref: str, name: str) -> str:
         if not asset_ref:
             return ""
 
+        cache_key = (str(asset_ref), str(name))
+        cached = cls._PAYLOAD_TEXT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        text = ""
         url = ""
         if asset_ref.startswith("http://") or asset_ref.startswith("https://"):
             base = asset_ref.rsplit("/", 1)[0]
             url = f"{base}/payloads/{name}"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "SimReadyBrowser/1.0"})
-                with urllib.request.urlopen(req, timeout=5.0) as response:
-                    return response.read().decode("utf-8", "replace")
+                with urllib.request.urlopen(req, timeout=1.5) as response:
+                    text = response.read().decode("utf-8", "replace")
             except Exception:
-                return ""
+                text = ""
+            cls._store_payload_text(cache_key, text)
+            return text
 
         if "://" in asset_ref:
             return ""
@@ -1699,10 +2474,21 @@ def Xform "World" (
             path = Path(asset_ref)
             payload = path.parent / "payloads" / name
             if payload.exists():
-                return payload.read_text(encoding="utf-8", errors="replace")
+                text = payload.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            return ""
-        return ""
+            text = ""
+        cls._store_payload_text(cache_key, text)
+        return text
+
+    @classmethod
+    def _store_payload_text(cls, cache_key: tuple[str, str], text: str) -> None:
+        cls._PAYLOAD_TEXT_CACHE[cache_key] = text
+        if cache_key in cls._PAYLOAD_TEXT_CACHE_ORDER:
+            cls._PAYLOAD_TEXT_CACHE_ORDER.remove(cache_key)
+        cls._PAYLOAD_TEXT_CACHE_ORDER.append(cache_key)
+        while len(cls._PAYLOAD_TEXT_CACHE_ORDER) > cls._PAYLOAD_TEXT_CACHE_LIMIT:
+            old_key = cls._PAYLOAD_TEXT_CACHE_ORDER.pop(0)
+            cls._PAYLOAD_TEXT_CACHE.pop(old_key, None)
 
     @staticmethod
     def _usd_name(value: str) -> str:
