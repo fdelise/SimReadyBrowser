@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -62,9 +63,11 @@ class ControlsPanel(QWidget):
     physics_play_changed   = pyqtSignal(bool)
     physics_step_requested = pyqtSignal()
     physics_restart_requested = pyqtSignal()
+    physics_drop_requested = pyqtSignal(int)
     physics_base_scene_changed = pyqtSignal(str)
     physics_collision_vis_changed = pyqtSignal(bool)
     physics_grab_force_changed = pyqtSignal(float)
+    physics_ccd_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -223,9 +226,9 @@ class ControlsPanel(QWidget):
         force_row.addWidget(force_label)
 
         self._physics_grab_force = QDoubleSpinBox()
-        self._physics_grab_force.setRange(0.25, 5.0)
+        self._physics_grab_force.setRange(0.25, 100.0)
         self._physics_grab_force.setDecimals(2)
-        self._physics_grab_force.setSingleStep(0.25)
+        self._physics_grab_force.setSingleStep(1.0)
         self._physics_grab_force.setValue(2.0)
         self._physics_grab_force.setSuffix("x")
         self._physics_grab_force.setToolTip("Higher values pull harder and need less mouse travel while grabbing.")
@@ -247,10 +250,39 @@ class ControlsPanel(QWidget):
         self._physics_collision_vis.toggled.connect(self.physics_collision_vis_changed)
         lay.addWidget(self._physics_collision_vis)
 
+        self._physics_ccd = QCheckBox("CCD continuous collision")
+        self._physics_ccd.setToolTip(
+            "Authors scene-level PhysX continuous collision detection on the next physics scene start."
+        )
+        self._physics_ccd.toggled.connect(self.physics_ccd_changed)
+        lay.addWidget(self._physics_ccd)
+
+        drop_count_row = QHBoxLayout()
+        drop_count_label = QLabel("Drop count:")
+        drop_count_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        drop_count_row.addWidget(drop_count_label)
+
+        self._physics_drop_count = QSpinBox()
+        self._physics_drop_count.setRange(1, 100)
+        self._physics_drop_count.setValue(1)
+        self._physics_drop_count.setToolTip("Drop multiple copies of the loaded asset with small random offsets.")
+        drop_count_row.addWidget(self._physics_drop_count, 1)
+
+        drop_count_widget = QWidget()
+        drop_count_widget.setStyleSheet("background: transparent;")
+        drop_count_widget.setLayout(drop_count_row)
+        lay.addWidget(drop_count_widget)
+
         button_row = QHBoxLayout()
         restart_btn = _small_button("Restart")
         restart_btn.clicked.connect(self.physics_restart_requested)
         button_row.addWidget(restart_btn)
+
+        drop_btn = _small_button("Drop")
+        drop_btn.clicked.connect(lambda: self.physics_drop_requested.emit(int(self._physics_drop_count.value())))
+        button_row.addWidget(drop_btn)
 
         step_btn = _small_button("Step")
         step_btn.clicked.connect(self.physics_step_requested)

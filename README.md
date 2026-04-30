@@ -2,7 +2,7 @@
 
 SimReady Browser is a Qt desktop tool for browsing NVIDIA Isaac SimReady assets from the public Omniverse S3 content bucket, loading them into an interactive OVRTX viewport, and reviewing how the authored USD collision data behaves in OVPhysX.
 
-The app is built for asset QA and simulation-readiness review. It combines a fast S3 asset browser, an RTX viewport with Kit-style navigation, collision visualization, and a lightweight physics play mode so you can inspect whether a SimReady asset renders correctly, has the expected authored colliders, and behaves properly when dropped, dragged, or tested against simple base scenes.
+The app is built for asset QA and simulation-readiness review. It combines a fast S3 asset browser, an RTX viewport with Kit-style navigation, collision visualization, and a lightweight physics play mode so you can inspect whether a SimReady asset renders correctly, has the expected authored colliders, and behaves properly when played, dragged, or tested against simple base scenes.
 
 ## What It Does
 
@@ -17,7 +17,7 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 - Uses the asset's authored colliders for physics review. It does not create fake asset colliders when authored colliders are missing or unavailable.
 - Adds review base scenes: plane, ramp, and obstacles.
 - Shows collision debug overlays as wireframe curves so you can compare the visible render asset against the collision representation.
-- Supports physics playback, restart, drop-from-air behavior, and Shift + left mouse physics grabbing with adjustable grab force.
+- Supports physics playback, restart, explicit single or multi-asset drop-from-air testing, current-pose simulation startup, optional CCD, and Shift + left mouse physics grabbing with adjustable grab force.
 
 ## Typical Workflow
 
@@ -26,8 +26,8 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 3. Double-click a thumbnail to load the asset into the viewport.
 4. Review the asset visually using Kit-style camera controls.
 5. Toggle collision visualization to inspect authored collider wireframes.
-6. Use the Physics panel to select a base scene, then press Play.
-7. The asset is dropped from the air so gravity, collider cooking, contact behavior, mass, and stability are easier to evaluate.
+6. Use the Physics panel to select a base scene, then press Play or Drop.
+7. Play starts from the asset's current viewport pose; Drop places one or more copies above the base scene and starts physics.
 8. Hold Shift + left mouse button on the asset to grab it with a force-based physics handle, drag it, then release to drop or throw it.
 
 ## Project Layout
@@ -117,16 +117,18 @@ The app creates local cache data under `cache/`. Cached catalog and thumbnail da
 
 The physics path is designed to validate authored SimReady collision data, not to hide asset problems.
 
-- The asset is referenced into an OVPhysX scene as `/World/Asset`.
+- The asset is referenced into an OVPhysX scene as `/World/Asset`; multi-drop adds sibling instances such as `/World/Asset_02`.
 - The app traverses the composed USD stage, including payloads, references, and instanceable prototypes, to discover collision prims.
 - Authored collider paths are passed to OVPhysX as body binding candidates.
 - SDF or mesh collision authoring is preserved where possible; helper overrides are only used to make authored SimReady collision prims cook in the local OVPhysX path.
 - If no usable authored collision shapes are exposed by OVPhysX, the app reports that instead of creating a fake asset collider.
 - The floor is authored as a simple box collider, not a triangle mesh.
 - The ramp base scene uses a closed convex wedge collider so the ramp itself has reliable collision.
-- Physics Play drops the asset from above the base scene to make contact behavior easy to see.
+- Physics Play starts from the asset's current viewport pose. It no longer automatically drops the asset from above the base scene.
+- Drop places the selected number of asset copies above the base scene with tight random offsets so they collide. The UI caps this at 100 copies. Re-dropping the same count reuses the cooked OVPhysX scene; changing the count rebuilds because the number of rigid-body instances changes.
+- The CCD checkbox authors scene-level `physxScene:enableCCD` on the next physics scene start. It does not mutate authored asset body or collider schemas, and toggling it does not force a collider re-cook.
 - Restart resets the cooked physics scene without re-cooking when possible.
-- Grab force is scaled by the estimated mass and by the user-controlled grab force multiplier.
+- Grab force is scaled by the estimated mass and by the user-controlled grab force multiplier, which supports 0.25x to 100x.
 
 ## Collision Debug Overlay
 
@@ -146,6 +148,7 @@ Run physics smoke tests:
 
 ```powershell
 .\.venv\Scripts\python.exe tools\physics_authored_smoke.py drop
+.\.venv\Scripts\python.exe tools\physics_authored_smoke.py multi
 .\.venv\Scripts\python.exe tools\physics_authored_smoke.py grab
 .\.venv\Scripts\python.exe tools\physics_authored_smoke.py ramp
 .\.venv\Scripts\python.exe tools\physics_controller_process_smoke.py
@@ -168,4 +171,4 @@ If closing the app crashes inside OVRTX/OVPhysX, make sure the latest committed 
 
 ## Notes
 
-This is a local review tool for SimReady asset inspection and physics validation. It is not a replacement for full Isaac Sim validation, but it is intended to make first-pass review fast: browse, load, inspect, visualize colliders, drop, grab, and decide whether an asset is ready for deeper simulation testing.
+This is a local review tool for SimReady asset inspection and physics validation. It is not a replacement for full Isaac Sim validation, but it is intended to make first-pass review fast: browse, load, inspect, visualize colliders, play physics, grab, and decide whether an asset is ready for deeper simulation testing.

@@ -34,6 +34,7 @@ def discover(asset_ref: str, root_path: str = "/World/Asset") -> dict:
 
     entries = list(_iter_composed_prims(root))
     rigid_paths = _rigid_body_paths(entries, UsdPhysics)
+    articulation_paths = _articulation_root_paths(entries, UsdPhysics)
     colliders = []
     for prim, mapped_path in entries:
         if not _is_collision_prim(prim, UsdPhysics):
@@ -57,7 +58,8 @@ def discover(asset_ref: str, root_path: str = "/World/Asset") -> dict:
         for item in colliders
         if item["approximation"] == "sdf" or "PhysxSDFMeshCollisionAPI" in item["schemas"]
     ]
-    body_patterns = _body_patterns(root_path, [item["body_path"] for item in colliders])
+    body_paths = _dedupe([item["body_path"] for item in colliders])
+    body_patterns = _body_patterns(root_path, body_paths)
     type_counts: dict[str, int] = {}
     for item in colliders:
         key = item["type"] or "collision"
@@ -68,7 +70,9 @@ def discover(asset_ref: str, root_path: str = "/World/Asset") -> dict:
         "collider_count": len(colliders),
         "override_paths": _dedupe(override_paths),
         "override_count": len(_dedupe(override_paths)),
+        "body_paths": body_paths,
         "body_patterns": body_patterns,
+        "articulation_paths": articulation_paths,
         "type_counts": type_counts,
     }
 
@@ -260,6 +264,26 @@ def _rigid_body_paths(entries, UsdPhysics) -> list[str]:
             has_api = has_api or prim.HasAPI(UsdPhysics.RigidBodyAPI)
         except Exception:
             pass
+        if has_api and mapped_path not in paths:
+            paths.append(mapped_path)
+    return paths
+
+
+def _articulation_root_paths(entries, UsdPhysics) -> list[str]:
+    paths: list[str] = []
+    articulation_api = getattr(UsdPhysics, "ArticulationRootAPI", None)
+    for prim, mapped_path in entries:
+        schemas = list(prim.GetAppliedSchemas())
+        has_api = (
+            "PhysicsArticulationRootAPI" in schemas
+            or "PhysxArticulationAPI" in schemas
+            or "PhysxArticulationRootAPI" in schemas
+        )
+        if articulation_api is not None:
+            try:
+                has_api = has_api or prim.HasAPI(articulation_api)
+            except Exception:
+                pass
         if has_api and mapped_path not in paths:
             paths.append(mapped_path)
     return paths

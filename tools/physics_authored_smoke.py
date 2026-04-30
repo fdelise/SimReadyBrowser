@@ -122,6 +122,71 @@ def Xform "World"
     return scene
 
 
+def _write_multi_drop_scene(temp_dir: Path, asset_path: str | Path, count: int = 4) -> Path:
+    scene = temp_dir / "multi_drop_scene.usda"
+    asset_ref = _asset_reference(asset_path)
+    asset_blocks = []
+    for index in range(max(1, int(count))):
+        name = "Asset" if index == 0 else f"Asset_{index + 1:02d}"
+        x = (index % 2) * 0.25
+        y = ((index // 2) % 2) * 0.25
+        z = 1.4 + index * 0.55
+        asset_blocks.append(
+            f"""    def Xform "{name}" (
+        prepend references = @{asset_ref}@
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {{
+        bool physics:rigidBodyEnabled = 1
+        bool physics:kinematicEnabled = 0
+        bool physics:startsAsleep = 0
+        float physics:mass = 10
+        vector3f physics:velocity = (0, 0, 0)
+        vector3f physics:angularVelocity = (0, 0, 0)
+        double3 xformOp:translate = ({x}, {y}, {z})
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }}"""
+        )
+
+    scene.write_text(
+        f"""#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+    kilogramsPerMass = 1
+)
+
+def Xform "World"
+{{
+    def PhysicsScene "PhysicsScene"
+    {{
+        vector3f physics:gravityDirection = (0, 0, -1)
+        float physics:gravityMagnitude = 9.81
+    }}
+
+{chr(10).join(asset_blocks)}
+
+    def Xform "Ground"
+    {{
+        def Cube "GroundGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {{
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:translate = (0, 0, -0.25)
+            double3 xformOp:scale = (40, 40, 0.5)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }}
+    }}
+}}
+""",
+        encoding="utf-8",
+    )
+    return scene
+
+
 def _write_ramp_wedge_scene(temp_dir: Path, asset_path: str | Path) -> Path:
     scene = temp_dir / "ramp_wedge_scene.usda"
     asset_ref = _asset_reference(asset_path)
@@ -191,6 +256,108 @@ def Xform "World"
     return scene
 
 
+def _write_jointed_multibody_scene(temp_dir: Path) -> Path:
+    scene = temp_dir / "jointed_multibody_scene.usda"
+    scene.write_text(
+        """#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+    kilogramsPerMass = 1
+)
+
+def Xform "World"
+{
+    def PhysicsScene "PhysicsScene"
+    {
+        vector3f physics:gravityDirection = (0, 0, -1)
+        float physics:gravityMagnitude = 9.81
+    }
+
+    def Xform "Asset"
+    {
+        def Xform "Base" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            bool physics:kinematicEnabled = 1
+            bool physics:startsAsleep = 0
+            float physics:mass = 100
+            double3 xformOp:translate = (0, 0, 0.7)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Cube "BaseCollider" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                double size = 1
+                double3 xformOp:scale = (0.12, 1.0, 1.2)
+                uniform token[] xformOpOrder = ["xformOp:scale"]
+            }
+        }
+
+        def Xform "Door" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            bool physics:kinematicEnabled = 0
+            bool physics:startsAsleep = 0
+            float physics:mass = 8
+            vector3f physics:velocity = (0, 0, 0)
+            vector3f physics:angularVelocity = (0, 0, 0)
+            double3 xformOp:translate = (0.5, 0, 0.7)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+
+            def Cube "DoorCollider" (
+                prepend apiSchemas = ["PhysicsCollisionAPI"]
+            )
+            {
+                float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+                double size = 1
+                double3 xformOp:translate = (0.32, 0, 0)
+                double3 xformOp:scale = (0.64, 0.08, 1.0)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            }
+        }
+
+        def PhysicsRevoluteJoint "DoorHinge"
+        {
+            rel physics:body0 = </World/Asset/Base>
+            rel physics:body1 = </World/Asset/Door>
+            point3f physics:localPos0 = (0.5, 0, 0)
+            point3f physics:localPos1 = (0, 0, 0)
+            quatf physics:localRot0 = (1, 0, 0, 0)
+            quatf physics:localRot1 = (1, 0, 0, 0)
+            token physics:axis = "Z"
+            float physics:lowerLimit = -120
+            float physics:upperLimit = 120
+        }
+    }
+
+    def Xform "Ground"
+    {
+        def Cube "GroundGeom" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1
+            double3 xformOp:translate = (0, 0, -0.25)
+            double3 xformOp:scale = (40, 40, 0.5)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    return scene
+
+
 def _last_message(messages: list[dict], kind: str) -> dict:
     for message in reversed(messages):
         if message.get("type") == kind:
@@ -214,6 +381,77 @@ def _test_referenced_collider_drop(temp_dir: Path) -> None:
             worker.step(1.0 / 60.0, index / 60.0, substeps=4)
         pose = np.array(_last_message(messages, "pose")["pose"], dtype=np.float32)
         assert pose[2] > 0.35, f"authored collider fell through floor: final z={pose[2]:.4f}"
+    finally:
+        worker.shutdown()
+
+
+def _test_multi_referenced_collider_drop(temp_dir: Path) -> None:
+    asset = _write_local_authored_asset(temp_dir)
+    count = 4
+    scene = _write_multi_drop_scene(temp_dir, asset, count=count)
+    body_paths = ["/World/Asset" if index == 0 else f"/World/Asset_{index + 1:02d}" for index in range(count)]
+
+    worker, messages = _collecting_worker()
+    try:
+        worker.start(
+            str(scene),
+            body_paths,
+            None,
+            contact_offset=0.02,
+            cook_only=False,
+            body_paths=body_paths,
+        )
+        started = _last_message(messages, "started")
+        assert int(started["body_count"]) >= count, started
+        assert int(started["shape_count"]) > 0, started
+
+        reset_poses = []
+        for index, body_path in enumerate(body_paths):
+            reset_poses.append(
+                {
+                    "path": body_path,
+                    "pose": [0.15 * (index % 2), 0.15 * (index // 2), 1.8 + index * 0.45, 0.0, 0.0, 0.0, 1.0],
+                }
+            )
+        worker.set_poses(reset_poses, zero_velocity=True)
+        reset_message = _last_message(messages, "pose")
+        for index, body_path in enumerate(body_paths):
+            pose = _body_pose(reset_message, body_path)
+            assert pose[2] > 1.5 + index * 0.35, f"{body_path} did not reset without recook: z={pose[2]:.4f}"
+
+        for index in range(180):
+            worker.step(1.0 / 60.0, index / 60.0, substeps=4)
+        pose_message = _last_message(messages, "pose")
+        for body_path in body_paths:
+            pose = _body_pose(pose_message, body_path)
+            assert pose[2] > 0.35, f"{body_path} fell through floor: final z={pose[2]:.4f}"
+    finally:
+        worker.shutdown()
+
+
+def _test_scene_level_ccd_cooks(temp_dir: Path) -> None:
+    asset = _write_local_authored_asset(temp_dir)
+    scene = _write_authored_scene(temp_dir, asset)
+    text = scene.read_text(encoding="utf-8")
+    text = text.replace(
+        '    def PhysicsScene "PhysicsScene"\n    {',
+        '    def PhysicsScene "PhysicsScene" (\n'
+        '        prepend apiSchemas = ["PhysxSceneAPI"]\n'
+        '    )\n'
+        '    {',
+    ).replace(
+        "        float physics:gravityMagnitude = 9.81",
+        "        float physics:gravityMagnitude = 9.81\n"
+        "        bool physxScene:enableCCD = 1",
+    )
+    scene.write_text(text, encoding="utf-8")
+
+    worker, messages = _collecting_worker()
+    try:
+        initial_pose = np.array([0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        worker.start(str(scene), AUTHORED_BODY_PATTERNS, initial_pose, contact_offset=0.02, cook_only=True)
+        cooked = _last_message(messages, "cooked")
+        assert int(cooked["shape_count"]) > 0, cooked
     finally:
         worker.shutdown()
 
@@ -280,6 +518,66 @@ def _test_ramp_wedge_scene_drop(temp_dir: Path) -> None:
     finally:
         if worker is not None:
             worker.shutdown()
+
+
+def _body_pose(message: dict, path: str) -> np.ndarray:
+    for item in message.get("bodies", []) or []:
+        if item.get("path") == path:
+            return np.array(item["pose"], dtype=np.float32)
+    raise AssertionError(f"missing body pose for {path}: {message}")
+
+
+def _test_jointed_multibody_grab(temp_dir: Path) -> None:
+    scene = _write_jointed_multibody_scene(temp_dir)
+    worker, messages = _collecting_worker()
+    try:
+        body_paths = ["/World/Asset/Base", "/World/Asset/Door"]
+        worker.start(
+            str(scene),
+            ["/World/Asset/*", AUTHORED_ASSET_PATH],
+            None,
+            contact_offset=0.02,
+            cook_only=False,
+            body_paths=body_paths,
+        )
+        started = _last_message(messages, "started")
+        assert int(started["body_count"]) >= 2, started
+        assert started.get("body_paths") == body_paths, started
+
+        start_pose = _last_message(messages, "pose")
+        start_base = _body_pose(start_pose, "/World/Asset/Base")
+        start_door = _body_pose(start_pose, "/World/Asset/Door")
+
+        worker.set_magnet(
+            {
+                "body_path": "/World/Asset/Door",
+                "target": [1.1, 0.65, 1.1],
+                "anchor": [0.55, 0.0, 0.0],
+                "target_velocity": [0.0, 0.0, 0.0],
+                "estimated_mass": 8.0,
+                "natural_frequency": 7.0,
+                "damping_ratio": 0.7,
+                "max_acceleration": 90.0,
+                "max_angular_acceleration": 14.0,
+                "force_amount": 3.0,
+            }
+        )
+        for index in range(180):
+            worker.step(1.0 / 60.0, index / 60.0, substeps=4)
+
+        end_pose = _last_message(messages, "pose")
+        end_base = _body_pose(end_pose, "/World/Asset/Base")
+        end_door = _body_pose(end_pose, "/World/Asset/Door")
+        base_delta = float(np.linalg.norm(end_base[:3] - start_base[:3]))
+        door_delta = float(np.linalg.norm(end_door[:3] - start_door[:3]))
+        door_rotation_delta = float(np.linalg.norm(end_door[3:7] - start_door[3:7]))
+        assert base_delta < 0.05, f"kinematic base moved unexpectedly: delta={base_delta:.4f}"
+        assert door_delta > 0.03 or door_rotation_delta > 0.03, (
+            f"door body did not respond to targeted multibody grab: "
+            f"translation={door_delta:.4f}, rotation={door_rotation_delta:.4f}"
+        )
+    finally:
+        worker.shutdown()
 
 
 def _test_cached_simready_cooks() -> None:
@@ -412,15 +710,30 @@ def main() -> int:
                 _test_referenced_collider_drop(Path(temp))
             print("authored referenced-collider drop test passed")
             return 0
+        if mode == "multi":
+            with tempfile.TemporaryDirectory(prefix="simready_physx_multi_") as temp:
+                _test_multi_referenced_collider_drop(Path(temp))
+            print("authored multi-instance drop test passed")
+            return 0
         if mode == "grab":
             with tempfile.TemporaryDirectory(prefix="simready_physx_grab_") as temp:
                 _test_corner_grab_lifts_and_tumbles(Path(temp))
             print("authored corner-grab force test passed")
             return 0
+        if mode == "ccd":
+            with tempfile.TemporaryDirectory(prefix="simready_physx_ccd_") as temp:
+                _test_scene_level_ccd_cooks(Path(temp))
+            print("scene-level CCD authored-collider cook test passed")
+            return 0
         if mode == "ramp":
             with tempfile.TemporaryDirectory(prefix="simready_physx_ramp_") as temp:
                 _test_ramp_wedge_scene_drop(Path(temp))
             print("ramp convex-wedge scene drop test passed")
+            return 0
+        if mode == "multibody":
+            with tempfile.TemporaryDirectory(prefix="simready_physx_multibody_") as temp:
+                _test_jointed_multibody_grab(Path(temp))
+            print("jointed multibody targeted-grab test passed")
             return 0
         if mode == "cached":
             _test_cached_simready_cooks()

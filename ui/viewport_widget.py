@@ -20,6 +20,10 @@ CAMERA_FOCAL_LENGTH_MM = 24.0
 CAMERA_HORIZONTAL_APERTURE_MM = 20.955
 GRAB_THROW_VELOCITY_LIMIT = 10.0
 DEFAULT_GRAB_FORCE_AMOUNT = 2.0
+MIN_GRAB_FORCE_AMOUNT = 0.25
+MAX_GRAB_FORCE_AMOUNT = 100.0
+MAX_GRAB_TARGET_EXTENTS = 8.0
+MIN_GRAB_TARGET_DISTANCE = 2.0
 
 
 class ViewportWidget(QWidget):
@@ -48,11 +52,13 @@ class ViewportWidget(QWidget):
         self._pending_dir_light = (0.8, 45.0, 60.0)
         self._pending_base_scene = "plane"
         self._pending_collision_overlay = False
+        self._pending_asset_instance_count = 1
         self._load_generation = 0
         self._loading_asset = False
         self._physics_cooking_active = False
         self._physics_auto_cook_started = False
         self._current_usd_source: Optional[str] = None
+        self._current_load_name = ""
         self._physics = PhysicsController(self)
         self._physics.pose_changed.connect(self._on_physics_pose)
         self._physics.status_changed.connect(self._on_physics_status)
@@ -60,7 +66,9 @@ class ViewportWidget(QWidget):
         self._physics.cooking_progress.connect(self._on_physics_cooking_progress)
         self._physics.cooking_finished.connect(self._on_physics_cooking_finished)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
+        self._physics_body_transforms: list[dict] = []
         self._physics_grabbing = False
+        self._physics_grab_body_path: Optional[str] = None
         self._physics_drag_start: Optional[QPoint] = None
         self._physics_drag_matrix = np.eye(4, dtype=np.float64)
         self._physics_grab_anchor = np.zeros(3, dtype=np.float64)
@@ -93,13 +101,18 @@ class ViewportWidget(QWidget):
         self.setFocus(Qt.OtherFocusReason)
         self._canvas.setFocus(Qt.OtherFocusReason)
         self._current_usd_source = str(path)
+        self._current_load_name = Path(str(path).split("?", 1)[0]).name
         self._last_bounds = None
         self._camera.reset()
+        self._reset_physics_interaction_state()
         self._physics.clear_asset()
-        self._physics_current_transform = np.eye(4, dtype=np.float64)
-        self._physics_grabbing = False
         self._physics_cooking_active = False
         self._physics_auto_cook_started = False
+        self._pending_asset_instance_count = 1
+        if self._renderer:
+            self._renderer.set_asset_instance_count(1)
+            self._renderer.set_asset_transform(np.eye(4, dtype=np.float64))
+            self._renderer.set_physics_body_transforms([])
         self._loading_asset = True
         self._load_generation += 1
         generation = self._load_generation
@@ -160,6 +173,27 @@ class ViewportWidget(QWidget):
             self.loading_changed.emit(False, self._physics.status_text)
             self._set_loading(False)
 
+    def drop_physics(self, count: int = 1) -> None:
+        if self._last_bounds is None:
+            self._on_physics_status("Load an asset before dropping physics.")
+            self.physics_running_changed.emit(False)
+            return
+        try:
+            drop_count = int(count)
+        except Exception:
+            drop_count = 1
+        drop_count = max(1, min(100, drop_count))
+        self._pending_asset_instance_count = drop_count
+        if self._renderer:
+            self._renderer.set_asset_instance_count(drop_count)
+        if not self._physics.has_scene and not self._physics_cooking_active:
+            label = "asset" if drop_count == 1 else "assets"
+            self._begin_physics_progress(f"Preparing physics colliders to drop {drop_count} {label}...", 0)
+        if not self._physics.drop_asset(drop_count):
+            self._physics_cooking_active = False
+            self.loading_changed.emit(False, self._physics.status_text)
+            self._set_loading(False)
+
     def step_physics(self) -> None:
         self._physics.step_once()
 
@@ -185,6 +219,9 @@ class ViewportWidget(QWidget):
     def set_physics_grab_force(self, amount: float) -> None:
         self._physics_grab_force_amount = self._sanitize_grab_force_amount(amount)
         self._physics.set_grab_force_amount(self._physics_grab_force_amount)
+
+    def set_physics_ccd_enabled(self, enabled: bool) -> None:
+        self._physics.set_ccd_enabled(bool(enabled))
 
     def shutdown(self, timeout_ms: int = 20000) -> bool:
         self._load_generation += 1
@@ -247,6 +284,9 @@ class ViewportWidget(QWidget):
         renderer.set_directional_light(*self._pending_dir_light)
         renderer.set_base_scene(self._pending_base_scene)
         renderer.set_collision_overlay_enabled(self._pending_collision_overlay)
+        renderer.set_asset_instance_count(self._pending_asset_instance_count)
+        if self._physics_body_transforms:
+            renderer.set_physics_body_transforms(self._physics_body_transforms)
         if self._last_bounds:
             renderer.set_collision_proxy_bounds(self._last_bounds)
 
@@ -287,6 +327,8 @@ class ViewportWidget(QWidget):
         self._set_loading(True, msg, None if value <= 0 else value)
 
     def _on_loading_finished(self, ok: bool, msg: str) -> None:
+        if ok and self._current_load_name and self._current_load_name not in str(msg):
+            return
         self._loading_asset = False
         self.status_msg.emit(msg)
         self.loading_changed.emit(False, msg)
@@ -297,6 +339,9 @@ class ViewportWidget(QWidget):
         self._cook_physics_after_load()
 
     def _on_bounds_ready(self, bounds: dict) -> None:
+        source = str(bounds.get("_usd_source", "") or "") if isinstance(bounds, dict) else ""
+        if source and self._current_usd_source and source != self._current_usd_source:
+            return
         self._last_bounds = bounds
         self._physics.configure_asset(bounds, usd_source=self._current_usd_source)
         self._physics_current_transform = np.eye(4, dtype=np.float64)
@@ -354,13 +399,37 @@ class ViewportWidget(QWidget):
         self._renderer.set_camera_transform(self._camera.get_transform())
         self._renderer.request_render()
 
-    def _on_physics_pose(self, matrix: np.ndarray) -> None:
-        self._physics_current_transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+    def _on_physics_pose(self, payload) -> None:
+        if self._loading_asset or not self._physics.has_scene:
+            return
+
+        bodies: list[dict] = []
+        if isinstance(payload, dict):
+            matrix = payload.get("root", np.eye(4, dtype=np.float64))
+            bodies = self._normalize_body_transforms(payload.get("bodies", []))
+        else:
+            matrix = payload
+
+        try:
+            root_matrix = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+        except Exception:
+            self._handle_unstable_physics("Physics returned an invalid transform; physics was stopped.")
+            return
+        if not np.all(np.isfinite(root_matrix)):
+            self._handle_unstable_physics("Physics returned a non-finite transform; physics was stopped.")
+            return
+
+        self._physics_current_transform = root_matrix
+        self._physics_body_transforms = bodies
         if self._renderer:
             self._renderer.set_asset_transform(self._physics_current_transform)
+            self._renderer.set_physics_body_transforms(self._physics_body_transforms)
             self._renderer.request_render()
 
     def _on_physics_status(self, msg: str) -> None:
+        lower = str(msg or "").lower()
+        if "physics was stopped" in lower or "ovphysx worker stopped" in lower or "physics returned" in lower:
+            self._reset_physics_interaction_state(clear_renderer=False)
         self.physics_status_changed.emit(msg)
         self.status_msg.emit(msg)
 
@@ -515,11 +584,22 @@ class ViewportWidget(QWidget):
         if not (modifiers & Qt.ShiftModifier) or modifiers & Qt.AltModifier:
             return False
 
+        selected_body = self._select_physics_body(event.pos())
         self._physics_grabbing = True
         self._physics_drag_start = event.pos()
-        self._physics_drag_matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True)
-        self._physics_grab_anchor = self._select_grab_anchor(event.pos())
-        self._physics_grab_target_start = self._anchor_world(self._physics_drag_matrix, self._physics_grab_anchor)
+        if selected_body is not None:
+            self._physics_grab_body_path = str(selected_body["path"])
+            self._physics_drag_matrix = np.array(selected_body["matrix"], dtype=np.float64, copy=True).reshape(4, 4)
+            self._physics_grab_anchor = self._select_body_grab_anchor(selected_body, event.pos())
+            self._physics_grab_target_start = self._body_anchor_world(
+                self._physics_drag_matrix,
+                self._physics_grab_anchor,
+            )
+        else:
+            self._physics_grab_body_path = None
+            self._physics_drag_matrix = np.array(self._physics_current_transform, dtype=np.float64, copy=True)
+            self._physics_grab_anchor = self._select_grab_anchor(event.pos())
+            self._physics_grab_target_start = self._anchor_world(self._physics_drag_matrix, self._physics_grab_anchor)
         _right, _up, forward = self._camera._camera_axes()
         self._physics_grab_plane_normal = np.array(forward, dtype=np.float64, copy=True)
         self._physics_grab_pointer_offset = np.zeros(3, dtype=np.float64)
@@ -536,12 +616,18 @@ class ViewportWidget(QWidget):
             self._physics_grab_anchor,
             self._physics_grab_target_start,
             self._physics_grab_velocity,
+            body_path=self._physics_grab_body_path,
         ):
             self._physics_grabbing = False
+            self._physics_grab_body_path = None
             return False
         self.setFocus()
         self._canvas.setFocus()
-        self._on_physics_status("Grabbed a physics corner. Drag to lift; flick and release to throw.")
+        if self._physics_grab_body_path:
+            name = self._physics_grab_body_path.rsplit("/", 1)[-1]
+            self._on_physics_status(f"Grabbed physics body {name}. Drag to pull the joint; flick and release to throw.")
+        else:
+            self._on_physics_status("Grabbed a physics corner. Drag to lift; flick and release to throw.")
         event.accept()
         return True
 
@@ -606,13 +692,22 @@ class ViewportWidget(QWidget):
         if abs(amount - 1.0) < 1.0e-6:
             return np.array(target, dtype=np.float64, copy=True)
         offset = np.asarray(target, dtype=np.float64) - self._physics_grab_target_start
-        return self._physics_grab_target_start + offset * amount
+        scaled = offset * amount
+        extent = 1.0
+        if self._last_bounds:
+            try:
+                extent = max(float(self._last_bounds.get("extent", extent)), 0.1)
+            except Exception:
+                extent = 1.0
+        limit = max(extent * MAX_GRAB_TARGET_EXTENTS, MIN_GRAB_TARGET_DISTANCE)
+        return self._physics_grab_target_start + self._clamp_vector(scaled, limit)
 
     def _finish_physics_grab(self, drop: bool, pos: Optional[QPoint] = None) -> None:
         if pos is not None:
             self._update_physics_grab(pos)
 
         self._physics_grabbing = False
+        self._physics_grab_body_path = None
         self._physics_drag_start = None
         self._last_pos = None
         self._active_button = None
@@ -623,6 +718,135 @@ class ViewportWidget(QWidget):
             self._on_physics_status("Released asset into physics.")
         else:
             self._physics.end_magnet(np.zeros(3, dtype=np.float64))
+
+    def _reset_physics_interaction_state(self, clear_renderer: bool = True) -> None:
+        self._physics_current_transform = np.eye(4, dtype=np.float64)
+        self._physics_body_transforms = []
+        self._physics_grabbing = False
+        self._physics_grab_body_path = None
+        self._physics_drag_start = None
+        self._physics_grab_velocity = np.zeros(3, dtype=np.float64)
+        self._physics_grab_last_target = np.zeros(3, dtype=np.float64)
+        if clear_renderer and self._renderer:
+            self._renderer.set_asset_transform(self._physics_current_transform)
+            self._renderer.set_physics_body_transforms([])
+
+    def _handle_unstable_physics(self, message: str) -> None:
+        self._reset_physics_interaction_state(clear_renderer=False)
+        self._physics.shutdown()
+        self.physics_running_changed.emit(False)
+        self._on_physics_status(message)
+
+    @staticmethod
+    def _normalize_body_transforms(items) -> list[dict]:
+        bodies: list[dict] = []
+        try:
+            raw_items = list(items or [])
+        except TypeError:
+            raw_items = []
+        for item in raw_items[:10000]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "") or "").strip()
+            if not path:
+                continue
+            try:
+                matrix = np.array(item.get("matrix"), dtype=np.float64, copy=True).reshape(4, 4)
+            except Exception:
+                continue
+            if not np.all(np.isfinite(matrix)):
+                continue
+            bodies.append({"path": path, "matrix": matrix})
+        return bodies
+
+    def _select_physics_body(self, pos: QPoint) -> Optional[dict]:
+        if not self._physics_body_transforms:
+            return None
+
+        ray_origin, ray_direction = self._pointer_ray(pos)
+        extent = 1.0
+        if self._last_bounds:
+            try:
+                extent = max(float(self._last_bounds.get("extent", extent)), 0.1)
+            except Exception:
+                extent = 1.0
+        threshold = max(extent * 0.35, self._camera.radius * 0.08, 0.15)
+
+        best_body = None
+        best_score = float("inf")
+        for body in self._physics_body_transforms:
+            matrix = np.asarray(body["matrix"], dtype=np.float64).reshape(4, 4)
+            center = matrix[3, :3]
+            to_center = center - ray_origin
+            distance_along_ray = float(np.dot(to_center, ray_direction))
+            if distance_along_ray <= 0.0 or not np.isfinite(distance_along_ray):
+                continue
+            closest = ray_origin + ray_direction * distance_along_ray
+            ray_distance = float(np.linalg.norm(center - closest))
+            if ray_distance > threshold:
+                continue
+            score = ray_distance + distance_along_ray * 0.002
+            if score < best_score:
+                best_score = score
+                best_body = body
+        return best_body
+
+    def _select_body_grab_anchor(self, body: dict, pos: QPoint) -> np.ndarray:
+        matrix = np.asarray(body["matrix"], dtype=np.float64).reshape(4, 4)
+        ray_origin, ray_direction = self._pointer_ray(pos)
+        body_origin = matrix[3, :3]
+        depth = max(float(np.dot(body_origin - ray_origin, ray_direction)), 0.05)
+        hit_world = ray_origin + ray_direction * depth
+        anchor = (hit_world - body_origin) @ matrix[:3, :3].T
+        half = self._body_grab_half_extent()
+        anchor = np.minimum(np.maximum(anchor, -half), half)
+        if float(np.linalg.norm(anchor)) < max(0.025, float(np.min(half)) * 0.2):
+            anchor = self._select_matrix_corner_anchor(pos, matrix, half)
+        return anchor.astype(np.float64)
+
+    def _body_grab_half_extent(self) -> np.ndarray:
+        size = np.ones(3, dtype=np.float64)
+        if self._last_bounds:
+            try:
+                size = np.array(self._last_bounds.get("size", size), dtype=np.float64).reshape(3)
+            except Exception:
+                size = np.ones(3, dtype=np.float64)
+        scale = 0.4 if len(self._physics_body_transforms) > 1 else 1.0
+        return np.maximum(np.abs(size) * 0.5 * scale, np.array([0.05, 0.05, 0.05], dtype=np.float64))
+
+    def _select_matrix_corner_anchor(self, pos: QPoint, matrix: np.ndarray, half: np.ndarray) -> np.ndarray:
+        body_center = np.asarray(matrix, dtype=np.float64).reshape(4, 4)[3, :3]
+        right, up, _forward = self._camera._camera_axes()
+        eye_dir = self._camera.eye - body_center
+        eye_norm = max(float(np.linalg.norm(eye_dir)), 1.0e-6)
+        pointer = np.array(
+            [
+                (float(pos.x()) / max(float(self._canvas.width()), 1.0)) * 2.0 - 1.0,
+                1.0 - (float(pos.y()) / max(float(self._canvas.height()), 1.0)) * 2.0,
+            ],
+            dtype=np.float64,
+        )
+
+        best_anchor = np.array([half[0], half[1], half[2]], dtype=np.float64)
+        best_score = -1.0e9
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    anchor = np.array([sx * half[0], sy * half[1], sz * half[2]], dtype=np.float64)
+                    offset = anchor @ matrix[:3, :3]
+                    footprint = max(float(np.linalg.norm(offset)), 1.0e-6)
+                    screen_score = (np.dot(offset, right) * pointer[0] + np.dot(offset, up) * pointer[1]) / footprint
+                    facing_score = np.dot(offset, eye_dir) / (footprint * eye_norm)
+                    score = screen_score + facing_score * 0.4
+                    if score > best_score:
+                        best_score = score
+                        best_anchor = anchor
+        return best_anchor
+
+    @staticmethod
+    def _body_anchor_world(matrix: np.ndarray, anchor: np.ndarray) -> np.ndarray:
+        transform = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+        return transform[3, :3] + np.asarray(anchor, dtype=np.float64).reshape(3) @ transform[:3, :3]
 
     def _select_grab_anchor(self, pos: QPoint) -> np.ndarray:
         size = np.ones(3, dtype=np.float64)
@@ -692,7 +916,7 @@ class ViewportWidget(QWidget):
             amount = DEFAULT_GRAB_FORCE_AMOUNT
         if not np.isfinite(amount):
             amount = DEFAULT_GRAB_FORCE_AMOUNT
-        return max(0.25, min(5.0, amount))
+        return max(MIN_GRAB_FORCE_AMOUNT, min(MAX_GRAB_FORCE_AMOUNT, amount))
 
     def _set_loading(self, active: bool, text: str = "", progress: Optional[int] = None) -> None:
         self._canvas.set_loading(False)

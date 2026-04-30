@@ -282,9 +282,11 @@ class MainWindow(QMainWindow):
         self._controls.physics_play_changed.connect(self._viewport.set_physics_playing)
         self._controls.physics_step_requested.connect(self._viewport.step_physics)
         self._controls.physics_restart_requested.connect(self._viewport.restart_physics)
+        self._controls.physics_drop_requested.connect(self._viewport.drop_physics)
         self._controls.physics_base_scene_changed.connect(self._viewport.set_physics_base_scene)
         self._controls.physics_collision_vis_changed.connect(self._viewport.set_physics_collision_overlay)
         self._controls.physics_grab_force_changed.connect(self._viewport.set_physics_grab_force)
+        self._controls.physics_ccd_changed.connect(self._viewport.set_physics_ccd_enabled)
         self._controls.set_physics_status(self._viewport.physics_status)
 
     # ── Slots ──────────────────────────────────────────────────────────────────

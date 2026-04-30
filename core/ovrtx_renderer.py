@@ -37,6 +37,9 @@ OVRTX_IMPORT_ERROR: Optional[BaseException] = None
 
 REVIEW_ROOT = "/SimReadyReview"
 ASSET_ROOT = "/SimReadyAsset"
+ASSET_ROOT_NAME = "SimReadyAsset"
+PHYSICS_ASSET_ROOT = "/World/Asset"
+PHYSICS_ASSET_ROOT_NAME = "Asset"
 STAGE_SETTINGS_PATH = "/SimReadyStageSettings"
 CAMERA_PATH = f"{REVIEW_ROOT}/Camera"
 DOME_LIGHT_PATH = f"{REVIEW_ROOT}/DomeLight"
@@ -65,6 +68,7 @@ GROUND_PLANE_Z = -0.005
 GROUND_COLLIDER_THICKNESS = 0.5
 BASE_SCENES = {"plane", "ramp", "obstacles"}
 HIDDEN_BASE_Z = -10000.0
+MAX_ASSET_INSTANCES = 100
 ENABLE_OVRTX_DEBUG_BOUNDS = os.environ.get("SIMREADY_OVRTX_DEBUG_BOUNDS") == "1"
 USD_DISCOVERY_PYTHON_ENV = "SIMREADY_USD_PYTHON"
 
@@ -115,6 +119,8 @@ class OVRTXRenderer(QObject):
     _resolution_requested = pyqtSignal(int, int)
     _camera_transform_requested = pyqtSignal(object)
     _asset_transform_requested = pyqtSignal(object)
+    _asset_instance_count_requested = pyqtSignal(int)
+    _physics_body_transforms_requested = pyqtSignal(object)
     _base_scene_requested = pyqtSignal(str)
     _collision_overlay_requested = pyqtSignal(bool)
     _collision_bounds_requested = pyqtSignal(object)
@@ -148,6 +154,13 @@ class OVRTXRenderer(QObject):
         self._asset_transform = np.eye(4, dtype=np.float64)
         self._asset_transform_dirty = True
         self._asset_transform_warning_shown = False
+        self._asset_instance_count = 1
+        self._loaded_asset_instance_count = 1
+        self._asset_instance_warning_shown = False
+        self._physics_body_transforms: list[tuple[str, np.ndarray]] = []
+        self._physics_body_transform_dirty = False
+        self._physics_body_reset_paths: set[str] = set()
+        self._physics_body_transform_warning_shown = False
         self._base_scene = "plane"
         self._base_scene_dirty = True
         self._collision_overlay_enabled = False
@@ -175,6 +188,8 @@ class OVRTXRenderer(QObject):
         self._resolution_requested.connect(self._set_resolution, Qt.QueuedConnection)
         self._camera_transform_requested.connect(self._set_camera_transform, Qt.QueuedConnection)
         self._asset_transform_requested.connect(self._set_asset_transform, Qt.QueuedConnection)
+        self._asset_instance_count_requested.connect(self._set_asset_instance_count, Qt.QueuedConnection)
+        self._physics_body_transforms_requested.connect(self._set_physics_body_transforms, Qt.QueuedConnection)
         self._base_scene_requested.connect(self._set_base_scene, Qt.QueuedConnection)
         self._collision_overlay_requested.connect(self._set_collision_overlay_enabled, Qt.QueuedConnection)
         self._collision_bounds_requested.connect(self._set_collision_proxy_bounds, Qt.QueuedConnection)
@@ -203,7 +218,27 @@ class OVRTXRenderer(QObject):
     def set_asset_transform(self, matrix: np.ndarray) -> None:
         if self._shutdown_started:
             return
-        self._asset_transform_requested.emit(np.array(matrix, dtype=np.float64, copy=True))
+        try:
+            arr = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+        except Exception:
+            return
+        if not np.all(np.isfinite(arr)):
+            return
+        self._asset_transform_requested.emit(arr)
+
+    def set_asset_instance_count(self, count: int) -> None:
+        if self._shutdown_started:
+            return
+        try:
+            value = int(count)
+        except Exception:
+            value = 1
+        self._asset_instance_count_requested.emit(max(1, min(MAX_ASSET_INSTANCES, value)))
+
+    def set_physics_body_transforms(self, bodies) -> None:
+        if self._shutdown_started:
+            return
+        self._physics_body_transforms_requested.emit(bodies)
 
     def set_base_scene(self, scene_id: str) -> None:
         if self._shutdown_started:
@@ -305,6 +340,13 @@ class OVRTXRenderer(QObject):
             self._asset_transform = np.eye(4, dtype=np.float64)
             self._asset_transform_dirty = True
             self._asset_transform_warning_shown = False
+            self._asset_instance_count = 1
+            self._loaded_asset_instance_count = 1
+            self._asset_instance_warning_shown = False
+            self._physics_body_transforms = []
+            self._physics_body_transform_dirty = False
+            self._physics_body_reset_paths = set()
+            self._physics_body_transform_warning_shown = False
             self._collision_asset_overlay_loaded = False
             self._collision_asset_overlay_path = None
             self._base_scene_dirty = True
@@ -331,7 +373,9 @@ class OVRTXRenderer(QObject):
             self._camera_dirty = True
             self.loading_progress.emit(72, "Applying viewport settings...")
             self._apply_resolution()
+            self._ensure_asset_instances()
             self._apply_asset_transform()
+            self._apply_physics_body_transforms()
             self._apply_base_scene()
             self._apply_collision_overlay()
             self._apply_dome_light()
@@ -340,6 +384,8 @@ class OVRTXRenderer(QObject):
             self.loading_progress.emit(84, "Framing asset bounds...")
             bounds = self._read_stage_bounds(usd_source)
             if bounds:
+                bounds = dict(bounds)
+                bounds["_usd_source"] = usd_source
                 self._frame_initial_camera(bounds)
                 self.bounds_ready.emit(bounds)
 
@@ -708,10 +754,40 @@ def Xform "SimReadyReview"
     def _set_asset_transform(self, matrix: np.ndarray) -> None:
         if self._shutdown_started:
             return
-        self._asset_transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+        try:
+            transform = np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)
+        except Exception:
+            return
+        if not np.all(np.isfinite(transform)):
+            return
+        self._asset_transform = transform
         self._asset_transform_dirty = True
         self._collision_overlay_dirty = True
         self._apply_asset_transform()
+        self._apply_collision_overlay()
+
+    def _set_asset_instance_count(self, count: int) -> None:
+        if self._shutdown_started:
+            return
+        try:
+            value = int(count)
+        except Exception:
+            value = 1
+        self._asset_instance_count = max(1, min(MAX_ASSET_INSTANCES, value))
+        self._asset_transform_dirty = True
+        self._physics_body_transform_dirty = True
+        self._ensure_asset_instances()
+        self._apply_asset_transform()
+        self._apply_physics_body_transforms()
+        self._apply_collision_overlay()
+
+    def _set_physics_body_transforms(self, bodies) -> None:
+        if self._shutdown_started:
+            return
+        self._physics_body_transforms = self._normalize_physics_body_transforms(bodies)
+        self._physics_body_transform_dirty = True
+        self._collision_overlay_dirty = True
+        self._apply_physics_body_transforms()
         self._apply_collision_overlay()
 
     def _set_base_scene(self, scene_id: str) -> None:
@@ -779,14 +855,41 @@ def Xform "SimReadyReview"
         )
         self._camera_dirty = False
 
+    def _ensure_asset_instances(self) -> None:
+        if not self._renderer or not self._stage_loaded or not self._current_usd_source:
+            return
+        target = max(1, min(MAX_ASSET_INSTANCES, int(self._asset_instance_count)))
+        while self._loaded_asset_instance_count < target:
+            index = self._loaded_asset_instance_count
+            try:
+                self._renderer.add_usd(self._current_usd_source, path_prefix=self._asset_render_root(index))
+                self._loaded_asset_instance_count += 1
+            except Exception as exc:
+                if not self._asset_instance_warning_shown:
+                    self._asset_instance_warning_shown = True
+                    self.status_changed.emit(f"Additional asset instance load skipped: {exc}")
+                break
+
     def _apply_asset_transform(self) -> None:
         if not self._renderer or not self._stage_loaded:
             return
         try:
+            self._ensure_asset_instances()
+            paths = []
+            matrices = []
+            hidden = self._hidden_base_transform()
+            for index in range(max(1, self._loaded_asset_instance_count)):
+                paths.append(self._asset_render_root(index))
+                if index == 0 and self._asset_instance_count <= 1:
+                    matrices.append(np.array(self._asset_transform, dtype=np.float64, copy=True).reshape(4, 4))
+                elif index < self._asset_instance_count:
+                    matrices.append(np.eye(4, dtype=np.float64))
+                else:
+                    matrices.append(hidden)
             self._renderer.write_attribute(
-                prim_paths=[ASSET_ROOT],
+                prim_paths=paths,
                 attribute_name="omni:xform",
-                tensor=np.array(self._asset_transform, dtype=np.float64, copy=True).reshape(1, 4, 4),
+                tensor=np.stack(matrices, axis=0),
                 semantic=Semantic.XFORM_MAT4x4,
                 prim_mode=PrimMode.MUST_EXIST,
             )
@@ -796,6 +899,74 @@ def Xform "SimReadyReview"
             if not self._asset_transform_warning_shown:
                 self._asset_transform_warning_shown = True
                 self.status_changed.emit(f"Asset transform update skipped: {exc}")
+
+    def _apply_physics_body_transforms(self) -> None:
+        if not self._renderer or not self._stage_loaded:
+            return
+
+        self._ensure_asset_instances()
+        entries = []
+        for physics_path, matrix in self._physics_body_transforms:
+            render_path = self._render_path_from_physics_path(physics_path)
+            if not render_path:
+                continue
+            if render_path == ASSET_ROOT and self._asset_instance_count <= 1:
+                continue
+            entries.append((render_path, np.array(matrix, dtype=np.float64, copy=True).reshape(4, 4)))
+
+        if not entries:
+            self._physics_body_transform_dirty = False
+            return
+
+        paths = [path for path, _matrix in entries]
+        matrices = np.stack([matrix for _path, matrix in entries], axis=0)
+        new_reset_paths = [path for path in paths if path not in self._physics_body_reset_paths]
+
+        try:
+            if new_reset_paths:
+                self._renderer.write_attribute(
+                    prim_paths=new_reset_paths,
+                    attribute_name="omni:resetXformStack",
+                    tensor=np.ones(len(new_reset_paths), dtype=np.bool_),
+                    prim_mode=PrimMode.CREATE_NEW,
+                )
+                self._physics_body_reset_paths.update(new_reset_paths)
+
+            self._renderer.write_attribute(
+                prim_paths=paths,
+                attribute_name="omni:xform",
+                tensor=matrices,
+                semantic=Semantic.XFORM_MAT4x4,
+                prim_mode=PrimMode.MUST_EXIST,
+            )
+            self._physics_body_transform_dirty = False
+        except Exception as exc:
+            applied = 0
+            last_exc = exc
+            for path, matrix in entries:
+                try:
+                    if path not in self._physics_body_reset_paths:
+                        self._renderer.write_attribute(
+                            prim_paths=[path],
+                            attribute_name="omni:resetXformStack",
+                            tensor=np.ones(1, dtype=np.bool_),
+                            prim_mode=PrimMode.CREATE_NEW,
+                        )
+                        self._physics_body_reset_paths.add(path)
+                    self._renderer.write_attribute(
+                        prim_paths=[path],
+                        attribute_name="omni:xform",
+                        tensor=np.array(matrix, dtype=np.float64, copy=True).reshape(1, 4, 4),
+                        semantic=Semantic.XFORM_MAT4x4,
+                        prim_mode=PrimMode.MUST_EXIST,
+                    )
+                    applied += 1
+                except Exception as item_exc:
+                    last_exc = item_exc
+            self._physics_body_transform_dirty = False
+            if applied <= 0 and not self._physics_body_transform_warning_shown:
+                self._physics_body_transform_warning_shown = True
+                self.status_changed.emit(f"Per-body physics transform update skipped: {last_exc}")
 
     def _apply_base_scene(self) -> None:
         if not self._renderer or not self._stage_loaded:
@@ -989,6 +1160,61 @@ def Xform "SimReadyReview"
         translate_back = np.eye(4, dtype=np.float64)
         translate_back[3, :3] = center
         return translate_to_origin @ scale @ translate_back @ self._asset_transform
+
+    @staticmethod
+    def _normalize_physics_body_transforms(bodies) -> list[tuple[str, np.ndarray]]:
+        normalized: list[tuple[str, np.ndarray]] = []
+        try:
+            raw_items = list(bodies or [])
+        except TypeError:
+            raw_items = []
+
+        for item in raw_items[:10000]:
+            if isinstance(item, dict):
+                path = str(item.get("path", "") or "").strip()
+                matrix_value = item.get("matrix")
+            else:
+                try:
+                    path, matrix_value = item
+                    path = str(path or "").strip()
+                except Exception:
+                    continue
+            if not path:
+                continue
+            try:
+                matrix = np.array(matrix_value, dtype=np.float64, copy=True).reshape(4, 4)
+            except Exception:
+                continue
+            if not np.all(np.isfinite(matrix)):
+                continue
+            normalized.append((path, matrix))
+        return normalized
+
+    @staticmethod
+    def _render_path_from_physics_path(path: str) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        if not text.startswith("/"):
+            text = "/" + text
+        if text == ASSET_ROOT or text.startswith(f"{ASSET_ROOT}/"):
+            return text
+        for index in range(MAX_ASSET_INSTANCES):
+            physics_root = OVRTXRenderer._physics_asset_root(index)
+            render_root = OVRTXRenderer._asset_render_root(index)
+            if text == physics_root:
+                return render_root
+            if text.startswith(f"{physics_root}/"):
+                return render_root + text[len(physics_root) :]
+        return ""
+
+    @staticmethod
+    def _asset_render_root(index: int) -> str:
+        return ASSET_ROOT if index <= 0 else f"/{ASSET_ROOT_NAME}_{index + 1:02d}"
+
+    @staticmethod
+    def _physics_asset_root(index: int) -> str:
+        return PHYSICS_ASSET_ROOT if index <= 0 else f"/World/{PHYSICS_ASSET_ROOT_NAME}_{index + 1:02d}"
 
     @staticmethod
     def _normalize_collision_bounds(bounds: dict) -> Optional[dict]:
@@ -1418,6 +1644,8 @@ def Xform "SimReadyReview"
                 self._apply_camera()
             if self._asset_transform_dirty:
                 self._apply_asset_transform()
+            if self._physics_body_transform_dirty:
+                self._apply_physics_body_transforms()
             if self._base_scene_dirty:
                 self._apply_base_scene()
             if self._collision_overlay_dirty:

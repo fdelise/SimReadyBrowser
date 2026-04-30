@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -25,6 +26,7 @@ from PyQt5.QtCore import QObject, QProcess, QTimer, pyqtSignal
 
 
 PROXY_PATH = "/World/AssetProxy"
+AUTHORED_ASSET_NAME = "Asset"
 AUTHORED_ASSET_PATH = "/World/Asset"
 S3_BUCKET = "omniverse-content-production"
 S3_HTTP_ROOT = f"https://{S3_BUCKET}.s3.us-west-2.amazonaws.com"
@@ -42,10 +44,12 @@ PHYSICS_MODE_PROXY = "proxy"
 GROUND_HALF_SIZE = 20.0
 GROUND_THICKNESS = 0.5
 GROUND_TOP_Z = 0.0
-DROP_HEIGHT_MIN = 1.5
-DROP_HEIGHT_MAX = 8.0
-DROP_HEIGHT_EXTENT_SCALE = 0.9
-DROP_HEIGHT_SIZE_SCALE = 1.5
+DROP_HEIGHT_MIN = 0.75
+DROP_HEIGHT_MAX = 3.0
+DROP_HEIGHT_EXTENT_SCALE = 0.35
+DROP_HEIGHT_SIZE_SCALE = 0.75
+MIN_DROP_ASSETS = 1
+MAX_DROP_ASSETS = 100
 DEFAULT_DT = 1.0 / 60.0
 DEFAULT_SUBSTEPS = 4
 BASE_SCENES = {"plane", "ramp", "obstacles"}
@@ -54,7 +58,8 @@ MIN_ESTIMATED_MASS_KG = 0.05
 MAX_ESTIMATED_MASS_KG = 500.0
 DEFAULT_GRAB_FORCE_AMOUNT = 2.0
 MIN_GRAB_FORCE_AMOUNT = 0.25
-MAX_GRAB_FORCE_AMOUNT = 5.0
+MAX_GRAB_FORCE_AMOUNT = 100.0
+MAX_SIM_POSITION = 10000.0
 
 Z_TO_Y_ROTATION = np.array(
     [
@@ -73,6 +78,8 @@ Y_TO_Z_MATRIX = Z_TO_Y_MATRIX.T
 class AuthoredColliderDiscovery:
     collision_overrides: str
     body_patterns: list[str]
+    body_paths: list[str]
+    articulation_paths: list[str]
     collider_count: int
     override_count: int
 
@@ -119,10 +126,17 @@ class PhysicsController(QObject):
         self._last_start_visual_transform = np.eye(4, dtype=np.float64)
         self._last_start_play = False
         self._current_body_patterns = list(AUTHORED_BODY_PATTERNS)
+        self._current_body_paths: list[str] = []
+        self._current_articulation_paths: list[str] = []
         self._authored_collider_count = 0
         self._authored_override_count = 0
         self._grab_force_amount = DEFAULT_GRAB_FORCE_AMOUNT
-        self._drop_on_next_play = True
+        self._ccd_enabled = False
+        self._scene_instance_count = 1
+        self._last_start_instance_count = 1
+        self._last_start_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._pending_instance_reset = False
 
     @property
     def status_text(self) -> str:
@@ -151,9 +165,15 @@ class PhysicsController(QObject):
         self._current_visual_transform = np.eye(4, dtype=np.float64)
         self._physics_mode = PHYSICS_MODE_AUTHORED if self._usd_source else PHYSICS_MODE_PROXY
         self._current_body_patterns = list(AUTHORED_BODY_PATTERNS)
+        self._current_body_paths = []
+        self._current_articulation_paths = []
         self._authored_collider_count = 0
         self._authored_override_count = 0
-        self._drop_on_next_play = True
+        self._scene_instance_count = 1
+        self._last_start_instance_count = 1
+        self._last_start_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._pending_instance_reset = False
         if self._usd_source:
             self._set_status("Physics ready. Colliders will cook when asset loading finishes.")
         else:
@@ -168,9 +188,15 @@ class PhysicsController(QObject):
         self._estimated_mass_kg = 10.0
         self._physics_mode = PHYSICS_MODE_PROXY
         self._current_body_patterns = list(AUTHORED_BODY_PATTERNS)
+        self._current_body_paths = []
+        self._current_articulation_paths = []
         self._authored_collider_count = 0
         self._authored_override_count = 0
-        self._drop_on_next_play = True
+        self._scene_instance_count = 1
+        self._last_start_instance_count = 1
+        self._last_start_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._pending_instance_reset = False
         self._set_status("Load an asset, then use Play or Restart physics.")
 
     def restart(
@@ -178,6 +204,7 @@ class PhysicsController(QObject):
         visual_transform: Optional[np.ndarray] = None,
         play: bool = True,
         force_rebuild: bool = False,
+        instance_transforms: Optional[list[np.ndarray]] = None,
     ) -> bool:
         if self._bounds is None:
             self._set_status("Load an asset before starting physics.")
@@ -192,17 +219,29 @@ class PhysicsController(QObject):
         visual = (
             np.array(visual_transform, dtype=np.float64, copy=True)
             if visual_transform is not None
-            else self._default_drop_visual_transform()
+            else np.array(self._current_visual_transform, dtype=np.float64, copy=True)
         )
+        if instance_transforms is None and self._scene_instance_count > 1:
+            instance_transforms = self._last_start_instance_transforms
+            if instance_transforms:
+                visual = np.array(instance_transforms[0], dtype=np.float64, copy=True)
+        instances = self._normalize_instance_transforms(instance_transforms, visual)
+        instance_count = len(instances)
+        force_rebuild = bool(force_rebuild or instance_count != self._scene_instance_count)
 
         if self._process is not None and self._worker_ready and not force_rebuild:
             self._sim_time = 0.0
             self._pending_step_after_start = False
             self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
+            self._last_start_instance_count = instance_count
+            self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in instances]
             self._last_start_play = bool(play)
-            self.set_visual_transform(visual, zero_velocity=True)
-            self._drop_on_next_play = False
-            self._set_status("Physics reset using cooked colliders.")
+            if instance_count > 1:
+                self._set_instance_transforms(instances, zero_velocity=True)
+                self._set_status(f"Physics reset {instance_count} asset instances using cooked colliders.")
+            else:
+                self.set_visual_transform(visual, zero_velocity=True)
+                self._set_status("Physics reset using cooked colliders.")
             self.set_playing(bool(play))
             return True
 
@@ -210,7 +249,10 @@ class PhysicsController(QObject):
             self._pending_play = bool(play)
             self._pending_step_after_start = False
             self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
+            self._last_start_instance_count = instance_count
+            self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in instances]
             self._last_start_play = bool(play)
+            self._pending_instance_reset = instance_count > 1
             self._set_status("Physics collider cook already in progress.")
             return True
 
@@ -225,12 +267,21 @@ class PhysicsController(QObject):
         self._set_status("Cooking authored physics colliders...")
 
         self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
+        self._last_start_instance_count = instance_count
+        self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in instances]
         self._last_start_play = bool(play)
-        body_matrix = self._body_from_visual(visual)
-        initial_pose = self._pose_from_body(body_matrix)
+        self._pending_instance_reset = instance_count > 1
+        self._authored_scene_instance_transforms = (
+            [np.eye(4, dtype=np.float64)]
+            if instance_count == 1
+            else [np.array(item, dtype=np.float64, copy=True) for item in instances]
+        )
+        initial_pose = None
+        if instance_count == 1:
+            body_matrix = self._body_from_visual(visual)
+            initial_pose = self._pose_from_body(body_matrix)
 
         scene_path = self._write_authored_scene()
-        self._drop_on_next_play = False
         return self._start_worker(scene_path, self._current_body_patterns, initial_pose)
 
     def cook_colliders(self) -> bool:
@@ -262,12 +313,14 @@ class PhysicsController(QObject):
         self._cooking_only = False
         self._startup_progress_active = True
         self._physics_mode = PHYSICS_MODE_AUTHORED
-        self._drop_on_next_play = True
         self.cooking_progress.emit(0, "Cooking physics colliders after asset load...")
         self._set_status("Cooking authored physics colliders after asset load...")
 
         visual = np.array(self._current_visual_transform, dtype=np.float64, copy=True)
         self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
+        self._last_start_instance_count = 1
+        self._last_start_instance_transforms = [np.array(visual, dtype=np.float64, copy=True)]
+        self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
         self._last_start_play = False
         body_matrix = self._body_from_visual(visual)
         initial_pose = self._pose_from_body(body_matrix)
@@ -286,10 +339,6 @@ class PhysicsController(QObject):
 
         if playing:
             status = "Physics playing."
-            if self._drop_on_next_play:
-                self.set_visual_transform(self._default_drop_visual_transform(), zero_velocity=True)
-                self._drop_on_next_play = False
-                status = "Physics playing from drop height."
             if not self._timer.isActive():
                 self._timer.start(max(1, int(self._dt * 1000)))
             if not self._running:
@@ -314,6 +363,25 @@ class PhysicsController(QObject):
         self.set_playing(False)
         self._send_step()
 
+    def drop_asset(self, count: int = 1) -> bool:
+        if self._bounds is None:
+            self._set_status("Load an asset before dropping physics.")
+            self.running_changed.emit(False)
+            return False
+        drop_count = self._sanitize_drop_count(count)
+        visuals = self._drop_visual_transforms(drop_count)
+        force_rebuild = drop_count != self._scene_instance_count
+        if not self.restart(
+            visual_transform=visuals[0],
+            play=True,
+            force_rebuild=force_rebuild,
+            instance_transforms=visuals,
+        ):
+            return False
+        label = "asset" if drop_count == 1 else "assets"
+        self._set_status(f"Dropped {drop_count} {label} from above the base scene.")
+        return True
+
     def set_base_scene(self, scene_id: str) -> None:
         scene = str(scene_id or "plane").lower()
         if scene not in BASE_SCENES:
@@ -330,17 +398,65 @@ class PhysicsController(QObject):
         was_running = self._running or self._pending_play
         visual = np.array(self._current_visual_transform, dtype=np.float64, copy=True)
         if active:
-            self.restart(visual_transform=visual, play=was_running, force_rebuild=True)
+            instances = self._last_start_instance_transforms if self._scene_instance_count > 1 else None
+            self.restart(visual_transform=visual, play=was_running, force_rebuild=True, instance_transforms=instances)
         else:
             self._set_status(f"Physics base set to {scene}.")
 
+    def set_ccd_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._ccd_enabled:
+            return
+
+        self._ccd_enabled = enabled
+        mode = "enabled" if enabled else "disabled"
+        if self._bounds is None:
+            self._set_status(f"CCD {mode}. Load an asset to apply it.")
+            return
+
+        if self._process is not None:
+            self._send({"cmd": "set_ccd", "enabled": enabled})
+            if self._worker_ready:
+                self._set_status(f"CCD {mode}; current cooked collider cache was left intact.")
+            else:
+                self._set_status(
+                    f"CCD {mode}; current collider cook will finish without restarting, then the setting applies next start."
+                )
+        else:
+            self._set_status(f"CCD {mode}. It will apply when physics starts.")
+
     def set_visual_transform(self, matrix: np.ndarray, zero_velocity: bool = True) -> None:
         visual = np.array(matrix, dtype=np.float64, copy=True)
+        if not self._matrix_is_valid(visual):
+            self._set_status("Physics transform ignored: invalid visual transform.")
+            return
         self._current_visual_transform = visual
         if self._worker_ready:
             pose = self._pose_from_visual(visual)
             self._send({"cmd": "set_pose", "pose": pose.tolist(), "zero_velocity": bool(zero_velocity)})
         self.pose_changed.emit(np.array(visual, dtype=np.float64, copy=True))
+
+    def _set_instance_transforms(self, transforms: list[np.ndarray], zero_velocity: bool = True) -> None:
+        instances = self._normalize_instance_transforms(transforms, self._current_visual_transform)
+        self._current_visual_transform = np.array(instances[0], dtype=np.float64, copy=True)
+        payload = []
+        bodies = []
+        for index, visual in enumerate(instances):
+            if not self._matrix_is_valid(visual):
+                continue
+            path = self._authored_asset_path(index)
+            pose = self._pose_from_visual(visual)
+            payload.append({"path": path, "pose": pose.astype(float).tolist()})
+            bodies.append({"path": path, "matrix": np.array(visual, dtype=np.float64, copy=True)})
+        if self._worker_ready and payload:
+            self._send({"cmd": "set_poses", "poses": payload, "zero_velocity": bool(zero_velocity)})
+        if bodies:
+            self.pose_changed.emit(
+                {
+                    "root": np.array(instances[0], dtype=np.float64, copy=True),
+                    "bodies": bodies,
+                }
+            )
 
     def set_grab_force_amount(self, amount: float) -> None:
         self._grab_force_amount = self._sanitize_grab_force_amount(amount)
@@ -354,12 +470,17 @@ class PhysicsController(QObject):
         anchor_local_visual: np.ndarray,
         target_visual: np.ndarray,
         target_velocity_visual: Optional[np.ndarray] = None,
+        body_path: Optional[str] = None,
     ) -> bool:
         if self._bounds is None:
             self._set_status("Load an asset before grabbing physics.")
             return False
 
-        message = self._magnet_message(anchor_local_visual, target_visual, target_velocity_visual)
+        if not self._vector_is_valid(anchor_local_visual) or not self._vector_is_valid(target_visual):
+            self._set_status("Physics grab skipped: invalid grab target.")
+            return False
+
+        message = self._magnet_message(anchor_local_visual, target_visual, target_velocity_visual, body_path)
         self._pending_magnet = message
 
         if self._process is None:
@@ -382,6 +503,12 @@ class PhysicsController(QObject):
     def update_magnet(self, target_visual: np.ndarray, target_velocity_visual: Optional[np.ndarray] = None) -> None:
         if self._pending_magnet is None:
             return
+        if not self._vector_is_valid(target_visual):
+            self._set_status("Physics grab stopped: invalid grab target.")
+            self.end_magnet(np.zeros(3, dtype=np.float64))
+            return
+        if target_velocity_visual is not None and not self._vector_is_valid(target_velocity_visual, MAX_SIM_POSITION):
+            target_velocity_visual = np.zeros(3, dtype=np.float64)
         self._pending_magnet["target"] = self._point_visual_to_physics(target_visual).astype(float).tolist()
         self._pending_magnet["target_velocity"] = self._vector_visual_to_physics(
             np.zeros(3, dtype=np.float64) if target_velocity_visual is None else target_velocity_visual
@@ -391,6 +518,8 @@ class PhysicsController(QObject):
 
     def end_magnet(self, throw_velocity_visual: Optional[np.ndarray] = None) -> None:
         self._pending_magnet = None
+        if throw_velocity_visual is not None and not self._vector_is_valid(throw_velocity_visual, MAX_SIM_POSITION):
+            throw_velocity_visual = np.zeros(3, dtype=np.float64)
         velocity = self._vector_visual_to_physics(
             np.zeros(3, dtype=np.float64) if throw_velocity_visual is None else throw_velocity_visual
         )
@@ -444,9 +573,14 @@ class PhysicsController(QObject):
                 "cmd": "start",
                 "scene": str(scene_path),
                 "body_patterns": body_patterns,
+                "body_paths": self._current_body_paths,
+                "articulation_paths": self._current_articulation_paths,
+                "instance_paths": self._instance_root_paths(self._last_start_instance_count),
+                "instance_reference_poses": self._instance_reference_poses(),
                 "initial_pose": None if initial_pose is None else initial_pose.astype(float).tolist(),
                 "contact_offset": self._contact_offset(),
                 "cook_only": bool(cook_only),
+                "ccd_enabled": bool(self._ccd_enabled),
             }
         )
         return True
@@ -508,6 +642,7 @@ class PhysicsController(QObject):
                 shape_text = f"{shape_count} collider {shape_suffix}"
             else:
                 shape_text = "zero usable collider shapes"
+            ccd_text = ", CCD on" if bool(message.get("ccd_enabled", False)) else ""
             authored_text = (
                 f"{self._authored_collider_count} authored collider prims traversed, "
                 if self._authored_collider_count > 0
@@ -515,7 +650,7 @@ class PhysicsController(QObject):
             )
             text = (
                 f"Physics colliders cooked ({authored_text}{body_count} {body_suffix}, "
-                f"{shape_text}, {pattern})."
+                f"{shape_text}, {pattern}{ccd_text})."
             )
             warning = str(message.get("cook_warning", "") or "")
             if warning:
@@ -532,6 +667,7 @@ class PhysicsController(QObject):
 
         if kind == "started":
             self._worker_ready = True
+            self._scene_instance_count = self._last_start_instance_count
             body_count = int(message.get("body_count", 1) or 1)
             if self._physics_mode == PHYSICS_MODE_AUTHORED:
                 pattern = str(message.get("body_pattern", "authored USD bodies"))
@@ -567,24 +703,35 @@ class PhysicsController(QObject):
                     if shape_count > 0
                     else ", authored collider tensors pending"
                 )
+                ccd_text = ", CCD on" if bool(message.get("ccd_enabled", False)) else ""
                 prefix = "Physics reset with authored colliders"
                 if not self._pending_play and not self._pending_step_after_start:
                     prefix = "Physics colliders cooked and ready"
+                instance_text = ""
+                if self._scene_instance_count > 1:
+                    instance_text = f", {self._scene_instance_count} asset instances"
                 text = (
                     f"{prefix} ({self._authored_collider_count} authored prims, "
                     f"{body_count} {suffix}{shape_text}, "
-                    f"{pattern}, {self._substeps}x substeps)."
+                    f"{pattern}{instance_text}, {self._substeps}x substeps{ccd_text})."
                 )
                 if warning:
                     text = f"{text} {warning}"
                 self._set_status(text)
             else:
                 text = "Physics reset with proxy collider."
+                if bool(message.get("ccd_enabled", False)):
+                    text = "Physics reset with proxy collider (CCD on)."
                 self._set_status(text)
             if self._startup_progress_active:
                 self.cooking_progress.emit(100, self._status_text)
                 self.cooking_finished.emit(True, self._status_text)
                 self._startup_progress_active = False
+            if self._last_start_instance_count <= 1:
+                self.set_visual_transform(self._last_start_visual_transform, zero_velocity=True)
+            elif self._pending_instance_reset:
+                self._set_instance_transforms(self._last_start_instance_transforms, zero_velocity=True)
+                self._pending_instance_reset = False
             if self._pending_magnet is not None:
                 self._send(self._pending_magnet)
             if self._pending_play:
@@ -594,14 +741,59 @@ class PhysicsController(QObject):
                 self._send_step()
             return
 
+        if kind == "ccd":
+            enabled = bool(message.get("enabled", False))
+            mode = "enabled" if enabled else "disabled"
+            detail = str(message.get("message", "") or "")
+            if detail:
+                self._set_status(detail)
+            else:
+                self._set_status(f"CCD {mode}; current physics scene was not re-cooked.")
+            return
+
         if kind == "pose":
             pose = np.array(message.get("pose", []), dtype=np.float64)
             if pose.size >= 7:
+                if not self._pose_is_valid(pose[:7]):
+                    self._handle_unstable_pose("Physics returned an invalid root pose; physics was stopped.")
+                    return
                 body_matrix = self._matrix_from_pose(pose[:7])
                 visual_matrix = self._visual_from_body(body_matrix)
+                if not self._matrix_is_valid(visual_matrix):
+                    self._handle_unstable_pose("Physics returned an invalid asset transform; physics was stopped.")
+                    return
                 self._current_visual_transform = visual_matrix
                 self._step_in_flight = False
-                self.pose_changed.emit(np.array(visual_matrix, dtype=np.float64, copy=True))
+                body_entries = []
+                for item in message.get("bodies", []) or []:
+                    if not isinstance(item, dict):
+                        continue
+                    body_pose = np.array(item.get("pose", []), dtype=np.float64)
+                    if body_pose.size < 7:
+                        continue
+                    if not self._pose_is_valid(body_pose[:7]):
+                        continue
+                    path = str(item.get("path", "") or "")
+                    if not path:
+                        continue
+                    body_visual = self._visual_from_body(self._matrix_from_pose(body_pose[:7]))
+                    if not self._matrix_is_valid(body_visual):
+                        continue
+                    body_entries.append(
+                        {
+                            "path": path,
+                            "matrix": body_visual,
+                        }
+                    )
+                if body_entries:
+                    self.pose_changed.emit(
+                        {
+                            "root": np.array(visual_matrix, dtype=np.float64, copy=True),
+                            "bodies": body_entries,
+                        }
+                    )
+                else:
+                    self.pose_changed.emit(np.array(visual_matrix, dtype=np.float64, copy=True))
             return
 
         if kind == "error":
@@ -633,6 +825,7 @@ class PhysicsController(QObject):
         self._process = None
         self._worker_ready = False
         self._step_in_flight = False
+        self._pending_instance_reset = False
         if self._timer.isActive():
             self._timer.stop()
         if self._running:
@@ -654,6 +847,7 @@ class PhysicsController(QObject):
         self._step_in_flight = False
         self._cooking_only = False
         self._startup_progress_active = False
+        self._scene_instance_count = 1
         if self._running:
             self._running = False
             self.running_changed.emit(False)
@@ -678,29 +872,6 @@ class PhysicsController(QObject):
                         process.waitForFinished(1500)
         finally:
             process.deleteLater()
-
-    def _default_drop_visual_transform(self) -> np.ndarray:
-        body_z = np.eye(4, dtype=np.float64)
-        half_z = max(float(self._size[2]) * 0.5, 0.05)
-        extent = max(float(np.linalg.norm(self._size)) * 0.5, half_z)
-        if self._bounds:
-            try:
-                extent = max(extent, float(self._bounds.get("extent", extent)))
-            except Exception:
-                pass
-        drop_height = max(
-            float(self._size[2]) * DROP_HEIGHT_SIZE_SCALE,
-            extent * DROP_HEIGHT_EXTENT_SCALE,
-            DROP_HEIGHT_MIN,
-        )
-        drop_height = min(drop_height, DROP_HEIGHT_MAX)
-        body_z[3, :3] = self._center
-        body_z[3, 2] = max(body_z[3, 2], GROUND_TOP_Z + half_z + drop_height)
-        if self._physics_mode == PHYSICS_MODE_AUTHORED:
-            visual = np.eye(4, dtype=np.float64)
-            visual[3, :3] = body_z[3, :3] - self._center
-            return visual
-        return self._visual_from_body(self._z_to_y_matrix(body_z))
 
     def _body_from_visual(self, visual_matrix: np.ndarray) -> np.ndarray:
         visual = np.array(visual_matrix, dtype=np.float64, copy=True)
@@ -737,13 +908,14 @@ class PhysicsController(QObject):
         anchor_local_visual: np.ndarray,
         target_visual: np.ndarray,
         target_velocity_visual: Optional[np.ndarray],
+        body_path: Optional[str] = None,
     ) -> dict:
         target_velocity = (
             np.zeros(3, dtype=np.float64)
             if target_velocity_visual is None
             else np.asarray(target_velocity_visual, dtype=np.float64)
         )
-        return {
+        message = {
             "cmd": "set_magnet",
             "anchor": self._vector_visual_to_physics(anchor_local_visual).astype(float).tolist(),
             "target": self._point_visual_to_physics(target_visual).astype(float).tolist(),
@@ -755,6 +927,9 @@ class PhysicsController(QObject):
             "max_angular_acceleration": 10.0,
             "force_amount": self._grab_force_amount,
         }
+        if body_path:
+            message["body_path"] = str(body_path)
+        return message
 
     def _write_authored_scene(self) -> Path:
         if not self._usd_source:
@@ -767,10 +942,28 @@ class PhysicsController(QObject):
         asset_ref = self._usd_asset_reference(self._usd_source)
         base_scene = self._base_scene_usda_z_up()
         discovery = self._authored_collider_discovery(asset_ref)
-        self._current_body_patterns = list(discovery.body_patterns)
+        instance_transforms = self._normalize_instance_transforms(
+            self._authored_scene_instance_transforms,
+            np.eye(4, dtype=np.float64),
+        )
+        instance_count = len(instance_transforms)
+        self._scene_instance_count = instance_count
+        self._current_body_patterns = self._expand_authored_paths(
+            discovery.body_patterns or list(AUTHORED_BODY_PATTERNS),
+            instance_count,
+        )
+        self._current_body_paths = self._expand_authored_paths(discovery.body_paths, instance_count)
+        if not self._current_body_paths and instance_count > 1:
+            self._current_body_paths = [self._authored_asset_path(index) for index in range(instance_count)]
+        self._current_articulation_paths = self._expand_authored_paths(discovery.articulation_paths, instance_count)
         self._authored_collider_count = int(discovery.collider_count)
         self._authored_override_count = int(discovery.override_count)
         collision_overrides = discovery.collision_overrides
+        scene_ccd = "1" if self._ccd_enabled else "0"
+        asset_blocks = "\n\n".join(
+            self._authored_asset_usda_block(index, asset_ref, collision_overrides, instance_transforms[index])
+            for index in range(instance_count)
+        )
         if self._authored_collider_count > 0:
             self._set_status(
                 f"Traversed {self._authored_collider_count} authored collider prims; starting OVPhysX cook..."
@@ -794,18 +987,22 @@ def Xform "World" (
     kind = "component"
 )
 {{
-    def PhysicsScene "PhysicsScene"
+    def PhysicsScene "PhysicsScene" (
+        prepend apiSchemas = ["PhysxSceneAPI"]
+    )
     {{
         vector3f physics:gravityDirection = (0, 0, -1)
         float physics:gravityMagnitude = 9.81
+        uniform token physxScene:solverType = "TGS"
+        bool physxScene:enableStabilization = 1
+        bool physxScene:enableExternalForcesEveryIteration = 1
+        bool physxScene:solveArticulationContactLast = 1
+        uniform uint physxScene:minPositionIterationCount = 8
+        uniform uint physxScene:minVelocityIterationCount = 2
+        bool physxScene:enableCCD = {scene_ccd}
     }}
 
-    def Xform "Asset" (
-        prepend references = @{asset_ref}@
-    )
-    {{
-{collision_overrides}
-    }}
+{asset_blocks}
 
 {base_scene}
 }}
@@ -823,6 +1020,7 @@ def Xform "World" (
         body_pos = body_matrix[3, :3]
         body_quat = self._quat_xyzw_from_row_rotation(body_matrix[:3, :3])
         base_scene = self._base_scene_usda()
+        proxy_mass = self._fmt(self._estimated_mass_kg)
 
         text = f"""#usda 1.0
 (
@@ -837,14 +1035,23 @@ def Xform "World" (
     kind = "component"
 )
 {{
-    def PhysicsScene "PhysicsScene"
+    def PhysicsScene "PhysicsScene" (
+        prepend apiSchemas = ["PhysxSceneAPI"]
+    )
     {{
         vector3f physics:gravityDirection = (0, -1, 0)
         float physics:gravityMagnitude = 9.81
+        uniform token physxScene:solverType = "TGS"
+        bool physxScene:enableStabilization = 1
+        bool physxScene:enableExternalForcesEveryIteration = 1
+        bool physxScene:solveArticulationContactLast = 1
+        uniform uint physxScene:minPositionIterationCount = 8
+        uniform uint physxScene:minVelocityIterationCount = 2
+        bool physxScene:enableCCD = {"1" if self._ccd_enabled else "0"}
     }}
 
     def Xform "AssetProxy" (
-        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI", "PhysxRigidBodyAPI"]
     )
     {{
         double3 xformOp:translate = ({self._fmt(body_pos[0])}, {self._fmt(body_pos[1])}, {self._fmt(body_pos[2])})
@@ -854,6 +1061,7 @@ def Xform "World" (
         float physics:mass = {proxy_mass}
         vector3f physics:velocity = (0, 0, 0)
         vector3f physics:angularVelocity = (0, 0, 0)
+        bool physxRigidBody:enableCCD = {"1" if self._ccd_enabled else "0"}
 
         def Cube "CubeGeom" (
             prepend apiSchemas = ["PhysicsCollisionAPI"]
@@ -871,6 +1079,242 @@ def Xform "World" (
 """
         self._scene_path.write_text(text, encoding="utf-8")
         return self._scene_path
+
+    def _authored_asset_usda_block(
+        self,
+        index: int,
+        asset_ref: str,
+        collision_overrides: str,
+        transform: np.ndarray,
+    ) -> str:
+        name = self._authored_asset_name(index)
+        matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
+        quat = self._quat_xyzw_from_row_rotation(matrix[:3, :3])
+        xform_lines = [
+            f"        double3 xformOp:translate = ({self._fmt(matrix[3, 0])}, {self._fmt(matrix[3, 1])}, {self._fmt(matrix[3, 2])})",
+            f"        quatd xformOp:orient = ({self._fmt(quat[3])}, {self._fmt(quat[0])}, {self._fmt(quat[1])}, {self._fmt(quat[2])})",
+            "        double3 xformOp:scale = (1, 1, 1)",
+            '        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]',
+        ]
+        overrides = f"\n{collision_overrides}" if collision_overrides else ""
+        return f"""    def Xform "{name}" (
+        prepend references = @{asset_ref}@
+    )
+    {{
+{chr(10).join(xform_lines)}
+{overrides}
+    }}"""
+
+    def _drop_visual_transforms(self, count: int) -> list[np.ndarray]:
+        drop_count = self._sanitize_drop_count(count)
+        first = self._drop_visual_transform()
+        if drop_count <= 1:
+            return [first]
+
+        rng = random.Random()
+        transforms: list[np.ndarray] = []
+        size = np.maximum(np.asarray(self._size, dtype=np.float64).reshape(3), np.array([0.05, 0.05, 0.05]))
+        clearance = max(0.03, min(0.25, float(np.max(size)) * 0.08))
+        horizontal_diagonal = max(float(np.linalg.norm(size[:2])), 0.1)
+        column_spacing = horizontal_diagonal + clearance * 2.0
+        vertical_gap = max(float(size[2]) + clearance, 0.12)
+        column_count = 1 if drop_count <= 6 else min(drop_count, max(2, math.ceil(math.sqrt(drop_count))))
+        column_offsets = self._drop_column_offsets(column_count, column_spacing)
+        base_center = self._center @ first[:3, :3] + first[3, :3]
+        placed_bounds: list[tuple[np.ndarray, np.ndarray]] = []
+        for index in range(drop_count):
+            column = index % column_count
+            layer = index // column_count
+            jitter_radius = clearance * rng.uniform(0.0, 0.25)
+            jitter_angle = rng.uniform(0.0, math.tau)
+            offset = column_offsets[column] + np.array(
+                [math.cos(jitter_angle) * jitter_radius, math.sin(jitter_angle) * jitter_radius],
+                dtype=np.float64,
+            )
+            yaw = rng.uniform(-0.45, 0.45)
+            rotation = first[:3, :3] @ self._z_up_yaw_rotation(yaw)
+            target_center = np.array(base_center, dtype=np.float64, copy=True)
+            target_center[0] += offset[0]
+            target_center[1] += offset[1]
+            target_center[2] += vertical_gap * layer
+            visual = self._visual_transform_for_center(rotation, target_center)
+            bounds = self._drop_aabb(visual)
+            if bounds[0][2] < GROUND_TOP_Z + clearance:
+                target_center[2] += GROUND_TOP_Z + clearance - bounds[0][2]
+                visual = self._visual_transform_for_center(rotation, target_center)
+                bounds = self._drop_aabb(visual)
+
+            guard = 0
+            while any(self._aabb_intersects(bounds, previous, clearance) for previous in placed_bounds) and guard < drop_count + 4:
+                target_center[2] += vertical_gap
+                visual = self._visual_transform_for_center(rotation, target_center)
+                bounds = self._drop_aabb(visual)
+                guard += 1
+            placed_bounds.append(bounds)
+            transforms.append(visual)
+        return transforms
+
+    @staticmethod
+    def _drop_column_offsets(count: int, spacing: float) -> list[np.ndarray]:
+        total = max(1, int(count))
+        if total <= 1:
+            return [np.zeros(2, dtype=np.float64)]
+        cols = max(1, math.ceil(math.sqrt(total)))
+        rows = max(1, math.ceil(total / cols))
+        offsets = []
+        for index in range(total):
+            row = index // cols
+            col = index % cols
+            offsets.append(
+                np.array(
+                    [
+                        (float(col) - (float(cols) - 1.0) * 0.5) * float(spacing),
+                        (float(row) - (float(rows) - 1.0) * 0.5) * float(spacing),
+                    ],
+                    dtype=np.float64,
+                )
+            )
+        offsets.sort(key=lambda item: float(np.linalg.norm(item)))
+        return offsets
+
+    def _visual_transform_for_center(self, rotation: np.ndarray, center: np.ndarray) -> np.ndarray:
+        visual = np.eye(4, dtype=np.float64)
+        visual[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+        visual[3, :3] = np.asarray(center, dtype=np.float64).reshape(3) - self._center @ visual[:3, :3]
+        return visual
+
+    def _drop_aabb(self, visual: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        matrix = np.asarray(visual, dtype=np.float64).reshape(4, 4)
+        half = np.maximum(np.asarray(self._size, dtype=np.float64).reshape(3), np.array([0.05, 0.05, 0.05])) * 0.5
+        center = self._center @ matrix[:3, :3] + matrix[3, :3]
+        extent = half @ np.abs(matrix[:3, :3])
+        return center - extent, center + extent
+
+    @staticmethod
+    def _aabb_intersects(
+        a: tuple[np.ndarray, np.ndarray],
+        b: tuple[np.ndarray, np.ndarray],
+        clearance: float = 0.0,
+    ) -> bool:
+        a_min, a_max = a
+        b_min, b_max = b
+        pad = max(0.0, float(clearance))
+        return bool(np.all(a_min < b_max + pad) and np.all(a_max > b_min - pad))
+
+    def _drop_visual_transform(self) -> np.ndarray:
+        visual = np.array(self._current_visual_transform, dtype=np.float64, copy=True).reshape(4, 4)
+        if not self._matrix_is_valid(visual):
+            visual = np.eye(4, dtype=np.float64)
+
+        half_z = max(float(self._size[2]) * 0.5, 0.05)
+        extent = max(float(np.linalg.norm(self._size)) * 0.5, half_z)
+        if self._bounds:
+            try:
+                extent = max(extent, float(self._bounds.get("extent", extent)))
+            except Exception:
+                pass
+
+        drop_height = max(
+            float(self._size[2]) * DROP_HEIGHT_SIZE_SCALE,
+            extent * DROP_HEIGHT_EXTENT_SCALE,
+            DROP_HEIGHT_MIN,
+        )
+        drop_height = min(drop_height, DROP_HEIGHT_MAX)
+
+        target_center = np.array(self._center, dtype=np.float64, copy=True)
+        target_center[2] = max(target_center[2], GROUND_TOP_Z + half_z + drop_height)
+        visual[3, :3] = target_center - self._center @ visual[:3, :3]
+        return visual
+
+    @classmethod
+    def _normalize_instance_transforms(
+        cls,
+        transforms: Optional[list[np.ndarray]],
+        fallback: np.ndarray,
+    ) -> list[np.ndarray]:
+        fallback_matrix = np.array(fallback, dtype=np.float64, copy=True).reshape(4, 4)
+        try:
+            raw_items = list(transforms or [])
+        except TypeError:
+            raw_items = []
+
+        normalized: list[np.ndarray] = []
+        for item in raw_items[:MAX_DROP_ASSETS]:
+            try:
+                matrix = np.array(item, dtype=np.float64, copy=True).reshape(4, 4)
+            except Exception:
+                matrix = np.array(fallback_matrix, dtype=np.float64, copy=True)
+            if not cls._matrix_is_valid(matrix):
+                matrix = np.array(fallback_matrix, dtype=np.float64, copy=True)
+            normalized.append(matrix)
+        return normalized or [fallback_matrix]
+
+    @staticmethod
+    def _sanitize_drop_count(count: int) -> int:
+        try:
+            value = int(count)
+        except Exception:
+            value = 1
+        return max(MIN_DROP_ASSETS, min(MAX_DROP_ASSETS, value))
+
+    @staticmethod
+    def _authored_asset_name(index: int) -> str:
+        return AUTHORED_ASSET_NAME if index <= 0 else f"{AUTHORED_ASSET_NAME}_{index + 1:02d}"
+
+    @classmethod
+    def _authored_asset_path(cls, index: int) -> str:
+        return f"/World/{cls._authored_asset_name(index)}"
+
+    @classmethod
+    def _instance_root_paths(cls, count: int) -> list[str]:
+        return [cls._authored_asset_path(index) for index in range(max(1, int(count)))]
+
+    def _instance_reference_poses(self) -> list[dict]:
+        transforms = self._normalize_instance_transforms(
+            self._authored_scene_instance_transforms,
+            np.eye(4, dtype=np.float64),
+        )
+        poses = []
+        for index, matrix in enumerate(transforms):
+            poses.append(
+                {
+                    "path": self._authored_asset_path(index),
+                    "pose": self._pose_from_visual(matrix).astype(float).tolist(),
+                }
+            )
+        return poses
+
+    @classmethod
+    def _expand_authored_paths(cls, paths: list[str], count: int) -> list[str]:
+        expanded: list[str] = []
+        for index in range(max(1, int(count))):
+            root = cls._authored_asset_path(index)
+            for path in paths or []:
+                text = str(path or "").strip()
+                if not text:
+                    continue
+                if text == AUTHORED_ASSET_PATH:
+                    mapped = root
+                elif text.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                    mapped = root + text[len(AUTHORED_ASSET_PATH) :]
+                else:
+                    mapped = text
+                if mapped not in expanded:
+                    expanded.append(mapped)
+        return expanded
+
+    @staticmethod
+    def _z_up_yaw_rotation(angle: float) -> np.ndarray:
+        c = math.cos(float(angle))
+        s = math.sin(float(angle))
+        return np.array(
+            [
+                [c, s, 0.0],
+                [-s, c, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
 
     @staticmethod
     def _usd_asset_reference(source: str) -> str:
@@ -937,10 +1381,12 @@ def Xform "World" (
         collider_count = int(payload.get("collider_count", 0) or 0)
         override_count = int(payload.get("override_count", 0) or 0)
         if collider_count <= 0:
-            return AuthoredColliderDiscovery("", body_patterns or list(AUTHORED_BODY_PATTERNS), 0, 0)
+            return AuthoredColliderDiscovery("", body_patterns or list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
         return AuthoredColliderDiscovery(
             self._format_absolute_collision_overrides(override_paths),
             body_patterns or list(AUTHORED_BODY_PATTERNS),
+            [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()],
+            [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
             collider_count,
             override_count,
         )
@@ -973,23 +1419,26 @@ def Xform "World" (
         base_text = self._read_simready_payload_text(asset_ref, "base.usda")
         instances_text = self._read_simready_payload_text(asset_ref, "instances.usda")
         if not base_text or not instances_text:
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
 
         collision_instances = self._collision_instances(instances_text)
         if not collision_instances:
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
 
         references = self._simready_instance_references(base_text)
         collision_refs = [(path, name) for path, name in references if name in collision_instances]
         if not collision_refs:
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
 
         override_refs = [(path, name) for path, name in collision_refs if collision_instances.get(name) == "sdf"]
         collision_overrides = self._format_collision_overrides(override_refs)
         body_patterns = self._authored_body_patterns_from_refs(collision_refs)
+        body_paths = self._authored_body_paths_from_refs(collision_refs)
         return AuthoredColliderDiscovery(
             collision_overrides,
             body_patterns,
+            body_paths,
+            [],
             len(collision_refs),
             len(override_refs),
         )
@@ -1073,6 +1522,24 @@ def Xform "World" (
         for fallback in AUTHORED_BODY_PATTERNS:
             add(fallback)
         return patterns or list(AUTHORED_BODY_PATTERNS)
+
+    def _authored_body_paths_from_refs(self, refs: list[tuple[tuple[str, ...], str]]) -> list[str]:
+        paths: list[str] = []
+
+        def add(path: str) -> None:
+            if path and path not in paths and len(paths) < MAX_DISCOVERED_BODY_PATTERNS:
+                paths.append(path)
+
+        for rel_path, _instance_name in refs:
+            clean_parts = [self._usd_name(part) for part in rel_path if part]
+            if not clean_parts:
+                continue
+            full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
+            if clean_parts[0] == "Geometry" and len(clean_parts) > 1:
+                add("/".join(full_parts[:4]))
+            else:
+                add("/".join(full_parts[:2]))
+        return paths
 
     def _format_collision_overrides(self, refs: list[tuple[tuple[str, ...], str]]) -> str:
         overrides: list[tuple[str, str, str]] = []
@@ -1416,6 +1883,14 @@ def Xform "World" (
         self._status_text = text
         self.status_changed.emit(text)
 
+    def _handle_unstable_pose(self, text: str) -> None:
+        was_progress = self._startup_progress_active
+        was_cooking = self._cooking_only
+        self._set_status(text)
+        self._release_scene()
+        if was_cooking or was_progress:
+            self.cooking_finished.emit(False, text)
+
     @classmethod
     def _normalize_bounds(cls, bounds: dict) -> dict:
         center = np.array(bounds.get("center", [0.0, 0.0, 0.0]), dtype=np.float64)
@@ -1445,6 +1920,35 @@ def Xform "World" (
         matrix[:3, :3] = cls._row_rotation_from_quat_xyzw(pose[3:7])
         matrix[3, :3] = pose[:3]
         return matrix
+
+    @staticmethod
+    def _pose_is_valid(pose) -> bool:
+        try:
+            arr = np.asarray(pose, dtype=np.float64).reshape(-1)
+        except Exception:
+            return False
+        if arr.size < 7 or not np.all(np.isfinite(arr[:7])):
+            return False
+        if float(np.linalg.norm(arr[:3])) > MAX_SIM_POSITION:
+            return False
+        quat_norm = float(np.linalg.norm(arr[3:7]))
+        return math.isfinite(quat_norm) and quat_norm > 1.0e-8
+
+    @staticmethod
+    def _matrix_is_valid(matrix) -> bool:
+        try:
+            arr = np.asarray(matrix, dtype=np.float64).reshape(4, 4)
+        except Exception:
+            return False
+        return np.all(np.isfinite(arr)) and float(np.linalg.norm(arr[3, :3])) <= MAX_SIM_POSITION
+
+    @staticmethod
+    def _vector_is_valid(vector, limit: float = MAX_SIM_POSITION) -> bool:
+        try:
+            arr = np.asarray(vector, dtype=np.float64).reshape(3)
+        except Exception:
+            return False
+        return np.all(np.isfinite(arr)) and float(np.linalg.norm(arr)) <= float(limit)
 
     @staticmethod
     def _row_rotation_from_quat_xyzw(quat: np.ndarray) -> np.ndarray:
