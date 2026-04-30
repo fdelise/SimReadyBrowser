@@ -218,6 +218,13 @@ class ViewportWidget(QWidget):
         except Exception:
             drop_count = 1
         drop_count = max(1, min(100, drop_count))
+        if isinstance(self._last_bounds, dict):
+            try:
+                selected_count = len(list(self._last_bounds.get("_asset_sources", []) or []))
+            except TypeError:
+                selected_count = 0
+            if selected_count > 1:
+                drop_count = max(drop_count, min(100, selected_count))
         self._pending_asset_instance_count = drop_count
         if self._renderer:
             self._renderer.set_asset_instance_count(drop_count)
@@ -254,6 +261,9 @@ class ViewportWidget(QWidget):
     def set_physics_grab_force(self, amount: float) -> None:
         self._physics_grab_force_amount = self._sanitize_grab_force_amount(amount)
         self._physics.set_grab_force_amount(self._physics_grab_force_amount)
+
+    def set_physics_drop_options(self, spacing: float, randomness: float) -> None:
+        self._physics.set_drop_options(float(spacing), float(randomness))
 
     def set_physics_ccd_enabled(self, enabled: bool) -> None:
         self._physics.set_ccd_enabled(bool(enabled))

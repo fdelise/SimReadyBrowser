@@ -745,8 +745,8 @@ def _test_selected_multi_simready_cooks() -> None:
     ]
     scene = controller._write_authored_scene(discoveries)
     scene_text = scene.read_text(encoding="utf-8")
-    assert "</World/Asset_02/Geometry/sm_support_a02_obj_00>" in scene_text
-    assert "</World/Asset_02/Geometry/sm_pakingtape_a02_obj_00>" in scene_text
+    assert "</World/Instance_02/Geometry/sm_support_a02_obj_00>" in scene_text
+    assert "</World/Instance_02/Geometry/sm_pakingtape_a02_obj_00>" in scene_text
 
     start_message = {
         "cmd": "start",
@@ -774,10 +774,268 @@ def _test_selected_multi_simready_cooks() -> None:
         timeout=240,
     )
     messages = [json.loads(line) for line in stdout.splitlines() if line.startswith("{")]
-    cooked = [message for message in messages if message.get("type") == "cooked"][-1]
+    cooked_messages = [message for message in messages if message.get("type") == "cooked"]
+    assert cooked_messages, f"missing cooked message\nstdout={stdout}\nstderr={stderr}"
+    cooked = cooked_messages[-1]
     assert int(cooked.get("body_count", 0)) >= 3, cooked
     assert int(cooked.get("shape_count", 0)) > 0, cooked
     assert "body relationship /World/Asset/Geometry" not in stderr
+
+
+def _test_controller_instanced_drop_uses_runtime_clones(temp_dir: Path) -> None:
+    from PyQt5.QtCore import QCoreApplication
+
+    from core.physics_controller import AuthoredColliderDiscovery, PhysicsController
+
+    QCoreApplication.instance() or QCoreApplication([])
+    asset = _write_local_authored_asset(temp_dir)
+    controller = PhysicsController()
+    controller.configure_asset(
+        {"center": [0, 0, 0], "size": [1, 1, 1], "extent": 1},
+        usd_source=str(asset),
+    )
+    transforms = []
+    for index in range(4):
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[3, 0] = float(index) * 1.5
+        matrix[3, 2] = 2.0 + float(index) * 0.05
+        transforms.append(matrix)
+    controller._authored_scene_instance_transforms = transforms
+    controller._last_start_instance_count = len(transforms)
+    controller._active_instance_count = len(transforms)
+
+    collision_overrides = """
+        over "AuthoredCollider" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            bool physics:kinematicEnabled = 0
+            bool physics:startsAsleep = 0
+            float physics:mass = 10
+            vector3f physics:velocity = (0, 0, 0)
+            vector3f physics:angularVelocity = (0, 0, 0)
+        }
+"""
+    discovery = AuthoredColliderDiscovery(
+        collision_overrides,
+        ["/World/Asset/AuthoredCollider"],
+        ["/World/Asset/AuthoredCollider"],
+        [],
+        1,
+        1,
+    )
+    scene = controller._write_authored_scene(discovery)
+    scene_text = scene.read_text(encoding="utf-8")
+    assert scene_text.count("prepend references") == 1, "drop scene should reference the source asset once"
+    assert controller._authored_collider_count == 1, "collider count should report source colliders, not cloned instances"
+    assert controller._runtime_clone_source_path == "/World/Asset"
+    assert controller._runtime_clone_target_paths == ["/World/Instance_02", "/World/Instance_03", "/World/Instance_04"]
+
+    start_message = {
+        "cmd": "start",
+        "scene": str(scene),
+        "body_patterns": controller._current_body_patterns,
+        "body_paths": controller._current_body_paths,
+        "articulation_paths": controller._current_articulation_paths,
+        "instance_paths": controller._instance_root_paths(len(transforms)),
+        "instance_reference_poses": controller._instance_reference_poses(),
+        "clone_source_path": controller._runtime_clone_source_path,
+        "clone_target_paths": controller._runtime_clone_target_paths,
+        "clone_parent_poses": [pose.astype(float).tolist() for pose in controller._runtime_clone_parent_poses],
+        "initial_pose": None,
+        "contact_offset": 0.02,
+        "cook_only": True,
+        "ccd_enabled": False,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-m", "core.physics_worker"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate(
+        json.dumps(start_message, separators=(",", ":")) + "\n" + json.dumps({"cmd": "shutdown"}) + "\n",
+        timeout=120,
+    )
+    messages = [json.loads(line) for line in stdout.splitlines() if line.startswith("{")]
+    cooked_messages = [message for message in messages if message.get("type") == "cooked"]
+    assert cooked_messages, f"missing cooked message\nstdout={stdout}\nstderr={stderr}"
+    cooked = cooked_messages[-1]
+    assert int(cooked.get("body_count", 0)) >= 4, cooked
+    assert int(cooked.get("shape_count", 0)) > 0, cooked
+    assert "Failed to queue clone" not in stdout + stderr
+
+
+def _test_https_simready_clone_drop() -> None:
+    from PyQt5.QtCore import QCoreApplication
+
+    from core.physics_controller import PhysicsController
+
+    QCoreApplication.instance() or QCoreApplication([])
+    asset = (
+        "https://omniverse-content-production.s3.us-west-2.amazonaws.com/"
+        "Assets/Isaac/6.0/Isaac/SimReady/Industrial/Hardware/Tapes/Clear_Tape/"
+        "sm_tape_clear_a02_01.usd"
+    )
+    controller = PhysicsController()
+    controller.configure_asset(
+        {"center": [0, 0, 0.1], "size": [0.35, 0.2, 0.15], "extent": 0.35},
+        usd_source=asset,
+    )
+    transforms = []
+    for index in range(4):
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[3, 0] = float(index % 2) * 0.45
+        matrix[3, 1] = float(index // 2) * 0.45
+        matrix[3, 2] = 1.2 + float(index) * 0.1
+        transforms.append(matrix)
+    controller._authored_scene_instance_transforms = transforms
+    controller._last_start_instance_count = len(transforms)
+    controller._active_instance_count = len(transforms)
+    discovery = controller._authored_collider_discovery(controller._usd_asset_reference(asset))
+    scene = controller._write_authored_scene(discovery)
+    scene_text = scene.read_text(encoding="utf-8")
+    assert scene_text.count("prepend references") == 1, "SimReady clone-drop scene should reference the source once"
+    assert controller._authored_collider_count == discovery.collider_count
+    assert len(controller._runtime_clone_target_paths) == len(transforms) - 1
+
+    start_message = {
+        "cmd": "start",
+        "scene": str(scene),
+        "body_patterns": controller._current_body_patterns,
+        "body_paths": controller._current_body_paths,
+        "articulation_paths": controller._current_articulation_paths,
+        "instance_paths": controller._instance_root_paths(len(transforms)),
+        "instance_reference_poses": controller._instance_reference_poses(),
+        "clone_source_path": controller._runtime_clone_source_path,
+        "clone_target_paths": controller._runtime_clone_target_paths,
+        "clone_parent_poses": [pose.astype(float).tolist() for pose in controller._runtime_clone_parent_poses],
+        "initial_pose": None,
+        "contact_offset": 0.02,
+        "cook_only": True,
+        "ccd_enabled": False,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-m", "core.physics_worker"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate(
+        json.dumps(start_message, separators=(",", ":")) + "\n" + json.dumps({"cmd": "shutdown"}) + "\n",
+        timeout=240,
+    )
+    messages = [json.loads(line) for line in stdout.splitlines() if line.startswith("{")]
+    cooked_messages = [message for message in messages if message.get("type") == "cooked"]
+    assert cooked_messages, f"missing cooked message\nstdout={stdout}\nstderr={stderr}"
+    cooked = cooked_messages[-1]
+    assert int(cooked.get("body_count", 0)) >= len(transforms), cooked
+    assert int(cooked.get("shape_count", 0)) > 0, cooked
+    assert "Failed to queue clone" not in stdout + stderr
+
+
+def _test_selected_assets_split_drop_uses_clone_groups(temp_dir: Path) -> None:
+    from PyQt5.QtCore import QCoreApplication
+
+    from core.physics_controller import AuthoredColliderDiscovery, PhysicsController
+
+    QCoreApplication.instance() or QCoreApplication([])
+    asset_a = _write_local_authored_asset(temp_dir)
+    asset_b = temp_dir / "authored_collider_asset_b.usda"
+    asset_b.write_text(asset_a.read_text(encoding="utf-8"), encoding="utf-8")
+
+    controller = PhysicsController()
+    bounds = {
+        "center": [0.5, 0.5, 0.5],
+        "size": [1, 1, 1],
+        "extent": 1,
+        "_asset_sources": [str(asset_a), str(asset_b)],
+        "_asset_bounds": [
+            {"center": [0, 0, 0.5], "size": [1.0, 1.0, 1.0], "extent": 0.9},
+            {"center": [0, 0, 0.2], "size": [0.5, 0.4, 0.4], "extent": 0.45},
+        ],
+        "_asset_layout_transforms": [np.eye(4).tolist(), np.eye(4).tolist()],
+    }
+    controller.configure_asset(bounds, usd_source=None)
+    controller.set_drop_options(0.55, 1.6)
+    controller._authored_scene_asset_indices = controller._drop_asset_indices(5)
+    transforms = controller._drop_visual_transforms(5)
+    for index, transform in enumerate(transforms):
+        source_index = controller._authored_scene_asset_indices[index]
+        assert controller._drop_aabb(transform, source_index)[0][2] > 0.01
+    controller._authored_scene_instance_transforms = transforms
+    controller._last_start_instance_count = len(transforms)
+    controller._active_instance_count = len(transforms)
+
+    discovery = AuthoredColliderDiscovery(
+        """
+        over "AuthoredCollider" (
+            prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+        )
+        {
+            bool physics:rigidBodyEnabled = 1
+            bool physics:kinematicEnabled = 0
+            bool physics:startsAsleep = 0
+            float physics:mass = 10
+            vector3f physics:velocity = (0, 0, 0)
+            vector3f physics:angularVelocity = (0, 0, 0)
+        }
+""",
+        ["/World/Asset/AuthoredCollider"],
+        ["/World/Asset/AuthoredCollider"],
+        [],
+        1,
+        1,
+    )
+    scene = controller._write_authored_scene([discovery, discovery])
+    scene_text = scene.read_text(encoding="utf-8")
+    assert scene_text.count("prepend references") == 2, "selected drop should reference each selected source once"
+    assert controller._authored_collider_count == 2, "collider count should report selected source colliders, not drop copies"
+    assert controller._authored_scene_asset_indices == [0, 1, 0, 1, 0]
+    assert len(controller._runtime_clone_groups) == 2
+    assert controller._runtime_clone_groups[0]["source"] == "/World/Asset"
+    assert controller._runtime_clone_groups[0]["targets"] == ["/World/Instance_03", "/World/Instance_05"]
+    assert controller._runtime_clone_groups[1]["source"] == "/World/Instance_02"
+    assert controller._runtime_clone_groups[1]["targets"] == ["/World/Instance_04"]
+
+    start_message = {
+        "cmd": "start",
+        "scene": str(scene),
+        "body_patterns": controller._current_body_patterns,
+        "body_paths": controller._current_body_paths,
+        "articulation_paths": controller._current_articulation_paths,
+        "instance_paths": controller._instance_root_paths(len(transforms)),
+        "instance_reference_poses": controller._instance_reference_poses(),
+        "clone_groups": controller._runtime_clone_groups_payload(),
+        "initial_pose": None,
+        "contact_offset": 0.02,
+        "cook_only": True,
+        "ccd_enabled": False,
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-m", "core.physics_worker"],
+        cwd=str(Path(__file__).resolve().parents[1]),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate(
+        json.dumps(start_message, separators=(",", ":")) + "\n" + json.dumps({"cmd": "shutdown"}) + "\n",
+        timeout=120,
+    )
+    messages = [json.loads(line) for line in stdout.splitlines() if line.startswith("{")]
+    cooked_messages = [message for message in messages if message.get("type") == "cooked"]
+    assert cooked_messages, f"missing cooked message\nstdout={stdout}\nstderr={stderr}"
+    cooked = cooked_messages[-1]
+    assert int(cooked.get("body_count", 0)) >= len(transforms), cooked
+    assert int(cooked.get("shape_count", 0)) > 0, cooked
+    assert "Failed to queue clone" not in stdout + stderr
 
 
 def main() -> int:
@@ -836,6 +1094,20 @@ def main() -> int:
         if mode == "selected-multi":
             _test_selected_multi_simready_cooks()
             print("selected multi-asset authored-collider cook test passed")
+            return 0
+        if mode == "clone-drop":
+            with tempfile.TemporaryDirectory(prefix="simready_physx_clone_drop_") as temp:
+                _test_controller_instanced_drop_uses_runtime_clones(Path(temp))
+            print("clone-backed multi-drop cook test passed")
+            return 0
+        if mode == "https-clone-drop":
+            _test_https_simready_clone_drop()
+            print("HTTPS SimReady clone-backed multi-drop cook test passed")
+            return 0
+        if mode == "selected-clone-drop":
+            with tempfile.TemporaryDirectory(prefix="simready_physx_selected_clone_drop_") as temp:
+                _test_selected_assets_split_drop_uses_clone_groups(Path(temp))
+            print("selected-asset split clone-drop cook test passed")
             return 0
         raise SystemExit(f"unknown mode: {mode}")
 

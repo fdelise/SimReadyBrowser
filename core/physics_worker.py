@@ -80,6 +80,10 @@ class PhysicsWorker:
                         articulation_paths=message.get("articulation_paths", []),
                         instance_paths=message.get("instance_paths", []),
                         instance_reference_poses=message.get("instance_reference_poses", []),
+                        clone_source_path=message.get("clone_source_path", ""),
+                        clone_target_paths=message.get("clone_target_paths", []),
+                        clone_parent_poses=message.get("clone_parent_poses", []),
+                        clone_groups=message.get("clone_groups", []),
                         ccd_enabled=bool(message.get("ccd_enabled", False)),
                     )
                 elif cmd == "step":
@@ -116,6 +120,10 @@ class PhysicsWorker:
         articulation_paths=None,
         instance_paths=None,
         instance_reference_poses=None,
+        clone_source_path: str = "",
+        clone_target_paths=None,
+        clone_parent_poses=None,
+        clone_groups=None,
         ccd_enabled: bool = False,
     ) -> None:
         self.shutdown()
@@ -163,6 +171,7 @@ class PhysicsWorker:
         result = self._physx.add_usd(scene_path)
         self._usd_handle = result[0] if isinstance(result, tuple) else result
         self._physx.wait_all()
+        self._clone_runtime_instances(clone_groups, clone_source_path, clone_target_paths, clone_parent_poses)
 
         self._emit_progress(58, "Discovering authored rigid bodies...")
         self._pose_binding = self._create_pose_binding(TensorType.RIGID_BODY_POSE)
@@ -211,7 +220,7 @@ class PhysicsWorker:
             self._mass_binding = None
             self._mass_buffer = None
 
-        self._emit_progress(82, "Cooking collider shapes...")
+        self._emit_progress(82, "Binding collider shapes from cooked sources...")
         self._shape_count = self._tune_shape_properties(TensorType)
         if self._shape_count <= 0:
             self._shape_count = self._force_collider_cook(TensorType)
@@ -222,7 +231,7 @@ class PhysicsWorker:
             )
             self._emit_progress(92, "Finalizing authored collider cook...")
 
-        self._emit_progress(94, "Finalizing cooked collider cache...")
+        self._emit_progress(94, "Finalizing cloned physics instance cache...")
         if cook_only:
             self._emit(
                 {
@@ -696,6 +705,78 @@ class PhysicsWorker:
                 continue
             poses[path] = pose
         return poses
+
+    def _clone_runtime_instances(self, clone_groups, source_path: str = "", target_paths=None, parent_poses=None) -> None:
+        if self._physx is None:
+            return
+
+        groups = self._normalize_clone_groups(clone_groups)
+        if not groups:
+            source = str(source_path or "").strip()
+            if source and not source.startswith("/"):
+                source = "/" + source
+            targets = [path for path in self._normalize_optional_paths(target_paths) if path and path != source]
+            if source and targets:
+                groups = [{"source": source, "targets": targets, "parent_poses": list(parent_poses or [])}]
+        if not groups:
+            return
+
+        clone_count = sum(len(group["targets"]) for group in groups)
+        self._emit_progress(44, f"Instancing {clone_count + len(groups)} physics copies from cooked sources...")
+        for group in groups:
+            source = group["source"]
+            targets = group["targets"]
+            parent_transforms = self._clone_parent_transforms(group.get("parent_poses", []), len(targets))
+            try:
+                if parent_transforms:
+                    self._physx.clone(source, targets, parent_transforms=parent_transforms)
+                else:
+                    self._physx.clone(source, targets)
+            except TypeError:
+                self._physx.clone(source, targets)
+        self._physx.wait_all()
+
+    def _normalize_clone_groups(self, groups) -> list[dict]:
+        try:
+            raw_items = list(groups or [])
+        except TypeError:
+            raw_items = []
+        normalized: list[dict] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source", "") or "").strip()
+            if source and not source.startswith("/"):
+                source = "/" + source
+            targets = [path for path in self._normalize_optional_paths(item.get("targets", [])) if path and path != source]
+            if not source or not targets:
+                continue
+            normalized.append(
+                {
+                    "source": source,
+                    "targets": targets,
+                    "parent_poses": list(item.get("parent_poses", []) or []),
+                }
+            )
+        return normalized
+
+    @staticmethod
+    def _clone_parent_transforms(poses, count: int) -> list[tuple[float, float, float, float, float, float, float]]:
+        try:
+            raw_items = list(poses or [])
+        except TypeError:
+            raw_items = []
+        expected = max(0, int(count))
+        transforms: list[tuple[float, float, float, float, float, float, float]] = []
+        for item in raw_items[:expected]:
+            try:
+                pose = np.array(item, dtype=np.float32).reshape(7)
+            except Exception:
+                continue
+            if not PhysicsWorker._pose_is_valid(pose):
+                continue
+            transforms.append(tuple(float(value) for value in pose))
+        return transforms if len(transforms) == expected else []
 
     def _instance_path_for_body(self, body_path: str, target_poses: dict[str, np.ndarray]) -> str:
         text = str(body_path or "").strip()

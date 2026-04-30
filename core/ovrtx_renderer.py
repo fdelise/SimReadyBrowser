@@ -156,6 +156,7 @@ class OVRTXRenderer(QObject):
         self._asset_transform = np.eye(4, dtype=np.float64)
         self._asset_transform_dirty = True
         self._asset_layout_transforms: list[np.ndarray] = []
+        self._stage_item_sources: list[str] = []
         self._asset_transform_warning_shown = False
         self._asset_instance_count = 1
         self._loaded_asset_instance_count = 1
@@ -373,6 +374,7 @@ class OVRTXRenderer(QObject):
         try:
             self._stage_loaded = False
             self._current_usd_source = stage_items[0]["source"] if count == 1 else None
+            self._stage_item_sources = [item["source"] for item in stage_items]
             self._asset_transform = np.eye(4, dtype=np.float64)
             self._asset_transform_dirty = True
             self._asset_layout_transforms = []
@@ -916,19 +918,33 @@ def Xform "SimReadyReview"
         self._camera_dirty = False
 
     def _ensure_asset_instances(self) -> None:
-        if not self._renderer or not self._stage_loaded or not self._current_usd_source:
+        if not self._renderer or not self._stage_loaded:
             return
         target = max(1, min(MAX_ASSET_INSTANCES, int(self._asset_instance_count)))
         while self._loaded_asset_instance_count < target:
             index = self._loaded_asset_instance_count
+            source = self._asset_source_for_instance(index)
+            if not source:
+                return
             try:
-                self._renderer.add_usd(self._current_usd_source, path_prefix=self._asset_render_root(index))
+                self._renderer.add_usd(source, path_prefix=self._asset_render_root(index))
                 self._loaded_asset_instance_count += 1
             except Exception as exc:
                 if not self._asset_instance_warning_shown:
                     self._asset_instance_warning_shown = True
                     self.status_changed.emit(f"Additional asset instance load skipped: {exc}")
                 break
+
+    def _asset_source_for_instance(self, index: int) -> str:
+        if self._current_usd_source:
+            return self._current_usd_source
+        if not self._stage_item_sources:
+            return ""
+        try:
+            source_index = max(0, int(index)) % len(self._stage_item_sources)
+        except Exception:
+            source_index = 0
+        return str(self._stage_item_sources[source_index] or "")
 
     def _apply_asset_transform(self) -> None:
         if not self._renderer or not self._stage_loaded:
@@ -1524,7 +1540,7 @@ def Xform "SimReadyReview"
 
     @staticmethod
     def _physics_asset_root(index: int) -> str:
-        return PHYSICS_ASSET_ROOT if index <= 0 else f"/World/{PHYSICS_ASSET_ROOT_NAME}_{index + 1:02d}"
+        return PHYSICS_ASSET_ROOT if index <= 0 else f"/World/Instance_{index + 1:02d}"
 
     @staticmethod
     def _normalize_collision_bounds(bounds: dict) -> Optional[dict]:

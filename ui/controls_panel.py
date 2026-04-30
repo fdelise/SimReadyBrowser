@@ -68,6 +68,7 @@ class ControlsPanel(QWidget):
     physics_collision_vis_changed = pyqtSignal(bool)
     physics_grab_force_changed = pyqtSignal(float)
     physics_ccd_changed = pyqtSignal(bool)
+    physics_drop_options_changed = pyqtSignal(float, float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -275,6 +276,44 @@ class ControlsPanel(QWidget):
         drop_count_widget.setLayout(drop_count_row)
         lay.addWidget(drop_count_widget)
 
+        drop_options_row = QHBoxLayout()
+        spacing_label = QLabel("Spacing:")
+        spacing_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        drop_options_row.addWidget(spacing_label)
+
+        self._physics_drop_spacing = QDoubleSpinBox()
+        self._physics_drop_spacing.setRange(0.00, 5.00)
+        self._physics_drop_spacing.setDecimals(2)
+        self._physics_drop_spacing.setSingleStep(0.10)
+        self._physics_drop_spacing.setValue(0.20)
+        self._physics_drop_spacing.setSuffix("x")
+        self._physics_drop_spacing.setToolTip("0 stacks tightly; higher values push dropped assets farther apart.")
+        self._physics_drop_spacing.valueChanged.connect(lambda _value: self._emit_drop_options())
+        drop_options_row.addWidget(self._physics_drop_spacing, 1)
+
+        random_label = QLabel("Random:")
+        random_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        drop_options_row.addWidget(random_label)
+
+        self._physics_drop_random = QDoubleSpinBox()
+        self._physics_drop_random.setRange(0.00, 6.00)
+        self._physics_drop_random.setDecimals(2)
+        self._physics_drop_random.setSingleStep(0.25)
+        self._physics_drop_random.setValue(0.25)
+        self._physics_drop_random.setSuffix("x")
+        self._physics_drop_random.setToolTip("0 is ordered; higher values scatter dropped assets much more aggressively.")
+        self._physics_drop_random.valueChanged.connect(lambda _value: self._emit_drop_options())
+        drop_options_row.addWidget(self._physics_drop_random, 1)
+
+        drop_options_widget = QWidget()
+        drop_options_widget.setStyleSheet("background: transparent;")
+        drop_options_widget.setLayout(drop_options_row)
+        lay.addWidget(drop_options_widget)
+
         button_row = QHBoxLayout()
         restart_btn = _small_button("Restart")
         restart_btn.clicked.connect(self.physics_restart_requested)
@@ -432,6 +471,12 @@ class ControlsPanel(QWidget):
         old = self._physics_play.blockSignals(True)
         self._physics_play.setChecked(bool(running))
         self._physics_play.blockSignals(old)
+
+    def _emit_drop_options(self):
+        self.physics_drop_options_changed.emit(
+            float(self._physics_drop_spacing.value()),
+            float(self._physics_drop_random.value()),
+        )
 
     def _request_load(self):
         if self._current_asset:

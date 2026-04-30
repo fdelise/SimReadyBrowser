@@ -53,6 +53,12 @@ DROP_HEIGHT_EXTENT_SCALE = 0.35
 DROP_HEIGHT_SIZE_SCALE = 0.75
 MIN_DROP_ASSETS = 1
 MAX_DROP_ASSETS = 100
+DEFAULT_DROP_SPACING = 0.20
+MIN_DROP_SPACING = 0.0
+MAX_DROP_SPACING = 5.0
+DEFAULT_DROP_RANDOMNESS = 0.25
+MIN_DROP_RANDOMNESS = 0.0
+MAX_DROP_RANDOMNESS = 6.0
 DEFAULT_DT = 1.0 / 60.0
 DEFAULT_SUBSTEPS = 4
 BASE_SCENES = {"plane", "ramp", "obstacles"}
@@ -133,6 +139,7 @@ class PhysicsController(QObject):
         self._usd_source: Optional[str] = None
         self._usd_sources: list[str] = []
         self._asset_source_transforms: list[np.ndarray] = [np.eye(4, dtype=np.float64)]
+        self._asset_source_bounds: list[dict] = []
         self._center = np.zeros(3, dtype=np.float64)
         self._size = np.ones(3, dtype=np.float64)
         self._estimated_mass_kg = 10.0
@@ -154,12 +161,24 @@ class PhysicsController(QObject):
         self._authored_collider_count = 0
         self._authored_override_count = 0
         self._grab_force_amount = DEFAULT_GRAB_FORCE_AMOUNT
+        self._drop_spacing_amount = DEFAULT_DROP_SPACING
+        self._drop_randomness_amount = DEFAULT_DROP_RANDOMNESS
         self._ccd_enabled = False
         self._scene_instance_count = 1
+        self._active_instance_count = 1
         self._last_start_instance_count = 1
         self._last_start_instance_transforms = [np.eye(4, dtype=np.float64)]
         self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._authored_scene_asset_indices = [0]
         self._pending_instance_reset = False
+        self._cooked_asset_refs: tuple[str, ...] = ()
+        self._cooked_base_scene = ""
+        self._cooked_ccd_enabled = False
+        self._cooked_instance_capacity = 0
+        self._runtime_clone_source_path = ""
+        self._runtime_clone_target_paths: list[str] = []
+        self._runtime_clone_parent_poses: list[np.ndarray] = []
+        self._runtime_clone_groups: list[dict] = []
 
     @property
     def status_text(self) -> str:
@@ -185,6 +204,7 @@ class PhysicsController(QObject):
         self._usd_sources = self._configured_asset_sources(bounds, usd_source)
         self._usd_source = self._usd_sources[0] if len(self._usd_sources) == 1 else None
         self._asset_source_transforms = self._configured_asset_transforms(bounds, len(self._usd_sources))
+        self._asset_source_bounds = self._configured_asset_bounds(bounds, len(self._usd_sources))
         self._center = np.array(self._bounds["center"], dtype=np.float64)
         self._size = np.array(self._bounds["size"], dtype=np.float64)
         self._estimated_mass_kg = self._estimate_asset_mass(self._size)
@@ -196,6 +216,7 @@ class PhysicsController(QObject):
         self._authored_collider_count = 0
         self._authored_override_count = 0
         self._scene_instance_count = max(1, len(self._asset_source_transforms))
+        self._active_instance_count = self._scene_instance_count
         self._last_start_instance_count = self._scene_instance_count
         self._last_start_instance_transforms = [
             np.array(item, dtype=np.float64, copy=True) for item in self._asset_source_transforms
@@ -203,7 +224,9 @@ class PhysicsController(QObject):
         self._authored_scene_instance_transforms = [
             np.array(item, dtype=np.float64, copy=True) for item in self._asset_source_transforms
         ]
+        self._authored_scene_asset_indices = self._default_asset_indices(self._scene_instance_count)
         self._pending_instance_reset = False
+        self._clear_runtime_clone_state()
         if len(self._usd_sources) > 1:
             self._set_status(f"Physics ready for {len(self._usd_sources)} selected assets. Colliders will cook after load.")
         elif self._usd_sources:
@@ -217,6 +240,7 @@ class PhysicsController(QObject):
         self._usd_source = None
         self._usd_sources = []
         self._asset_source_transforms = [np.eye(4, dtype=np.float64)]
+        self._asset_source_bounds = []
         self._pending_magnet = None
         self._pending_discovery_start = None
         self._current_visual_transform = np.eye(4, dtype=np.float64)
@@ -228,10 +252,13 @@ class PhysicsController(QObject):
         self._authored_collider_count = 0
         self._authored_override_count = 0
         self._scene_instance_count = 1
+        self._active_instance_count = 1
         self._last_start_instance_count = 1
         self._last_start_instance_transforms = [np.eye(4, dtype=np.float64)]
         self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
+        self._authored_scene_asset_indices = [0]
         self._pending_instance_reset = False
+        self._clear_runtime_clone_state()
         self._set_status("Load an asset, then use Play or Restart physics.")
 
     def restart(
@@ -257,23 +284,35 @@ class PhysicsController(QObject):
             else np.array(self._current_visual_transform, dtype=np.float64, copy=True)
         )
         if instance_transforms is None and self._scene_instance_count > 1:
-            instance_transforms = self._last_start_instance_transforms
+            active_existing = max(1, min(self._active_instance_count, len(self._last_start_instance_transforms)))
+            instance_transforms = self._last_start_instance_transforms[:active_existing]
             if instance_transforms:
                 visual = np.array(instance_transforms[0], dtype=np.float64, copy=True)
         instances = self._normalize_instance_transforms(instance_transforms, visual)
-        instance_count = len(instances)
-        force_rebuild = bool(force_rebuild or instance_count != self._scene_instance_count)
+        active_count = len(instances)
+        self._authored_scene_asset_indices = self._scene_asset_indices(active_count, len(self._active_asset_refs()))
+        asset_refs = self._active_asset_refs()
+        can_reuse_pool = self._can_reuse_live_scene(asset_refs, active_count)
+        force_rebuild = bool(force_rebuild or (active_count > self._scene_instance_count and not can_reuse_pool))
+        reset_instances = (
+            self._pad_instance_transforms(instances, self._cooked_instance_capacity)
+            if can_reuse_pool
+            else instances
+        )
 
-        if self._process is not None and self._worker_ready and not force_rebuild:
+        if self._process is not None and self._worker_ready and (can_reuse_pool or not force_rebuild):
             self._sim_time = 0.0
             self._pending_step_after_start = False
             self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
-            self._last_start_instance_count = instance_count
+            self._active_instance_count = active_count
+            self._last_start_instance_count = active_count
             self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in instances]
             self._last_start_play = bool(play)
-            if instance_count > 1:
-                self._set_instance_transforms(instances, zero_velocity=True)
-                self._set_status(f"Physics reset {instance_count} asset instances using cooked colliders.")
+            if active_count > 1 or len(reset_instances) > 1:
+                self._set_instance_transforms(reset_instances, zero_velocity=True)
+                label = "asset" if active_count == 1 else "assets"
+                suffix = "" if len(reset_instances) == active_count else f" from a {len(reset_instances)}-instance cooked pool"
+                self._set_status(f"Physics reset {active_count} {label} using cooked colliders{suffix}.")
             else:
                 self.set_visual_transform(visual, zero_velocity=True)
                 self._set_status("Physics reset using cooked colliders.")
@@ -284,10 +323,11 @@ class PhysicsController(QObject):
             self._pending_play = bool(play)
             self._pending_step_after_start = False
             self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
-            self._last_start_instance_count = instance_count
+            self._active_instance_count = active_count
+            self._last_start_instance_count = active_count
             self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in instances]
             self._last_start_play = bool(play)
-            self._pending_instance_reset = instance_count > 1
+            self._pending_instance_reset = active_count > 1
             self._set_status("Physics collider cook already in progress.")
             return True
 
@@ -302,17 +342,19 @@ class PhysicsController(QObject):
         self._set_status("Cooking authored physics colliders...")
 
         self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
-        self._last_start_instance_count = instance_count
+        self._active_instance_count = active_count
+        self._last_start_instance_count = active_count
         self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in instances]
         self._last_start_play = bool(play)
-        self._pending_instance_reset = instance_count > 1
+        self._pending_instance_reset = active_count > 1
         self._authored_scene_instance_transforms = (
             [np.eye(4, dtype=np.float64)]
-            if instance_count == 1
+            if active_count == 1
             else [np.array(item, dtype=np.float64, copy=True) for item in instances]
         )
+        self._authored_scene_asset_indices = self._scene_asset_indices(active_count, len(asset_refs))
         initial_pose = None
-        if instance_count == 1:
+        if active_count == 1:
             body_matrix = self._body_from_visual(visual)
             initial_pose = self._pose_from_body(body_matrix)
 
@@ -362,6 +404,7 @@ class PhysicsController(QObject):
             else [np.array(visual, dtype=np.float64, copy=True)]
         )
         self._last_start_visual_transform = np.array(visual, dtype=np.float64, copy=True)
+        self._active_instance_count = len(transforms)
         self._last_start_instance_count = len(transforms)
         self._last_start_instance_transforms = [np.array(item, dtype=np.float64, copy=True) for item in transforms]
         self._authored_scene_instance_transforms = (
@@ -369,6 +412,7 @@ class PhysicsController(QObject):
             if len(transforms) == 1
             else [np.array(item, dtype=np.float64, copy=True) for item in transforms]
         )
+        self._authored_scene_asset_indices = self._default_asset_indices(len(transforms))
         self._last_start_play = False
         self._pending_instance_reset = len(transforms) > 1
         initial_pose = None
@@ -423,9 +467,14 @@ class PhysicsController(QObject):
             self._set_status("Load an asset before dropping physics.")
             self.running_changed.emit(False)
             return False
-        drop_count = self._sanitize_drop_count(count)
+        selected_count = max(1, len(self._active_asset_refs()))
+        drop_count = max(self._sanitize_drop_count(count), selected_count)
+        self._authored_scene_asset_indices = self._drop_asset_indices(drop_count)
         visuals = self._drop_visual_transforms(drop_count)
-        force_rebuild = drop_count != self._scene_instance_count
+        force_rebuild = (
+            drop_count != self._scene_instance_count
+            and not self._can_reuse_live_scene(self._active_asset_refs(), drop_count)
+        )
         if not self.restart(
             visual_transform=visuals[0],
             play=True,
@@ -472,6 +521,7 @@ class PhysicsController(QObject):
         if self._process is not None:
             self._send({"cmd": "set_ccd", "enabled": enabled})
             if self._worker_ready:
+                self._cooked_ccd_enabled = enabled
                 self._set_status(f"CCD {mode}; current cooked collider cache was left intact.")
             else:
                 self._set_status(
@@ -519,6 +569,10 @@ class PhysicsController(QObject):
             self._pending_magnet["force_amount"] = self._grab_force_amount
             if self._worker_ready:
                 self._send(self._pending_magnet)
+
+    def set_drop_options(self, spacing: float, randomness: float) -> None:
+        self._drop_spacing_amount = self._sanitize_drop_spacing(spacing)
+        self._drop_randomness_amount = self._sanitize_drop_randomness(randomness)
 
     def begin_magnet(
         self,
@@ -756,12 +810,23 @@ class PhysicsController(QObject):
                 "articulation_paths": self._current_articulation_paths,
                 "instance_paths": self._instance_root_paths(self._last_start_instance_count),
                 "instance_reference_poses": self._instance_reference_poses(),
+                "clone_source_path": self._runtime_clone_source_path,
+                "clone_target_paths": self._runtime_clone_target_paths,
+                "clone_parent_poses": [
+                    np.array(pose, dtype=np.float32, copy=True).reshape(7).astype(float).tolist()
+                    for pose in self._runtime_clone_parent_poses
+                ],
+                "clone_groups": self._runtime_clone_groups_payload(),
                 "initial_pose": None if initial_pose is None else initial_pose.astype(float).tolist(),
                 "contact_offset": self._contact_offset(),
                 "cook_only": bool(cook_only),
                 "ccd_enabled": bool(self._ccd_enabled),
             }
         )
+        self._cooked_asset_refs = tuple(self._active_asset_refs())
+        self._cooked_base_scene = self._base_scene
+        self._cooked_ccd_enabled = bool(self._ccd_enabled)
+        self._cooked_instance_capacity = max(1, int(self._last_start_instance_count))
         return True
 
     def _send_step(self) -> None:
@@ -887,8 +952,10 @@ class PhysicsController(QObject):
                 if not self._pending_play and not self._pending_step_after_start:
                     prefix = "Physics colliders cooked and ready"
                 instance_text = ""
-                if self._scene_instance_count > 1:
-                    instance_text = f", {self._scene_instance_count} asset instances"
+                if self._active_instance_count > 1:
+                    instance_text = f", {self._active_instance_count} active asset instances"
+                    if self._scene_instance_count > self._active_instance_count:
+                        instance_text += f" from a {self._scene_instance_count}-instance cache"
                 text = (
                     f"{prefix} ({self._authored_collider_count} authored prims, "
                     f"{body_count} {suffix}{shape_text}, "
@@ -1005,6 +1072,7 @@ class PhysicsController(QObject):
         self._worker_ready = False
         self._step_in_flight = False
         self._pending_instance_reset = False
+        self._clear_live_cooked_scene_state()
         if self._timer.isActive():
             self._timer.stop()
         if self._running:
@@ -1028,6 +1096,9 @@ class PhysicsController(QObject):
         self._cooking_only = False
         self._startup_progress_active = False
         self._scene_instance_count = 1
+        self._active_instance_count = 1
+        self._clear_live_cooked_scene_state()
+        self._clear_runtime_clone_state()
         if self._running:
             self._running = False
             self.running_changed.emit(False)
@@ -1156,27 +1227,48 @@ class PhysicsController(QObject):
             np.eye(4, dtype=np.float64),
         )
         instance_count = len(instance_transforms)
-        if len(asset_refs) == 1 and instance_count > 1:
-            scene_asset_refs = [asset_refs[0] for _index in range(instance_count)]
-            scene_discoveries = [discoveries[0] if discoveries else self._empty_discovery() for _index in range(instance_count)]
-        else:
-            scene_asset_refs = list(asset_refs)
-            scene_discoveries = [
-                discoveries[index] if index < len(discoveries) else self._empty_discovery()
-                for index in range(len(scene_asset_refs))
-            ]
-            if len(instance_transforms) != len(scene_asset_refs):
-                instance_transforms = self._normalize_instance_transforms(
-                    self._asset_source_transforms[: len(scene_asset_refs)],
-                    np.eye(4, dtype=np.float64),
+        self._clear_runtime_clone_state()
+        asset_indices = self._scene_asset_indices(instance_count, len(asset_refs))
+        self._authored_scene_asset_indices = list(asset_indices)
+
+        source_instances: dict[int, list[int]] = {}
+        for instance_index, source_index in enumerate(asset_indices):
+            source_instances.setdefault(int(source_index), []).append(instance_index)
+
+        scene_entries: list[tuple[int, int, AuthoredColliderDiscovery]] = []
+        for source_index, instance_indices in source_instances.items():
+            if source_index < 0 or source_index >= len(asset_refs):
+                continue
+            source_discovery = (
+                discoveries[source_index]
+                if source_index < len(discoveries)
+                else self._empty_discovery()
+            )
+            source_instance_index = instance_indices[0]
+            scene_entries.append((source_instance_index, source_index, source_discovery))
+            clone_targets = [self._authored_asset_path(index) for index in instance_indices[1:]]
+            if clone_targets:
+                parent_poses = [
+                    self._pose_from_visual(instance_transforms[index])
+                    for index in instance_indices[1:]
+                ]
+                self._add_runtime_clone_group(
+                    self._authored_asset_path(source_instance_index),
+                    clone_targets,
+                    parent_poses,
                 )
-            instance_count = len(scene_asset_refs)
+
+        scene_entries.sort(key=lambda item: item[0])
+        body_discoveries = [
+            discoveries[source_index] if source_index < len(discoveries) else self._empty_discovery()
+            for source_index in asset_indices
+        ]
 
         self._scene_instance_count = instance_count
         self._current_body_patterns = []
         self._current_body_paths = []
         self._current_articulation_paths = []
-        for index, item_discovery in enumerate(scene_discoveries):
+        for index, item_discovery in enumerate(body_discoveries):
             self._extend_unique(
                 self._current_body_patterns,
                 self._map_authored_paths_for_index(
@@ -1194,22 +1286,29 @@ class PhysicsController(QObject):
             )
         if not self._current_body_paths and instance_count > 1:
             self._current_body_paths = [self._authored_asset_path(index) for index in range(instance_count)]
-        self._authored_collider_count = sum(int(item.collider_count) for item in scene_discoveries)
-        self._authored_override_count = sum(int(item.override_count) for item in scene_discoveries)
+        source_collider_count = sum(int(item[2].collider_count) for item in scene_entries)
+        self._authored_collider_count = source_collider_count
+        self._authored_override_count = sum(int(item[2].override_count) for item in scene_entries)
         scene_ccd = "1" if self._ccd_enabled else "0"
         asset_blocks = "\n\n".join(
             self._authored_asset_usda_block(
-                index,
-                scene_asset_refs[index],
-                self._map_authored_override_text_for_index(scene_discoveries[index].collision_overrides, index),
-                instance_transforms[index],
+                instance_index,
+                asset_refs[source_index],
+                self._map_authored_override_text_for_index(discovery_item.collision_overrides, instance_index),
+                instance_transforms[instance_index],
             )
-            for index in range(instance_count)
+            for instance_index, source_index, discovery_item in scene_entries
         )
         if self._authored_collider_count > 0:
-            self._set_status(
-                f"Found {self._authored_collider_count} authored collider prims; starting OVPhysX cook..."
-            )
+            if instance_count > len(scene_entries):
+                self._set_status(
+                    f"Found {self._authored_collider_count} authored collider prims across "
+                    f"{len(scene_entries)} source assets; cloning to {instance_count} physics instances..."
+                )
+            else:
+                self._set_status(
+                    f"Found {self._authored_collider_count} authored collider prims; starting OVPhysX cook..."
+                )
         else:
             self._set_status(
                 "No authored collider prims were found in the SimReady payload metadata; OVPhysX will inspect the stage."
@@ -1349,48 +1448,65 @@ def Xform "World" (
 
     def _drop_visual_transforms(self, count: int) -> list[np.ndarray]:
         drop_count = self._sanitize_drop_count(count)
-        first = self._drop_visual_transform()
+        asset_indices = self._scene_asset_indices(drop_count, len(self._active_asset_refs()))
+        first = self._drop_visual_transform(asset_indices[0] if asset_indices else 0)
         if drop_count <= 1:
             return [first]
 
         rng = random.Random()
         transforms: list[np.ndarray] = []
-        size = np.maximum(np.asarray(self._size, dtype=np.float64).reshape(3), np.array([0.05, 0.05, 0.05]))
-        clearance = max(0.03, min(0.25, float(np.max(size)) * 0.08))
-        horizontal_diagonal = max(float(np.linalg.norm(size[:2])), 0.1)
-        column_spacing = horizontal_diagonal + clearance * 2.0
-        vertical_gap = max(float(size[2]) + clearance, 0.12)
+        source_bounds = [self._drop_source_bounds(index) for index in asset_indices]
+        sizes = [np.asarray(item["size"], dtype=np.float64).reshape(3) for item in source_bounds]
+        max_size = np.maximum(np.max(np.stack(sizes, axis=0), axis=0), np.array([0.05, 0.05, 0.05]))
+        spacing = self._drop_spacing_amount
+        randomness = self._drop_randomness_amount
+        clearance = max(0.005, min(0.22, float(np.max(max_size)) * 0.035 * max(0.15, spacing)))
+        horizontal_diagonal = max(float(np.linalg.norm(max_size[:2])), 0.1)
+        column_spacing = max(0.02, horizontal_diagonal * (0.08 + spacing * 0.95) + clearance)
+        vertical_gap = max(float(max_size[2]) * (0.55 + spacing * 0.22) + clearance, 0.08)
         column_count = 1 if drop_count <= 6 else min(drop_count, max(2, math.ceil(math.sqrt(drop_count))))
         column_offsets = self._drop_column_offsets(column_count, column_spacing)
-        base_center = self._center @ first[:3, :3] + first[3, :3]
+        rng.shuffle(column_offsets)
+        base_center = np.asarray(self._center, dtype=np.float64).reshape(3)
         placed_bounds: list[tuple[np.ndarray, np.ndarray]] = []
         for index in range(drop_count):
+            source_index = asset_indices[index] if index < len(asset_indices) else 0
+            item_bounds = source_bounds[index] if index < len(source_bounds) else self._drop_source_bounds(source_index)
+            size = np.asarray(item_bounds["size"], dtype=np.float64).reshape(3)
+            item_clearance = max(clearance, min(0.2, float(np.max(size)) * 0.05))
             column = index % column_count
             layer = index // column_count
-            jitter_radius = clearance * rng.uniform(0.0, 0.25)
-            jitter_angle = rng.uniform(0.0, math.tau)
-            offset = column_offsets[column] + np.array(
-                [math.cos(jitter_angle) * jitter_radius, math.sin(jitter_angle) * jitter_radius],
-                dtype=np.float64,
-            )
-            yaw = rng.uniform(-0.45, 0.45)
-            rotation = first[:3, :3] @ self._z_up_yaw_rotation(yaw)
-            target_center = np.array(base_center, dtype=np.float64, copy=True)
-            target_center[0] += offset[0]
-            target_center[1] += offset[1]
-            target_center[2] += vertical_gap * layer
-            visual = self._visual_transform_for_center(rotation, target_center)
-            bounds = self._drop_aabb(visual)
-            if bounds[0][2] < GROUND_TOP_Z + clearance:
-                target_center[2] += GROUND_TOP_Z + clearance - bounds[0][2]
-                visual = self._visual_transform_for_center(rotation, target_center)
-                bounds = self._drop_aabb(visual)
+            visual = first
+            bounds = self._drop_aabb(visual, source_index)
+            for attempt in range(10):
+                jitter_radius = horizontal_diagonal * 0.65 * randomness * rng.uniform(0.0, 1.25)
+                jitter_angle = rng.uniform(0.0, math.tau)
+                offset = column_offsets[column] + np.array(
+                    [math.cos(jitter_angle) * jitter_radius, math.sin(jitter_angle) * jitter_radius],
+                    dtype=np.float64,
+                )
+                yaw = rng.uniform(-math.pi, math.pi) * min(1.0, 0.35 + randomness * 0.35)
+                rotation = first[:3, :3] @ self._z_up_yaw_rotation(yaw)
+                target_center = np.array(base_center, dtype=np.float64, copy=True)
+                target_center[0] += offset[0]
+                target_center[1] += offset[1]
+                target_center[2] = self._drop_center_z_for_source(source_index) + vertical_gap * layer
+                if randomness > 0.0:
+                    target_center[2] += rng.uniform(0.0, vertical_gap * 0.45 * randomness)
+                visual = self._visual_transform_for_source_center(source_index, rotation, target_center)
+                bounds = self._drop_aabb(visual, source_index)
+                if bounds[0][2] < GROUND_TOP_Z + item_clearance:
+                    target_center[2] += GROUND_TOP_Z + item_clearance - bounds[0][2]
+                    visual = self._visual_transform_for_source_center(source_index, rotation, target_center)
+                    bounds = self._drop_aabb(visual, source_index)
+                if not any(self._aabb_intersects(bounds, previous, item_clearance) for previous in placed_bounds):
+                    break
 
             guard = 0
-            while any(self._aabb_intersects(bounds, previous, clearance) for previous in placed_bounds) and guard < drop_count + 4:
+            while any(self._aabb_intersects(bounds, previous, item_clearance) for previous in placed_bounds) and guard < drop_count + 4:
                 target_center[2] += vertical_gap
-                visual = self._visual_transform_for_center(rotation, target_center)
-                bounds = self._drop_aabb(visual)
+                visual = self._visual_transform_for_source_center(source_index, rotation, target_center)
+                bounds = self._drop_aabb(visual, source_index)
                 guard += 1
             placed_bounds.append(bounds)
             transforms.append(visual)
@@ -1425,10 +1541,26 @@ def Xform "World" (
         visual[3, :3] = np.asarray(center, dtype=np.float64).reshape(3) - self._center @ visual[:3, :3]
         return visual
 
-    def _drop_aabb(self, visual: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _visual_transform_for_source_center(
+        self,
+        source_index: int,
+        rotation: np.ndarray,
+        center: np.ndarray,
+    ) -> np.ndarray:
+        source_bounds = self._drop_source_bounds(source_index)
+        source_center = np.asarray(source_bounds["center"], dtype=np.float64).reshape(3)
+        visual = np.eye(4, dtype=np.float64)
+        visual[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+        visual[3, :3] = np.asarray(center, dtype=np.float64).reshape(3) - source_center @ visual[:3, :3]
+        return visual
+
+    def _drop_aabb(self, visual: np.ndarray, source_index: int = 0) -> tuple[np.ndarray, np.ndarray]:
         matrix = np.asarray(visual, dtype=np.float64).reshape(4, 4)
-        half = np.maximum(np.asarray(self._size, dtype=np.float64).reshape(3), np.array([0.05, 0.05, 0.05])) * 0.5
-        center = self._center @ matrix[:3, :3] + matrix[3, :3]
+        source_bounds = self._drop_source_bounds(source_index)
+        source_center = np.asarray(source_bounds["center"], dtype=np.float64).reshape(3)
+        source_size = np.asarray(source_bounds["size"], dtype=np.float64).reshape(3)
+        half = np.maximum(source_size, np.array([0.05, 0.05, 0.05])) * 0.5
+        center = source_center @ matrix[:3, :3] + matrix[3, :3]
         extent = half @ np.abs(matrix[:3, :3])
         return center - extent, center + extent
 
@@ -1443,30 +1575,46 @@ def Xform "World" (
         pad = max(0.0, float(clearance))
         return bool(np.all(a_min < b_max + pad) and np.all(a_max > b_min - pad))
 
-    def _drop_visual_transform(self) -> np.ndarray:
+    def _drop_visual_transform(self, source_index: int = 0) -> np.ndarray:
         visual = np.array(self._current_visual_transform, dtype=np.float64, copy=True).reshape(4, 4)
         if not self._matrix_is_valid(visual):
             visual = np.eye(4, dtype=np.float64)
 
-        half_z = max(float(self._size[2]) * 0.5, 0.05)
-        extent = max(float(np.linalg.norm(self._size)) * 0.5, half_z)
-        if self._bounds:
-            try:
-                extent = max(extent, float(self._bounds.get("extent", extent)))
-            except Exception:
-                pass
+        source_bounds = self._drop_source_bounds(source_index)
+        source_center = np.asarray(source_bounds["center"], dtype=np.float64).reshape(3)
+        source_size = np.asarray(source_bounds["size"], dtype=np.float64).reshape(3)
+        half_z = max(float(source_size[2]) * 0.5, 0.05)
+        extent = max(float(source_bounds.get("extent", 0.0) or 0.0), float(np.linalg.norm(source_size)) * 0.5, half_z)
 
         drop_height = max(
-            float(self._size[2]) * DROP_HEIGHT_SIZE_SCALE,
+            float(source_size[2]) * DROP_HEIGHT_SIZE_SCALE,
             extent * DROP_HEIGHT_EXTENT_SCALE,
             DROP_HEIGHT_MIN,
         )
         drop_height = min(drop_height, DROP_HEIGHT_MAX)
 
-        target_center = np.array(self._center, dtype=np.float64, copy=True)
+        target_center = np.array(source_center, dtype=np.float64, copy=True)
         target_center[2] = max(target_center[2], GROUND_TOP_Z + half_z + drop_height)
-        visual[3, :3] = target_center - self._center @ visual[:3, :3]
+        visual[3, :3] = target_center - source_center @ visual[:3, :3]
         return visual
+
+    def _drop_center_z_for_source(self, source_index: int) -> float:
+        source_bounds = self._drop_source_bounds(source_index)
+        size = np.asarray(source_bounds["size"], dtype=np.float64).reshape(3)
+        half_z = max(float(size[2]) * 0.5, 0.05)
+        extent = max(float(source_bounds.get("extent", 0.0) or 0.0), float(np.linalg.norm(size)) * 0.5, half_z)
+        drop_height = max(float(size[2]) * DROP_HEIGHT_SIZE_SCALE, extent * DROP_HEIGHT_EXTENT_SCALE, DROP_HEIGHT_MIN)
+        return GROUND_TOP_Z + half_z + min(drop_height, DROP_HEIGHT_MAX)
+
+    def _drop_source_bounds(self, source_index: int) -> dict:
+        try:
+            index = max(0, int(source_index))
+        except Exception:
+            index = 0
+        if self._asset_source_bounds:
+            index = min(index, len(self._asset_source_bounds) - 1)
+            return self._asset_source_bounds[index]
+        return self._bounds or {"center": self._center.tolist(), "size": self._size.tolist(), "extent": 1.0}
 
     @classmethod
     def _normalize_instance_transforms(
@@ -1499,9 +1647,49 @@ def Xform "World" (
             value = 1
         return max(MIN_DROP_ASSETS, min(MAX_DROP_ASSETS, value))
 
+    def _drop_asset_indices(self, count: int) -> list[int]:
+        source_count = max(1, len(self._active_asset_refs()))
+        total = max(source_count, self._sanitize_drop_count(count))
+        indices: list[int] = []
+        base = total // source_count
+        remainder = total % source_count
+        for source_index in range(source_count):
+            copies = base + (1 if source_index < remainder else 0)
+            indices.extend([source_index] * copies)
+        ordered: list[int] = []
+        for offset in range(max(indices.count(index) for index in range(source_count))):
+            for source_index in range(source_count):
+                item_index = sum(indices.count(index) for index in range(source_index)) + offset
+                if item_index < len(indices) and indices[item_index] == source_index:
+                    ordered.append(source_index)
+        return ordered[:total] or [0]
+
+    def _default_asset_indices(self, count: int) -> list[int]:
+        source_count = max(1, len(self._active_asset_refs()))
+        total = max(1, int(count))
+        if total == source_count:
+            return list(range(source_count))
+        return [index % source_count for index in range(total)]
+
+    def _scene_asset_indices(self, count: int, source_count: int) -> list[int]:
+        total = max(1, int(count))
+        sources = max(1, int(source_count))
+        current = []
+        for item in self._authored_scene_asset_indices[:total]:
+            try:
+                value = int(item)
+            except Exception:
+                value = 0
+            current.append(max(0, min(sources - 1, value)))
+        if len(current) == total:
+            return current
+        if total == sources:
+            return list(range(sources))
+        return [index % sources for index in range(total)]
+
     @staticmethod
     def _authored_asset_name(index: int) -> str:
-        return AUTHORED_ASSET_NAME if index <= 0 else f"{AUTHORED_ASSET_NAME}_{index + 1:02d}"
+        return AUTHORED_ASSET_NAME if index <= 0 else f"Instance_{index + 1:02d}"
 
     @classmethod
     def _authored_asset_path(cls, index: int) -> str:
@@ -1612,6 +1800,87 @@ def Xform "World" (
             refs = [self._usd_asset_reference(self._usd_source)]
         return refs
 
+    def _can_reuse_live_scene(self, asset_refs: list[str], active_count: int) -> bool:
+        if self._process is None or not self._worker_ready:
+            return False
+        try:
+            count = max(1, int(active_count))
+        except Exception:
+            count = 1
+        return (
+            tuple(asset_refs or []) == self._cooked_asset_refs
+            and self._base_scene == self._cooked_base_scene
+            and bool(self._ccd_enabled) == bool(self._cooked_ccd_enabled)
+            and self._cooked_instance_capacity >= count
+        )
+
+    def _pad_instance_transforms(self, transforms: list[np.ndarray], capacity: int) -> list[np.ndarray]:
+        instances = self._normalize_instance_transforms(transforms, self._current_visual_transform)
+        try:
+            target = max(len(instances), int(capacity))
+        except Exception:
+            target = len(instances)
+        if target <= len(instances):
+            return [np.array(item, dtype=np.float64, copy=True) for item in instances]
+
+        padded = [np.array(item, dtype=np.float64, copy=True) for item in instances]
+        for index in range(len(padded), target):
+            padded.append(self._hidden_instance_transform(index))
+        return padded
+
+    @staticmethod
+    def _hidden_instance_transform(index: int = 0) -> np.ndarray:
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[3, 0] = 8000.0
+        matrix[3, 1] = float(max(0, int(index))) * 8.0
+        matrix[3, 2] = -1000.0
+        return matrix
+
+    def _clear_runtime_clone_state(self) -> None:
+        self._runtime_clone_source_path = ""
+        self._runtime_clone_target_paths = []
+        self._runtime_clone_parent_poses = []
+        self._runtime_clone_groups = []
+
+    def _add_runtime_clone_group(
+        self,
+        source_path: str,
+        target_paths: list[str],
+        parent_poses: list[np.ndarray],
+    ) -> None:
+        source = str(source_path or "").strip()
+        targets = [str(path or "").strip() for path in target_paths if str(path or "").strip()]
+        if not source or not targets:
+            return
+        poses = [np.array(pose, dtype=np.float32, copy=True).reshape(7) for pose in parent_poses[: len(targets)]]
+        if len(poses) != len(targets):
+            poses = []
+        group = {"source": source, "targets": targets, "parent_poses": poses}
+        self._runtime_clone_groups.append(group)
+        if not self._runtime_clone_source_path:
+            self._runtime_clone_source_path = source
+            self._runtime_clone_target_paths = list(targets)
+            self._runtime_clone_parent_poses = [np.array(pose, dtype=np.float32, copy=True) for pose in poses]
+
+    def _runtime_clone_groups_payload(self) -> list[dict]:
+        payload: list[dict] = []
+        for group in self._runtime_clone_groups:
+            source = str(group.get("source", "") or "").strip()
+            targets = [str(path or "").strip() for path in group.get("targets", []) if str(path or "").strip()]
+            poses = [
+                np.array(pose, dtype=np.float32, copy=True).reshape(7).astype(float).tolist()
+                for pose in group.get("parent_poses", [])
+            ]
+            if source and targets:
+                payload.append({"source": source, "targets": targets, "parent_poses": poses})
+        return payload
+
+    def _clear_live_cooked_scene_state(self) -> None:
+        self._cooked_asset_refs = ()
+        self._cooked_base_scene = ""
+        self._cooked_ccd_enabled = False
+        self._cooked_instance_capacity = 0
+
     @staticmethod
     def _configured_asset_sources(bounds: dict, usd_source: Optional[str]) -> list[str]:
         if usd_source:
@@ -1649,6 +1918,27 @@ def Xform "World" (
         while len(transforms) < source_count:
             transforms.append(np.eye(4, dtype=np.float64))
         return transforms
+
+    @classmethod
+    def _configured_asset_bounds(cls, bounds: dict, source_count: int) -> list[dict]:
+        if source_count <= 0:
+            return []
+        raw_bounds = []
+        if isinstance(bounds, dict):
+            try:
+                raw_bounds = list(bounds.get("_asset_bounds", []) or [])
+            except TypeError:
+                raw_bounds = []
+        fallback = cls._normalize_bounds(bounds if isinstance(bounds, dict) else {})
+        normalized: list[dict] = []
+        for item in raw_bounds[:source_count]:
+            try:
+                normalized.append(cls._normalize_bounds(item if isinstance(item, dict) else {}))
+            except Exception:
+                normalized.append(dict(fallback))
+        while len(normalized) < source_count:
+            normalized.append(dict(fallback))
+        return normalized
 
     @staticmethod
     def _empty_discovery() -> AuthoredColliderDiscovery:
@@ -2534,6 +2824,26 @@ def Xform "World" (
         if not math.isfinite(amount):
             amount = DEFAULT_GRAB_FORCE_AMOUNT
         return max(MIN_GRAB_FORCE_AMOUNT, min(amount, MAX_GRAB_FORCE_AMOUNT))
+
+    @staticmethod
+    def _sanitize_drop_spacing(value: float) -> float:
+        try:
+            amount = float(value)
+        except Exception:
+            amount = DEFAULT_DROP_SPACING
+        if not math.isfinite(amount):
+            amount = DEFAULT_DROP_SPACING
+        return max(MIN_DROP_SPACING, min(amount, MAX_DROP_SPACING))
+
+    @staticmethod
+    def _sanitize_drop_randomness(value: float) -> float:
+        try:
+            amount = float(value)
+        except Exception:
+            amount = DEFAULT_DROP_RANDOMNESS
+        if not math.isfinite(amount):
+            amount = DEFAULT_DROP_RANDOMNESS
+        return max(MIN_DROP_RANDOMNESS, min(amount, MAX_DROP_RANDOMNESS))
 
     def _ground_usda_z_up(self) -> str:
         ground_z = -GROUND_THICKNESS * 0.5
