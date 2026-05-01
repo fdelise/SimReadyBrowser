@@ -187,6 +187,7 @@ class OVRTXRenderer(QObject):
         self._dir_elevation = 60.0
 
         self._frame_times: list[float] = []
+        self._startup_timer_start = time.perf_counter()
 
         self._thread = QThread()
         self._connect_requests()
@@ -322,7 +323,8 @@ class OVRTXRenderer(QObject):
                 keep_system_alive=True,
             )
             self._renderer = Renderer(cfg)
-            self.status_changed.emit("OVRTX renderer ready.")
+            elapsed = max(0.0, time.perf_counter() - self._startup_timer_start)
+            self.status_changed.emit(f"OVRTX renderer ready in {elapsed:.2f}s; waiting for first frame.")
             if self._pending_stage_items:
                 pending_items = self._pending_stage_items
                 self._pending_stage_items = None

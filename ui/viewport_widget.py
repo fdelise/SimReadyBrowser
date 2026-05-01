@@ -59,6 +59,7 @@ class ViewportWidget(QWidget):
         self._physics_auto_cook_started = False
         self._current_usd_source: Optional[str] = None
         self._current_load_name = ""
+        self._first_frame_timer_start: Optional[float] = None
         self._physics = PhysicsController(self)
         self._physics.pose_changed.connect(self._on_physics_pose)
         self._physics.status_changed.connect(self._on_physics_status)
@@ -102,6 +103,7 @@ class ViewportWidget(QWidget):
         self._canvas.setFocus(Qt.OtherFocusReason)
         self._current_usd_source = str(path)
         self._current_load_name = Path(str(path).split("?", 1)[0]).name
+        self._begin_first_frame_timer()
         self._last_bounds = None
         self._camera.reset()
         self._reset_physics_interaction_state()
@@ -136,6 +138,7 @@ class ViewportWidget(QWidget):
         self._canvas.setFocus(Qt.OtherFocusReason)
         self._current_usd_source = None
         self._current_load_name = ""
+        self._begin_first_frame_timer()
         self._last_bounds = None
         self._camera.reset()
         self._reset_physics_interaction_state()
@@ -355,6 +358,7 @@ class ViewportWidget(QWidget):
         self.asset_loaded.emit(f"{len(items)} assets")
 
     def _on_frame(self, img: QImage) -> None:
+        self._finish_first_frame_timer()
         self._canvas.set_image(img)
 
     def _on_status(self, msg: str) -> None:
@@ -453,6 +457,17 @@ class ViewportWidget(QWidget):
         self.status_msg.emit(text)
         self.loading_changed.emit(True, text)
         self._set_loading(True, text, progress)
+
+    def _begin_first_frame_timer(self) -> None:
+        self._first_frame_timer_start = time.perf_counter()
+        self._canvas.set_debug_timing("")
+
+    def _finish_first_frame_timer(self) -> None:
+        if self._first_frame_timer_start is None:
+            return
+        elapsed = max(0.0, time.perf_counter() - self._first_frame_timer_start)
+        self._first_frame_timer_start = None
+        self._canvas.set_debug_timing(f"First frame: {elapsed:.2f}s")
 
     def _push_camera(self) -> None:
         if not self._renderer:
@@ -1042,6 +1057,7 @@ class _RenderCanvas(QLabel):
         self._pixmap: Optional[QPixmap] = None
         self._overlay_text = ""
         self._fps = 0.0
+        self._debug_timing = ""
         self._loading = False
         self._loading_text = ""
         self._loading_progress: Optional[int] = None
@@ -1077,6 +1093,10 @@ class _RenderCanvas(QLabel):
         self._fps = fps
         self.update()
 
+    def set_debug_timing(self, text: str) -> None:
+        self._debug_timing = str(text or "")
+        self.update()
+
     def _tick_loading(self) -> None:
         self._loading_tick = (self._loading_tick + 1) % 10000
         self.update()
@@ -1098,14 +1118,7 @@ class _RenderCanvas(QLabel):
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
 
-        if self._fps > 0:
-            painter.setFont(QFont("Segoe UI", 10))
-            painter.setPen(QColor(COLOR_ACCENT))
-            painter.drawText(
-                self.rect().adjusted(0, 8, -10, 0),
-                Qt.AlignTop | Qt.AlignRight,
-                f"{self._fps:.1f} fps",
-            )
+        self._draw_debug_hud(painter)
 
         if self._loading:
             self._draw_loading_overlay(painter)
@@ -1173,6 +1186,26 @@ class _RenderCanvas(QLabel):
                 Qt.AlignCenter,
                 f"{self._loading_progress}%",
             )
+
+    def _draw_debug_hud(self, painter: QPainter) -> None:
+        lines: list[tuple[str, QColor]] = []
+        if self._debug_timing:
+            lines.append((self._debug_timing, QColor(COLOR_TEXT_SECONDARY)))
+        if self._fps > 0:
+            lines.append((f"{self._fps:.1f} fps", QColor(COLOR_ACCENT)))
+        if not lines:
+            return
+
+        painter.setFont(QFont("Segoe UI", 10))
+        top = 8
+        for text, color in lines:
+            painter.setPen(color)
+            painter.drawText(
+                self.rect().adjusted(0, top, -10, 0),
+                Qt.AlignTop | Qt.AlignRight,
+                text,
+            )
+            top += 17
 
     def sizeHint(self) -> QSize:
         return QSize(960, 540)
