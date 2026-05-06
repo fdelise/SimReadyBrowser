@@ -209,6 +209,7 @@ class ControlsPanel(QWidget):
         self._physics_base_scene.addItem("Plane", "plane")
         self._physics_base_scene.addItem("Ramp", "ramp")
         self._physics_base_scene.addItem("Obstacles", "obstacles")
+        self._physics_base_scene.addItem("No Ground", "none")
         self._physics_base_scene.currentIndexChanged.connect(
             lambda _idx: self.physics_base_scene_changed.emit(self._physics_base_scene.currentData())
         )

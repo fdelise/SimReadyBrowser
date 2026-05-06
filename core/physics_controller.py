@@ -41,7 +41,7 @@ AUTHORED_BODY_PATTERNS = [
 MAX_DISCOVERED_BODY_PATTERNS = 256
 USD_DISCOVERY_PYTHON_ENV = "SIMREADY_USD_PYTHON"
 ENABLE_SLOW_USD_COLLIDER_DISCOVERY_ENV = "SIMREADY_ENABLE_SLOW_USD_COLLIDER_DISCOVERY"
-DISCOVERY_CACHE_VERSION = 4
+DISCOVERY_CACHE_VERSION = 8
 PHYSICS_MODE_AUTHORED = "authored"
 PHYSICS_MODE_PROXY = "proxy"
 GROUND_HALF_SIZE = 20.0
@@ -61,7 +61,7 @@ MIN_DROP_RANDOMNESS = 0.0
 MAX_DROP_RANDOMNESS = 6.0
 DEFAULT_DT = 1.0 / 60.0
 DEFAULT_SUBSTEPS = 4
-BASE_SCENES = {"plane", "ramp", "obstacles"}
+BASE_SCENES = {"none", "plane", "ramp", "obstacles"}
 ESTIMATED_ASSET_DENSITY_KG_M3 = 260.0
 MIN_ESTIMATED_MASS_KG = 0.05
 MAX_ESTIMATED_MASS_KG = 500.0
@@ -175,6 +175,8 @@ class PhysicsController(QObject):
         self._cooked_base_scene = ""
         self._cooked_ccd_enabled = False
         self._cooked_instance_capacity = 0
+        self._cooked_contact_instances_required = False
+        self._authored_contact_instances_required = False
         self._runtime_clone_source_path = ""
         self._runtime_clone_target_paths: list[str] = []
         self._runtime_clone_parent_poses: list[np.ndarray] = []
@@ -226,6 +228,7 @@ class PhysicsController(QObject):
         ]
         self._authored_scene_asset_indices = self._default_asset_indices(self._scene_instance_count)
         self._pending_instance_reset = False
+        self._authored_contact_instances_required = False
         self._clear_runtime_clone_state()
         if len(self._usd_sources) > 1:
             self._set_status(f"Physics ready for {len(self._usd_sources)} selected assets. Colliders will cook after load.")
@@ -258,6 +261,7 @@ class PhysicsController(QObject):
         self._authored_scene_instance_transforms = [np.eye(4, dtype=np.float64)]
         self._authored_scene_asset_indices = [0]
         self._pending_instance_reset = False
+        self._authored_contact_instances_required = False
         self._clear_runtime_clone_state()
         self._set_status("Load an asset, then use Play or Restart physics.")
 
@@ -469,6 +473,7 @@ class PhysicsController(QObject):
             return False
         selected_count = max(1, len(self._active_asset_refs()))
         drop_count = max(self._sanitize_drop_count(count), selected_count)
+        self._authored_contact_instances_required = drop_count > 1
         self._authored_scene_asset_indices = self._drop_asset_indices(drop_count)
         visuals = self._drop_visual_transforms(drop_count)
         force_rebuild = (
@@ -707,7 +712,7 @@ class PhysicsController(QObject):
             self._pending_discovery_start = None
             process.deleteLater()
             discoveries = [self._empty_discovery() for _asset_ref in asset_refs]
-            self._set_status(f"Collider discovery process could not start ({error}); starting OVPhysX directly.")
+            self._set_status(f"Collider discovery process could not start ({error}); OVPhysX will inspect USD only.")
             return self._start_worker_with_discoveries(discoveries, initial_pose, cook_only)
         return True
 
@@ -761,7 +766,7 @@ class PhysicsController(QObject):
         discoveries = self._discoveries_from_stdout(self._discovery_buffer, pending.asset_refs)
         if exit_code != 0 or discoveries is None:
             detail = self._discovery_error.splitlines()[-1] if self._discovery_error else "no discovery payload returned"
-            self._set_status(f"Collider metadata discovery skipped ({detail}); starting OVPhysX directly.")
+            self._set_status(f"Collider metadata discovery skipped ({detail}); OVPhysX will inspect USD only.")
             discoveries = [self._empty_discovery() for _asset_ref in pending.asset_refs]
         else:
             for asset_ref, discovery in zip(pending.asset_refs, discoveries):
@@ -827,6 +832,7 @@ class PhysicsController(QObject):
         self._cooked_base_scene = self._base_scene
         self._cooked_ccd_enabled = bool(self._ccd_enabled)
         self._cooked_instance_capacity = max(1, int(self._last_start_instance_count))
+        self._cooked_contact_instances_required = bool(self._authored_contact_instances_required)
         return True
 
     def _send_step(self) -> None:
@@ -1236,6 +1242,7 @@ class PhysicsController(QObject):
             source_instances.setdefault(int(source_index), []).append(instance_index)
 
         scene_entries: list[tuple[int, int, AuthoredColliderDiscovery]] = []
+        use_authored_contact_instances = self._authored_contact_instances_required and instance_count > 1
         for source_index, instance_indices in source_instances.items():
             if source_index < 0 or source_index >= len(asset_refs):
                 continue
@@ -1244,6 +1251,11 @@ class PhysicsController(QObject):
                 if source_index < len(discoveries)
                 else self._empty_discovery()
             )
+            if use_authored_contact_instances:
+                for instance_index in instance_indices:
+                    scene_entries.append((instance_index, source_index, source_discovery))
+                continue
+
             source_instance_index = instance_indices[0]
             scene_entries.append((source_instance_index, source_index, source_discovery))
             clone_targets = [self._authored_asset_path(index) for index in instance_indices[1:]]
@@ -1288,13 +1300,13 @@ class PhysicsController(QObject):
             self._current_body_paths = [self._authored_asset_path(index) for index in range(instance_count)]
         source_collider_count = sum(int(item[2].collider_count) for item in scene_entries)
         self._authored_collider_count = source_collider_count
-        self._authored_override_count = sum(int(item[2].override_count) for item in scene_entries)
+        self._authored_override_count = 0
         scene_ccd = "1" if self._ccd_enabled else "0"
         asset_blocks = "\n\n".join(
             self._authored_asset_usda_block(
                 instance_index,
                 asset_refs[source_index],
-                self._map_authored_override_text_for_index(discovery_item.collision_overrides, instance_index),
+                "",
                 instance_transforms[instance_index],
             )
             for instance_index, source_index, discovery_item in scene_entries
@@ -1305,13 +1317,18 @@ class PhysicsController(QObject):
                     f"Found {self._authored_collider_count} authored collider prims across "
                     f"{len(scene_entries)} source assets; cloning to {instance_count} physics instances..."
                 )
+            elif use_authored_contact_instances and instance_count > 1:
+                self._set_status(
+                    f"Found {self._authored_collider_count} authored collider prims; "
+                    f"cooking {instance_count} contact-enabled physics instances..."
+                )
             else:
                 self._set_status(
                     f"Found {self._authored_collider_count} authored collider prims; starting OVPhysX cook..."
                 )
         else:
             self._set_status(
-                "No authored collider prims were found in the SimReady payload metadata; OVPhysX will inspect the stage."
+                "No authored collider prims were found by discovery; OVPhysX will inspect the loaded stage."
             )
         proxy_mass = self._fmt(self._estimated_mass_kg)
 
@@ -1431,6 +1448,7 @@ def Xform "World" (
         name = self._authored_asset_name(index)
         matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
         quat = self._quat_xyzw_from_row_rotation(matrix[:3, :3])
+        schema_lines = [f"        prepend references = @{asset_ref}@"]
         xform_lines = [
             f"        double3 xformOp:translate = ({self._fmt(matrix[3, 0])}, {self._fmt(matrix[3, 1])}, {self._fmt(matrix[3, 2])})",
             f"        quatd xformOp:orient = ({self._fmt(quat[3])}, {self._fmt(quat[0])}, {self._fmt(quat[1])}, {self._fmt(quat[2])})",
@@ -1439,7 +1457,7 @@ def Xform "World" (
         ]
         overrides = f"\n{collision_overrides}" if collision_overrides else ""
         return f"""    def Xform "{name}" (
-        prepend references = @{asset_ref}@
+{chr(10).join(schema_lines)}
     )
     {{
 {chr(10).join(xform_lines)}
@@ -1739,16 +1757,6 @@ def Xform "World" (
                 mapped_paths.append(mapped)
         return mapped_paths
 
-    @classmethod
-    def _map_authored_override_text_for_index(cls, text: str, index: int) -> str:
-        if index <= 0 or not text:
-            return str(text or "")
-        root = cls._authored_asset_path(index)
-        mapped = str(text)
-        mapped = mapped.replace(f"<{AUTHORED_ASSET_PATH}/", f"<{root}/")
-        mapped = mapped.replace(f"<{AUTHORED_ASSET_PATH}>", f"<{root}>")
-        return mapped
-
     @staticmethod
     def _extend_unique(target: list[str], values: list[str]) -> None:
         for value in values or []:
@@ -1790,7 +1798,9 @@ def Xform "World" (
 
         if self._should_use_slow_usd_discovery(asset_ref):
             stage_discovery = self._stage_collider_discovery(asset_ref)
-            if stage_discovery is not None:
+            if stage_discovery is not None and stage_discovery.collider_count > 0:
+                return stage_discovery
+            if stage_discovery is not None and stage_discovery.body_paths:
                 return stage_discovery
         return payload_discovery
 
@@ -1811,6 +1821,7 @@ def Xform "World" (
             tuple(asset_refs or []) == self._cooked_asset_refs
             and self._base_scene == self._cooked_base_scene
             and bool(self._ccd_enabled) == bool(self._cooked_ccd_enabled)
+            and bool(self._authored_contact_instances_required) == bool(self._cooked_contact_instances_required)
             and self._cooked_instance_capacity >= count
         )
 
@@ -1880,6 +1891,7 @@ def Xform "World" (
         self._cooked_base_scene = ""
         self._cooked_ccd_enabled = False
         self._cooked_instance_capacity = 0
+        self._cooked_contact_instances_required = False
 
     @staticmethod
     def _configured_asset_sources(bounds: dict, usd_source: Optional[str]) -> list[str]:
@@ -2060,84 +2072,88 @@ def Xform "World" (
     def _discovery_from_payload(payload: dict) -> AuthoredColliderDiscovery:
         try:
             collider_count = int(payload.get("collider_count", 0) or 0)
-            override_count = int(payload.get("override_count", 0) or 0)
         except Exception:
             collider_count = 0
-            override_count = 0
         return AuthoredColliderDiscovery(
-            str(payload.get("collision_overrides", "") or ""),
+            "",
             [str(path) for path in payload.get("body_patterns", []) if str(path or "").strip()]
             or list(AUTHORED_BODY_PATTERNS),
             [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()],
             [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
             collider_count,
-            override_count,
+            0,
         )
 
     @staticmethod
     def _discovery_to_payload(discovery: AuthoredColliderDiscovery) -> dict:
         return {
-            "collision_overrides": discovery.collision_overrides,
+            "collision_overrides": "",
             "body_patterns": list(discovery.body_patterns or []),
             "body_paths": list(discovery.body_paths or []),
             "articulation_paths": list(discovery.articulation_paths or []),
             "collider_count": int(discovery.collider_count),
-            "override_count": int(discovery.override_count),
+            "override_count": 0,
         }
 
     def _stage_collider_discovery(self, asset_ref: str) -> Optional[AuthoredColliderDiscovery]:
-        helper_python = self._usd_discovery_python()
-        if not helper_python:
+        helper_pythons = self._usd_discovery_python_candidates()
+        if not helper_pythons:
             return None
 
-        try:
-            result = subprocess.run(
-                [
-                    helper_python,
-                    "-u",
-                    "-m",
-                    "core.usd_collision_discovery",
-                    asset_ref,
-                    AUTHORED_ASSET_PATH,
-                ],
-                cwd=str(Path(__file__).resolve().parents[1]),
-                capture_output=True,
-                text=True,
-                timeout=90.0,
-                check=False,
-            )
-        except Exception:
-            return None
-
-        if result.returncode != 0:
-            return None
-
-        payload = None
-        for line in reversed((result.stdout or "").splitlines()):
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
+        for helper_python in helper_pythons:
             try:
-                payload = json.loads(line)
-                break
-            except json.JSONDecodeError:
+                result = subprocess.run(
+                    [
+                        helper_python,
+                        "-u",
+                        "-m",
+                        "core.usd_collision_discovery",
+                        asset_ref,
+                        AUTHORED_ASSET_PATH,
+                    ],
+                    cwd=str(Path(__file__).resolve().parents[1]),
+                    capture_output=True,
+                    text=True,
+                    timeout=90.0,
+                    check=False,
+                )
+            except Exception:
                 continue
+
+            if result.returncode != 0:
+                continue
+
+            payload = None
+            for line in reversed((result.stdout or "").splitlines()):
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    payload = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(payload, dict):
+                return self._discovery_from_stage_payload(payload)
+
+        return None
+
+    def _discovery_from_stage_payload(self, payload: dict) -> AuthoredColliderDiscovery:
         if not isinstance(payload, dict):
-            return None
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
 
         body_patterns = [str(path) for path in payload.get("body_patterns", []) if str(path or "").strip()]
         body_paths = [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()]
         collider_count = int(payload.get("collider_count", 0) or 0)
-        override_count = len(body_paths)
         if collider_count <= 0:
             return AuthoredColliderDiscovery("", body_patterns or list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
         return AuthoredColliderDiscovery(
-            self._format_rigid_body_overrides(body_paths),
+            "",
             body_patterns or list(AUTHORED_BODY_PATTERNS),
             body_paths,
             [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
             collider_count,
-            override_count,
+            0,
         )
 
     @staticmethod
@@ -2151,13 +2167,20 @@ def Xform "World" (
 
     @staticmethod
     def _usd_discovery_python() -> Optional[str]:
+        candidates = PhysicsController._usd_discovery_python_candidates()
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _usd_discovery_python_candidates() -> list[str]:
         root = Path(__file__).resolve().parents[1]
         candidates = [
             os.environ.get(USD_DISCOVERY_PYTHON_ENV, ""),
             str(root / ".usd_discovery_venv" / "Scripts" / "python.exe"),
             str(root / ".usd_discovery_venv" / "bin" / "python"),
+            sys.executable,
         ]
-        current = Path(sys.executable).resolve()
+        result: list[str] = []
+        seen: set[str] = set()
         for item in candidates:
             if not item:
                 continue
@@ -2168,10 +2191,12 @@ def Xform "World" (
                 resolved = path
             if not resolved.exists():
                 continue
-            if resolved == current and not os.environ.get(USD_DISCOVERY_PYTHON_ENV):
+            key = str(resolved).lower()
+            if key in seen:
                 continue
-            return str(resolved)
-        return None
+            seen.add(key)
+            result.append(str(resolved))
+        return result
 
     def _payload_collider_discovery(self, asset_ref: str) -> AuthoredColliderDiscovery:
         base_text = self._read_simready_payload_text(asset_ref, "base.usda")
@@ -2188,358 +2213,16 @@ def Xform "World" (
         if not collision_refs:
             return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
 
-        sdf_refs = [
-            (path, name)
-            for path, name in collision_refs
-            if collision_instances.get(name, "").lower() in {"sdf", "physxsdfmeshcollisionapi"}
-        ]
         body_patterns = self._authored_body_patterns_from_refs(collision_refs)
         body_paths = self._authored_body_paths_from_refs(collision_refs)
-        scene_overrides = self._format_payload_physics_overrides(body_paths, base_text, sdf_refs)
         return AuthoredColliderDiscovery(
-            scene_overrides,
+            "",
             body_patterns,
             body_paths,
             [],
             len(collision_refs),
-            len(body_paths) + len(sdf_refs),
+            0,
         )
-
-    def _authored_collision_overrides(self, asset_ref: str) -> str:
-        return self._authored_collider_discovery(asset_ref).collision_overrides
-
-    def _format_absolute_collision_overrides(self, paths: list[str]) -> str:
-        return self._format_rigid_body_overrides(paths)
-
-    def _format_payload_physics_overrides(
-        self,
-        body_paths: list[str],
-        base_text: str,
-        sdf_refs: list[tuple[tuple[str, ...], str]],
-    ) -> str:
-        blocks = [
-            self._format_body_and_sdf_overrides(body_paths, sdf_refs),
-        ]
-        joints = self._format_payload_joint_overrides(body_paths, base_text)
-        if joints:
-            blocks.append(joints)
-        return "\n".join(block for block in blocks if block)
-
-    def _format_rigid_body_overrides(self, paths: list[str]) -> str:
-        root: dict = {}
-        for path in paths:
-            text = str(path or "").strip()
-            if not text.startswith(f"{AUTHORED_ASSET_PATH}/"):
-                continue
-            rel_parts = [self._usd_name(part) for part in text[len(AUTHORED_ASSET_PATH) + 1 :].split("/") if part]
-            if not rel_parts:
-                continue
-            node = root
-            for part in rel_parts:
-                node = node.setdefault(part, {})
-            node["__rigid_body__"] = True
-
-        if not root:
-            return ""
-
-        lines: list[str] = []
-
-        def emit_node(name: str, node: dict, indent: int) -> None:
-            pad = " " * indent
-            is_body = bool(node.get("__rigid_body__"))
-            children = [(child, child_node) for child, child_node in node.items() if child != "__rigid_body__"]
-            if is_body:
-                lines.extend(
-                    [
-                        f'{pad}over "{name}" (',
-                        ' ' * (indent + 4)
-                        + 'prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]',
-                        f"{pad})",
-                        f"{pad}{{",
-                        ' ' * (indent + 4) + "bool physics:rigidBodyEnabled = 1",
-                        ' ' * (indent + 4) + "bool physics:kinematicEnabled = 0",
-                        ' ' * (indent + 4) + "bool physics:startsAsleep = 0",
-                        ' ' * (indent + 4) + "vector3f physics:velocity = (0, 0, 0)",
-                        ' ' * (indent + 4) + "vector3f physics:angularVelocity = (0, 0, 0)",
-                    ]
-                )
-            else:
-                lines.extend([f'{pad}over "{name}"', f"{pad}{{"])
-            for child, child_node in children:
-                emit_node(child, child_node, indent + 4)
-            lines.append(f"{pad}}}")
-
-        for child, child_node in root.items():
-            emit_node(child, child_node, 8)
-        return "\n".join(lines)
-
-    def _format_body_and_sdf_overrides(
-        self,
-        body_paths: list[str],
-        sdf_refs: list[tuple[tuple[str, ...], str]],
-    ) -> str:
-        root: dict = {}
-
-        def add_path(parts: list[str], marker: str) -> None:
-            if not parts:
-                return
-            node = root
-            for part in parts:
-                node = node.setdefault(self._usd_name(part), {})
-            node[marker] = True
-
-        for path in body_paths:
-            text = str(path or "").strip()
-            if not text.startswith(f"{AUTHORED_ASSET_PATH}/"):
-                continue
-            add_path([part for part in text[len(AUTHORED_ASSET_PATH) + 1 :].split("/") if part], "__rigid_body__")
-
-        for rel_path, instance_name in sdf_refs:
-            parts = self._sdf_ref_parts(rel_path, instance_name)
-            add_path(parts, "__sdf__")
-            clean_instance = self._usd_name(instance_name)
-            if clean_instance and parts:
-                add_path([*parts, clean_instance], "__sdf__")
-
-        if not root:
-            return ""
-
-        lines: list[str] = []
-
-        def emit_node(name: str, node: dict, indent: int) -> None:
-            pad = " " * indent
-            is_body = bool(node.get("__rigid_body__"))
-            is_sdf = bool(node.get("__sdf__"))
-            children = [
-                (child, child_node)
-                for child, child_node in node.items()
-                if child not in {"__rigid_body__", "__sdf__"}
-            ]
-            schemas = []
-            if is_body:
-                schemas.extend(["PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"])
-            if is_sdf:
-                schemas.extend(
-                    [
-                        "PhysicsCollisionAPI",
-                        "PhysicsMeshCollisionAPI",
-                        "PhysxConvexDecompositionCollisionAPI",
-                    ]
-                )
-
-            if schemas:
-                schema_text = ", ".join(f'"{schema}"' for schema in schemas)
-                lines.extend([f'{pad}over "{name}" (', " " * (indent + 4) + f"prepend apiSchemas = [{schema_text}]", f"{pad})", f"{pad}{{"])
-            else:
-                lines.extend([f'{pad}over "{name}"', f"{pad}{{"])
-
-            if is_body:
-                lines.extend(
-                    [
-                        " " * (indent + 4) + "bool physics:rigidBodyEnabled = 1",
-                        " " * (indent + 4) + "bool physics:kinematicEnabled = 0",
-                        " " * (indent + 4) + "bool physics:startsAsleep = 0",
-                        " " * (indent + 4) + "vector3f physics:velocity = (0, 0, 0)",
-                        " " * (indent + 4) + "vector3f physics:angularVelocity = (0, 0, 0)",
-                    ]
-                )
-            if is_sdf:
-                lines.extend(
-                    [
-                        " " * (indent + 4) + 'uniform token physics:approximation = "convexDecomposition"',
-                        " " * (indent + 4) + "int physxConvexDecompositionCollision:maxConvexHulls = 32",
-                        " " * (indent + 4) + "int physxConvexDecompositionCollision:hullVertexLimit = 64",
-                    ]
-                )
-            for child, child_node in children:
-                emit_node(child, child_node, indent + 4)
-            lines.append(f"{pad}}}")
-
-        for child, child_node in root.items():
-            emit_node(child, child_node, 8)
-        return "\n".join(lines)
-
-    def _sdf_ref_parts(self, rel_path: tuple[str, ...], instance_name: str) -> list[str]:
-        clean_parts = [self._usd_name(part) for part in rel_path if part]
-        instance_name = self._usd_name(instance_name)
-        if len(clean_parts) >= 3:
-            return clean_parts
-        if len(clean_parts) == 2 and clean_parts[0] == "Geometry" and instance_name:
-            return [*clean_parts, instance_name]
-        if len(clean_parts) == 1 and instance_name:
-            return [clean_parts[0], instance_name]
-        return clean_parts
-
-    def _format_sdf_cook_overrides(self, refs: list[tuple[tuple[str, ...], str]]) -> str:
-        overrides: list[tuple[str, str, str]] = []
-        for rel_path, instance_name in refs:
-            clean_parts = [self._usd_name(part) for part in rel_path if part]
-            instance_name = self._usd_name(instance_name)
-            if len(clean_parts) >= 3 and clean_parts[0] == "Geometry":
-                object_name = clean_parts[1]
-                mesh_name = clean_parts[-1]
-            elif len(clean_parts) == 2 and clean_parts[0] == "Geometry":
-                object_name = clean_parts[1]
-                mesh_name = instance_name
-            elif len(clean_parts) >= 2:
-                object_name = clean_parts[0]
-                mesh_name = clean_parts[-1]
-            elif len(clean_parts) == 1:
-                object_name = clean_parts[0]
-                mesh_name = instance_name
-            else:
-                continue
-            item = (object_name, mesh_name, instance_name)
-            if item not in overrides:
-                overrides.append(item)
-
-        if not overrides:
-            return ""
-
-        lines = ['        over "Geometry"', "        {"]
-        for object_name, mesh_name, instance_name in overrides:
-            lines.extend(
-                [
-                    f'            over "{self._usd_name(object_name)}"',
-                    "            {",
-                    f'                over "{self._usd_name(mesh_name)}" (',
-                    '                    prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxSDFMeshCollisionAPI"]',
-                    "                )",
-                    "                {",
-                    '                    uniform token physics:approximation = "sdf"',
-                    "                    int physxSDFMeshCollision:sdfResolution = 128",
-                    "                    bool physxSDFMeshCollision:sdfEnableRemeshing = 1",
-                    "                    float physxSDFMeshCollision:sdfMargin = 0.01",
-                ]
-            )
-            if instance_name and instance_name != mesh_name:
-                lines.extend(
-                    [
-                        "",
-                        f'                    over "{self._usd_name(instance_name)}" (',
-                        '                        prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxSDFMeshCollisionAPI"]',
-                        "                    )",
-                        "                    {",
-                        '                        uniform token physics:approximation = "sdf"',
-                        "                        int physxSDFMeshCollision:sdfResolution = 128",
-                        "                        bool physxSDFMeshCollision:sdfEnableRemeshing = 1",
-                        "                        float physxSDFMeshCollision:sdfMargin = 0.01",
-                        "                    }",
-                    ]
-                )
-            lines.extend(["                }", "            }"])
-        lines.append("        }")
-        return "\n".join(lines)
-
-    def _format_payload_joint_overrides(self, body_paths: list[str], base_text: str) -> str:
-        joints = self._payload_joint_definitions(base_text)
-        if not joints:
-            return ""
-
-        body_by_name = {}
-        for path in body_paths:
-            name = str(path or "").rstrip("/").rsplit("/", 1)[-1]
-            if name:
-                body_by_name[name] = path
-
-        lines = ['        def Scope "Joints"', "        {"]
-        emitted = 0
-        for joint in joints:
-            body0 = body_by_name.get(joint.get("body0", ""))
-            body1 = body_by_name.get(joint.get("body1", ""))
-            if not body0 or not body1:
-                continue
-            name = self._usd_name(joint.get("name", "joint") or "joint")
-            joint_type = self._usd_joint_type(joint.get("type", "fixed"))
-            lines.extend(
-                [
-                    f'            def {joint_type} "{name}"',
-                    "            {",
-                    f"                rel physics:body0 = <{body0}>",
-                    f"                rel physics:body1 = <{body1}>",
-                ]
-            )
-            if joint.get("local_pos0"):
-                lines.append(f"                point3f physics:localPos0 = {joint['local_pos0']}")
-            if joint.get("local_pos1"):
-                lines.append(f"                point3f physics:localPos1 = {joint['local_pos1']}")
-            if joint.get("break_force"):
-                lines.append(f"                float physics:breakForce = {joint['break_force']}")
-            if joint.get("break_torque"):
-                lines.append(f"                float physics:breakTorque = {joint['break_torque']}")
-            lines.append("            }")
-            emitted += 1
-
-        lines.append("        }")
-        return "\n".join(lines) if emitted else ""
-
-    @staticmethod
-    def _usd_joint_type(value: str) -> str:
-        kind = str(value or "").strip().lower()
-        return {
-            "fixed": "PhysicsFixedJoint",
-            "revolute": "PhysicsRevoluteJoint",
-            "hinge": "PhysicsRevoluteJoint",
-            "prismatic": "PhysicsPrismaticJoint",
-            "slider": "PhysicsPrismaticJoint",
-            "spherical": "PhysicsSphericalJoint",
-            "ball": "PhysicsSphericalJoint",
-            "distance": "PhysicsDistanceJoint",
-        }.get(kind, "PhysicsFixedJoint")
-
-    @staticmethod
-    def _payload_joint_definitions(base_text: str) -> list[dict[str, str]]:
-        joints: list[dict[str, str]] = []
-        if "pxr:usd:physics:joint:" not in base_text:
-            return joints
-
-        pattern = re.compile(
-            r'\b(?:def|over|class)\s+(?:\w+\s+)?"([^"]+)"\s*(?:\([^{}]*?\))?\s*\{',
-            re.MULTILINE | re.DOTALL,
-        )
-        for match in pattern.finditer(base_text):
-            name = match.group(1)
-            body_start = match.end() - 1
-            body_end = PhysicsController._matching_brace(base_text, body_start)
-            if body_end <= body_start:
-                continue
-            body = base_text[body_start + 1 : body_end]
-            if "pxr:usd:physics:joint:" not in body:
-                continue
-            direct_body = re.split(r'\b(?:def|over|class)\s+(?:\w+\s+)?"', body, maxsplit=1)[0]
-            body0 = PhysicsController._quoted_attr(direct_body, r"pxr:usd:physics:joint:body0")
-            body1 = PhysicsController._quoted_attr(direct_body, r"pxr:usd:physics:joint:body1")
-            joint_type = PhysicsController._quoted_attr(direct_body, r"pxr:usd:physics:joint:type") or "fixed"
-            if not body0 or not body1:
-                continue
-            joints.append(
-                {
-                    "name": name,
-                    "body0": body0,
-                    "body1": body1,
-                    "type": joint_type,
-                    "local_pos0": PhysicsController._tuple_attr(direct_body, r"pxr:usd:physics:localPos0"),
-                    "local_pos1": PhysicsController._tuple_attr(direct_body, r"pxr:usd:physics:localPos1"),
-                    "break_force": PhysicsController._number_attr(direct_body, r"pxr:usd:physics:breakForce"),
-                    "break_torque": PhysicsController._number_attr(direct_body, r"pxr:usd:physics:breakTorque"),
-                }
-            )
-        return joints
-
-    @staticmethod
-    def _quoted_attr(text: str, name: str) -> str:
-        match = re.search(rf'custom\s+string\s+{re.escape(name)}\s*=\s*"([^"]+)"', text)
-        return match.group(1).strip() if match else ""
-
-    @staticmethod
-    def _tuple_attr(text: str, name: str) -> str:
-        match = re.search(rf"custom\s+(?:double3|float3|point3f)\s+{re.escape(name)}\s*=\s*(\([^)]+\))", text)
-        return match.group(1).strip() if match else ""
-
-    @staticmethod
-    def _number_attr(text: str, name: str) -> str:
-        match = re.search(rf"custom\s+(?:double|float)\s+{re.escape(name)}\s*=\s*([^\s\r\n]+)", text)
-        return match.group(1).strip() if match else ""
 
     def _authored_body_patterns_from_refs(self, refs: list[tuple[tuple[str, ...], str]]) -> list[str]:
         patterns: list[str] = []
@@ -2591,69 +2274,6 @@ def Xform "World" (
                 full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
                 add("/".join(full_parts[:2]))
         return paths
-
-    def _format_collision_overrides(self, refs: list[tuple[tuple[str, ...], str]]) -> str:
-        overrides: list[tuple[str, str, str]] = []
-        for rel_path, instance_name in refs:
-            clean_parts = [self._usd_name(part) for part in rel_path if part]
-            instance_name = self._usd_name(instance_name)
-            if len(clean_parts) >= 3 and clean_parts[0] == "Geometry":
-                object_name = clean_parts[1]
-                mesh_name = clean_parts[-1]
-            elif len(clean_parts) == 2 and clean_parts[0] == "Geometry":
-                object_name = clean_parts[1]
-                mesh_name = instance_name
-            elif len(clean_parts) >= 2:
-                object_name = clean_parts[0]
-                mesh_name = clean_parts[-1]
-            elif len(clean_parts) == 1:
-                object_name = clean_parts[0]
-                mesh_name = instance_name
-            else:
-                continue
-            item = (object_name, mesh_name, instance_name)
-            if item not in overrides:
-                overrides.append(item)
-
-        if not overrides:
-            return ""
-
-        lines = ['        over "Geometry"', "        {"]
-        for object_name, mesh_name, instance_name in overrides:
-            lines.extend(
-                [
-                    f'            over "{self._usd_name(object_name)}"',
-                    "            {",
-                    f'                over "{self._usd_name(mesh_name)}" (',
-                    '                    prepend apiSchemas = ["PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI"]',
-                    "                )",
-                    "                {",
-                    '                    uniform token physics:approximation = "convexDecomposition"',
-                    "                    int physxConvexDecompositionCollision:maxConvexHulls = 32",
-                    "                    int physxConvexDecompositionCollision:hullVertexLimit = 64",
-                ]
-            )
-            if instance_name:
-                lines.extend(
-                    [
-                        "",
-                        f'                    over "{self._usd_name(instance_name)}" (',
-                        '                        prepend apiSchemas = ["PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI"]',
-                        "                    )",
-                        "                    {",
-                        '                        uniform token physics:approximation = "convexDecomposition"',
-                        "                        int physxConvexDecompositionCollision:maxConvexHulls = 32",
-                        "                        int physxConvexDecompositionCollision:hullVertexLimit = 64",
-                        "                    }",
-                    ]
-                )
-            lines.extend(["                }", "            }"])
-        lines.append("        }")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _sdf_collision_instances(instances_text: str) -> set[str]:
-        return {name for name, approximation in PhysicsController._collision_instances(instances_text).items() if approximation == "sdf"}
 
     @staticmethod
     def _collision_instances(instances_text: str) -> dict[str, str]:
@@ -2785,6 +2405,8 @@ def Xform "World" (
         return str(value or "").replace("\\", "_").replace('"', "_")
 
     def _base_scene_usda_z_up(self) -> str:
+        if self._base_scene == "none":
+            return ""
         parts = [self._ground_usda_z_up()]
         if self._base_scene == "ramp":
             parts.append(self._ramp_usda_z_up())
@@ -2904,6 +2526,8 @@ def Xform "World" (
     }}"""
 
     def _base_scene_usda(self) -> str:
+        if self._base_scene == "none":
+            return ""
         parts = [self._ground_usda()]
         if self._base_scene == "ramp":
             parts.append(self._ramp_usda())

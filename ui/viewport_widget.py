@@ -57,6 +57,7 @@ class ViewportWidget(QWidget):
         self._loading_asset = False
         self._physics_cooking_active = False
         self._physics_auto_cook_started = False
+        self._auto_cook_physics_after_load = True
         self._current_usd_source: Optional[str] = None
         self._current_load_name = ""
         self._first_frame_timer_start: Optional[float] = None
@@ -97,10 +98,11 @@ class ViewportWidget(QWidget):
 
         self._show_hint()
 
-    def load_usd(self, path: str | Path) -> None:
+    def load_usd(self, path: str | Path, *, auto_cook_physics: bool = True) -> None:
         self._hide_hint()
         self.setFocus(Qt.OtherFocusReason)
         self._canvas.setFocus(Qt.OtherFocusReason)
+        self._auto_cook_physics_after_load = bool(auto_cook_physics)
         self._current_usd_source = str(path)
         self._current_load_name = Path(str(path).split("?", 1)[0]).name
         self._begin_first_frame_timer()
@@ -136,6 +138,7 @@ class ViewportWidget(QWidget):
         self._hide_hint()
         self.setFocus(Qt.OtherFocusReason)
         self._canvas.setFocus(Qt.OtherFocusReason)
+        self._auto_cook_physics_after_load = True
         self._current_usd_source = None
         self._current_load_name = ""
         self._begin_first_frame_timer()
@@ -413,6 +416,9 @@ class ViewportWidget(QWidget):
             self._cook_physics_after_load()
 
     def _cook_physics_after_load(self) -> None:
+        if not self._auto_cook_physics_after_load:
+            self.physics_status_changed.emit("Physics colliders will cook on Play or Drop.")
+            return
         if self._loading_asset or self._physics_auto_cook_started:
             return
         if self._last_bounds is None:

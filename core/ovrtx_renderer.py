@@ -45,6 +45,7 @@ CAMERA_PATH = f"{REVIEW_ROOT}/Camera"
 DOME_LIGHT_PATH = f"{REVIEW_ROOT}/DomeLight"
 KEY_LIGHT_PATH = f"{REVIEW_ROOT}/KeyLight"
 RENDER_PRODUCT_PATH = f"{REVIEW_ROOT}/Render/Viewport"
+BASE_GROUND_PATH = f"{REVIEW_ROOT}/GroundPlane"
 BASE_RAMP_PATH = f"{REVIEW_ROOT}/Ramp"
 BASE_OBSTACLE_PATHS = [
     f"{REVIEW_ROOT}/ObstacleA",
@@ -66,7 +67,7 @@ STAGE_METERS_PER_UNIT = 1
 GROUND_PLANE_HALF_SIZE = 20.0
 GROUND_PLANE_Z = -0.005
 GROUND_COLLIDER_THICKNESS = 0.5
-BASE_SCENES = {"plane", "ramp", "obstacles"}
+BASE_SCENES = {"none", "plane", "ramp", "obstacles"}
 HIDDEN_BASE_Z = -10000.0
 MAX_ASSET_INSTANCES = 100
 ENABLE_OVRTX_DEBUG_BOUNDS = os.environ.get("SIMREADY_OVRTX_DEBUG_BOUNDS") == "1"
@@ -1052,10 +1053,13 @@ def Xform "SimReadyReview"
         if not self._renderer or not self._stage_loaded:
             return
 
+        ground_transform = np.eye(4, dtype=np.float64)
         ramp_transform = self._hidden_base_transform()
         obstacle_transforms = [self._hidden_base_transform() for _ in BASE_OBSTACLE_PATHS]
 
-        if self._base_scene == "ramp":
+        if self._base_scene == "none":
+            ground_transform = self._hidden_base_transform()
+        elif self._base_scene == "ramp":
             ramp_transform = np.eye(4, dtype=np.float64)
         elif self._base_scene == "obstacles":
             obstacle_transforms = [
@@ -1065,8 +1069,8 @@ def Xform "SimReadyReview"
             ]
 
         try:
-            paths = [BASE_RAMP_PATH] + BASE_OBSTACLE_PATHS
-            transforms = [ramp_transform] + obstacle_transforms
+            paths = [BASE_GROUND_PATH, BASE_RAMP_PATH] + BASE_OBSTACLE_PATHS
+            transforms = [ground_transform, ramp_transform] + obstacle_transforms
             for path, transform in zip(paths, transforms):
                 self._renderer.write_attribute(
                     prim_paths=[path],
@@ -1094,10 +1098,11 @@ def Xform "SimReadyReview"
         if self._collision_overlay_enabled:
             if self._ensure_collision_asset_overlay():
                 authored_asset_transform = self._expanded_collision_asset_transform()
-            ground_transform = self._box_transform(
-                (0.0, 0.0, -GROUND_COLLIDER_THICKNESS * 0.5),
-                (GROUND_PLANE_HALF_SIZE * 2.0, GROUND_PLANE_HALF_SIZE * 2.0, GROUND_COLLIDER_THICKNESS),
-            )
+            if self._base_scene != "none":
+                ground_transform = self._box_transform(
+                    (0.0, 0.0, -GROUND_COLLIDER_THICKNESS * 0.5),
+                    (GROUND_PLANE_HALF_SIZE * 2.0, GROUND_PLANE_HALF_SIZE * 2.0, GROUND_COLLIDER_THICKNESS),
+                )
             if self._base_scene == "ramp":
                 ramp_transform = np.eye(4, dtype=np.float64)
             elif self._base_scene == "obstacles":

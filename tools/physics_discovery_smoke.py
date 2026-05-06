@@ -21,27 +21,24 @@ DISPENSER_ASSET = (
 )
 
 
-def _check(asset: str, expected_pattern: str, expected_mesh: str) -> None:
+def _check(asset: str, expected_pattern: str) -> None:
     controller = PhysicsController()
     discovery = controller._authored_collider_discovery(asset)
     print(asset.rsplit("/", 1)[-1])
     print(f"collider_refs={discovery.collider_count}")
-    print(f"physics_authoring_overrides={discovery.override_count}")
+    print(f"generated_physics_overrides={discovery.override_count}")
     for pattern in discovery.body_patterns[:12]:
         print(f"pattern={pattern}")
 
     assert discovery.collider_count > 0, "expected authored collision references"
-    assert discovery.override_count > 0, "expected rigid body authoring references"
+    assert discovery.override_count == 0, "discovery should not generate asset physics overrides"
+    assert discovery.collision_overrides == "", "discovery should leave authored collider settings untouched"
     assert any(expected_pattern in pattern for pattern in discovery.body_patterns), "expected discovered object body path"
-    assert "PhysicsRigidBodyAPI" in discovery.collision_overrides
-    assert "convexDecomposition" in discovery.collision_overrides
-    assert expected_pattern in discovery.collision_overrides, "expected body override path"
-    assert expected_mesh in discovery.collision_overrides, "expected authored collider mesh override path"
 
 
 def main() -> int:
-    _check(CLEAR_TAPE_ASSET, "sm_tape_clear_a02_obj_00", "sm_tape_clear_a02_mesh_00")
-    _check(DISPENSER_ASSET, "sm_support_a02_obj_00", "sm_support_a02_mesh_00")
+    _check(CLEAR_TAPE_ASSET, "sm_tape_clear_a02_obj_00")
+    _check(DISPENSER_ASSET, "sm_support_a02_obj_00")
     return 0
 
 

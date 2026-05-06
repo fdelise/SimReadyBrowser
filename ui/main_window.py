@@ -16,14 +16,17 @@ Layout
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QSize, Qt, QTimer
+from PyQt5.QtCore import QProcess, QProcessEnvironment, QSize, Qt, QTimer
 from PyQt5.QtGui import QFont, QIcon, QPixmap
 from PyQt5.QtWidgets import (
     QAction,
     QApplication,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -39,6 +42,13 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from core.cad2usd_bridge import (
+    CAD2USD_ROOT_ENV,
+    CAD_FILE_FILTER,
+    find_cad2usd_root,
+    is_supported_cad_file,
+    make_cad_usd_output_path,
+)
 from core.s3_client import AssetInfo, S3Client, S3_URI_ROOT
 from styles import nvidia_theme as theme
 from styles.nvidia_theme import (
@@ -66,6 +76,16 @@ class MainWindow(QMainWindow):
         cache_dir = Path.home() / ".cache" / "simready_browser"
         self._s3  = S3Client(cache_dir=cache_dir)
         self._closing = False
+        self._last_open_dir = Path.home()
+        self._last_cad_open_dir = Path.home()
+        self._cad2usd_root = find_cad2usd_root(Path(__file__).resolve().parents[1])
+        self._cad2usd_process: Optional[QProcess] = None
+        self._cad2usd_output_path: Optional[Path] = None
+        self._cad2usd_last_line = ""
+        self._cad2usd_log_lines: list[str] = []
+        self._cad2usd_log_path: Optional[Path] = None
+        self._cad2usd_job_id = 0
+        self._cad2usd_base_env = QProcessEnvironment.systemEnvironment()
 
         # ── Window setup ────────────────────────────────────────────────────────
         self.setWindowTitle(APP_NAME)
@@ -110,6 +130,18 @@ class MainWindow(QMainWindow):
 
         # File menu
         file_menu = mb.addMenu("&File")
+        act_open = QAction("&Open USD File...", self)
+        act_open.setShortcut("Ctrl+O")
+        act_open.triggered.connect(self._open_usd_file)
+        file_menu.addAction(act_open)
+
+        act_open_cad = QAction("Open &CAD File...", self)
+        act_open_cad.setShortcut("Ctrl+Shift+O")
+        act_open_cad.triggered.connect(self._open_cad_file)
+        file_menu.addAction(act_open_cad)
+
+        file_menu.addSeparator()
+
         act_refresh = QAction("&Refresh S3 Bucket", self)
         act_refresh.setShortcut("Ctrl+R")
         act_refresh.triggered.connect(lambda: self._s3.refresh(force_network=True))
@@ -317,6 +349,224 @@ class MainWindow(QMainWindow):
             ]
         )
 
+    def _open_usd_file(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Open USD File",
+            str(self._last_open_dir),
+            "USD files (*.usd *.usda *.usdc *.usdz);;All files (*.*)",
+        )
+        if not path:
+            return
+
+        file_path = Path(path)
+        self._last_open_dir = file_path.parent
+        self._set_status(f"Loading local USD {file_path.name} in OVRTX...")
+        self._viewport.load_usd(str(file_path), auto_cook_physics=False)
+
+    def _open_cad_file(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Open CAD File",
+            str(self._last_cad_open_dir),
+            CAD_FILE_FILTER,
+        )
+        if not path:
+            return
+
+        cad_path = Path(path)
+        self._last_cad_open_dir = cad_path.parent
+        if not is_supported_cad_file(cad_path):
+            QMessageBox.warning(
+                self,
+                "Unsupported CAD File",
+                f"CAD2USD does not list {cad_path.suffix or 'this file type'} as a supported input format.",
+            )
+            return
+
+        self._convert_cad_file(cad_path)
+
+    def _convert_cad_file(self, cad_path: Path):
+        if self._cad2usd_process and self._cad2usd_process.state() != QProcess.NotRunning:
+            QMessageBox.information(
+                self,
+                "CAD Conversion Running",
+                "A CAD2USD conversion is already running. Wait for it to finish before starting another.",
+            )
+            return
+
+        root = self._ensure_cad2usd_root()
+        if root is None:
+            return
+
+        output_dir = Path(__file__).resolve().parents[1] / "cache" / "cad2usd"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = make_cad_usd_output_path(cad_path, output_dir)
+        log_path = output_path.with_suffix(".log")
+
+        process = QProcess(self)
+        process.setWorkingDirectory(str(root))
+        process.setProcessEnvironment(self._cad2usd_process_environment(root))
+
+        self._cad2usd_process = process
+        self._cad2usd_output_path = output_path
+        self._cad2usd_last_line = ""
+        self._cad2usd_log_lines = []
+        self._cad2usd_log_path = log_path
+        self._cad2usd_job_id += 1
+        job_id = self._cad2usd_job_id
+
+        process.readyReadStandardOutput.connect(
+            lambda proc=process, job=job_id: self._read_cad2usd_output(proc, job, False)
+        )
+        process.readyReadStandardError.connect(
+            lambda proc=process, job=job_id: self._read_cad2usd_output(proc, job, True)
+        )
+        process.errorOccurred.connect(
+            lambda error, proc=process, job=job_id: self._on_cad2usd_error(proc, job, error)
+        )
+        process.finished.connect(
+            lambda exit_code, exit_status, proc=process, job=job_id, out=output_path: self._on_cad2usd_finished(
+                proc, job, out, exit_code, exit_status
+            )
+        )
+
+        convert_bat = root / "convert.bat"
+        program = os.environ.get("ComSpec") or "cmd.exe"
+        args = ["/d", "/c", "call", str(convert_bat), str(cad_path), str(output_path)]
+        self._record_cad2usd_log(f"START root={root}", stderr=False)
+        self._record_cad2usd_log(f"INPUT {cad_path}", stderr=False)
+        self._record_cad2usd_log(f"OUTPUT {output_path}", stderr=False)
+        self._record_cad2usd_log(f"COMMAND {program} {' '.join(args)}", stderr=False)
+        self._set_status(f"Converting CAD with CAD2USD: {cad_path.name}...")
+        process.start(program, args)
+
+    def _cad2usd_process_environment(self, root: Path) -> QProcessEnvironment:
+        env = QProcessEnvironment(self._cad2usd_base_env)
+        for name in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PXR_PLUGINPATH_NAME",
+            "USD_PLUGIN_PATH",
+            "CARB_APP_PATH",
+            "CARB_PLUGIN_PATH",
+            "OMNI_KIT_PATH",
+        ):
+            env.remove(name)
+        env.insert("OMNI_KIT_ACCEPT_EULA", "yes")
+        env.insert(CAD2USD_ROOT_ENV, str(root))
+        return env
+
+    def _ensure_cad2usd_root(self) -> Optional[Path]:
+        root = self._cad2usd_root
+        if root and (root / "convert.bat").is_file():
+            return root
+
+        root = find_cad2usd_root(Path(__file__).resolve().parents[1])
+        if root and (root / "convert.bat").is_file():
+            self._cad2usd_root = root
+            return root
+
+        QMessageBox.information(
+            self,
+            "Locate CAD2USD",
+            "Select the CAD2USD convert.bat file. You can also set CAD2USD_ROOT to the CAD2USD checkout.",
+        )
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Locate CAD2USD convert.bat",
+            str(Path.home()),
+            "CAD2USD converter (convert.bat);;Batch files (*.bat);;All files (*.*)",
+        )
+        if not path:
+            self._set_status("CAD2USD converter not configured.")
+            return None
+
+        convert_bat = Path(path)
+        if convert_bat.name.lower() != "convert.bat":
+            QMessageBox.warning(self, "CAD2USD", "Please select CAD2USD's convert.bat file.")
+            self._set_status("CAD2USD converter not configured.")
+            return None
+
+        self._cad2usd_root = convert_bat.parent
+        return self._cad2usd_root
+
+    def _read_cad2usd_output(self, process: QProcess, job_id: int, stderr: bool):
+        if job_id != self._cad2usd_job_id or process is not self._cad2usd_process:
+            return
+        data = process.readAllStandardError() if stderr else process.readAllStandardOutput()
+        text = bytes(data).decode("utf-8", errors="replace")
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            self._cad2usd_last_line = line
+            self._record_cad2usd_log(line, stderr=stderr)
+            prefix = "CAD2USD warning" if stderr else "CAD2USD"
+            self._set_status(f"{prefix}: {line[-180:]}")
+
+    def _on_cad2usd_error(self, process: QProcess, job_id: int, _error):
+        if job_id != self._cad2usd_job_id or process is not self._cad2usd_process:
+            process.deleteLater()
+            return
+        detail = self._cad2usd_last_line or "CAD2USD process could not start."
+        self._record_cad2usd_log(f"PROCESS ERROR {detail}", stderr=True)
+        self._set_status(f"CAD conversion failed: {detail}")
+        if process and process.state() == QProcess.NotRunning:
+            process.deleteLater()
+            self._cad2usd_process = None
+            self._cad2usd_output_path = None
+
+    def _on_cad2usd_finished(self, process: QProcess, job_id: int, output_path: Path, exit_code: int, exit_status):
+        if job_id != self._cad2usd_job_id or process is not self._cad2usd_process:
+            process.deleteLater()
+            return
+
+        self._read_cad2usd_output(process, job_id, False)
+        self._read_cad2usd_output(process, job_id, True)
+
+        self._cad2usd_process = None
+        self._cad2usd_output_path = None
+        process.deleteLater()
+        self._record_cad2usd_log(f"EXIT code={exit_code} status={exit_status}", stderr=exit_code != 0)
+
+        if (
+            exit_code == 0
+            and exit_status == QProcess.NormalExit
+            and output_path
+            and output_path.is_file()
+            and output_path.stat().st_size > 0
+        ):
+            self._last_open_dir = output_path.parent
+            self._set_status(f"CAD converted to {output_path.name}; loading in OVRTX...")
+            self._viewport.load_usd(str(output_path), auto_cook_physics=False)
+            return
+
+        detail = self._cad2usd_last_line or f"Process exited with code {exit_code}."
+        self._set_status(f"CAD conversion failed: {detail}")
+        tail = "\n".join(self._cad2usd_log_lines[-12:])
+        log_text = f"\n\nLog: {self._cad2usd_log_path}" if self._cad2usd_log_path else ""
+        tail_text = f"\n\nLast CAD2USD output:\n{tail}" if tail else ""
+        QMessageBox.warning(
+            self,
+            "CAD Conversion Failed",
+            f"CAD2USD did not create a USD file.\n\n{detail}{log_text}{tail_text}",
+        )
+
+    def _record_cad2usd_log(self, line: str, stderr: bool = False):
+        text = f"[CAD2USD {'STDERR' if stderr else 'STDOUT'}] {line}"
+        print(text, file=sys.stderr if stderr else sys.stdout, flush=True)
+        self._cad2usd_log_lines.append(text)
+        log_path = self._cad2usd_log_path
+        if log_path is None:
+            return
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+        except OSError:
+            pass
+
     def _set_status(self, msg: str):
         self._status_left.setText(msg)
 
@@ -368,6 +618,18 @@ class MainWindow(QMainWindow):
 
     # ── Close ──────────────────────────────────────────────────────────────────
 
+    def _stop_cad2usd_process(self):
+        process = self._cad2usd_process
+        if not process or process.state() == QProcess.NotRunning:
+            return
+        self._cad2usd_job_id += 1
+        process.terminate()
+        if not process.waitForFinished(3000):
+            process.kill()
+            process.waitForFinished(3000)
+        self._cad2usd_process = None
+        self._cad2usd_output_path = None
+
     def closeEvent(self, event):
         if self._closing:
             event.ignore()
@@ -379,6 +641,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.WaitCursor)
 
         try:
+            self._stop_cad2usd_process()
             self._s3.shutdown(timeout_ms=10000)
             viewport_ok = self._viewport.shutdown(timeout_ms=20000)
         finally:

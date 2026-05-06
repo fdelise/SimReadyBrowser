@@ -11,6 +11,7 @@ import json
 import math
 import os
 import sys
+import ctypes
 from typing import Optional
 
 import numpy as np
@@ -28,6 +29,108 @@ DEFAULT_GRAB_FORCE_AMOUNT = 2.0
 MIN_GRAB_FORCE_AMOUNT = 0.25
 MAX_GRAB_FORCE_AMOUNT = 100.0
 MAX_SIM_POSITION = 10000.0
+
+
+class _CudaTensorBuffer:
+    _cuda = None
+    _context = None
+    _initialized = False
+
+    @classmethod
+    def available(cls) -> bool:
+        try:
+            cls._ensure_cuda()
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _ensure_cuda(cls):
+        if cls._initialized:
+            return cls._cuda
+
+        cuda = ctypes.WinDLL("nvcuda.dll")
+        cuda.cuInit.argtypes = [ctypes.c_uint]
+        cuda.cuInit.restype = ctypes.c_int
+        cuda.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        cuda.cuDeviceGet.restype = ctypes.c_int
+        cuda.cuDevicePrimaryCtxRetain.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+        cuda.cuDevicePrimaryCtxRetain.restype = ctypes.c_int
+        cuda.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+        cuda.cuCtxSetCurrent.restype = ctypes.c_int
+        cuda.cuCtxSynchronize.argtypes = []
+        cuda.cuCtxSynchronize.restype = ctypes.c_int
+        cuda.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        cuda.cuMemAlloc_v2.restype = ctypes.c_int
+        cuda.cuMemFree_v2.argtypes = [ctypes.c_uint64]
+        cuda.cuMemFree_v2.restype = ctypes.c_int
+        cuda.cuMemcpyHtoD_v2.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
+        cuda.cuMemcpyHtoD_v2.restype = ctypes.c_int
+        cuda.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
+        cuda.cuMemcpyDtoH_v2.restype = ctypes.c_int
+
+        cls._check(cuda.cuInit(0), "cuInit")
+        device = ctypes.c_int()
+        cls._check(cuda.cuDeviceGet(ctypes.byref(device), 0), "cuDeviceGet")
+        context = ctypes.c_void_p()
+        cls._check(cuda.cuDevicePrimaryCtxRetain(ctypes.byref(context), device.value), "cuDevicePrimaryCtxRetain")
+        cls._check(cuda.cuCtxSetCurrent(context), "cuCtxSetCurrent")
+        cls._cuda = cuda
+        cls._context = context
+        cls._initialized = True
+        return cuda
+
+    @staticmethod
+    def _check(code: int, name: str) -> None:
+        if int(code) != 0:
+            raise RuntimeError(f"{name} failed with CUDA status {code}")
+
+    def __init__(self, shape):
+        from ovphysx.dlpack import DLTensor, DLDevice, DLDeviceType, DLDataType, DLDataTypeCode
+
+        self._cuda = self._ensure_cuda()
+        self.shape = tuple(int(value) for value in shape)
+        self.nbytes = max(1, int(np.prod(self.shape, dtype=np.int64)) * np.dtype(np.float32).itemsize)
+        self.ptr = ctypes.c_uint64()
+        self._check(self._cuda.cuMemAlloc_v2(ctypes.byref(self.ptr), self.nbytes), "cuMemAlloc")
+        self._shape_array = (ctypes.c_int64 * len(self.shape))(*self.shape)
+        self.tensor = DLTensor()
+        self.tensor.data = ctypes.c_void_p(self.ptr.value)
+        self.tensor.device = DLDevice()
+        self.tensor.device.device_type = DLDeviceType.kDLCUDA
+        self.tensor.device.device_id = 0
+        self.tensor.ndim = len(self.shape)
+        self.tensor.dtype = DLDataType()
+        self.tensor.dtype.code = DLDataTypeCode.kDLFloat
+        self.tensor.dtype.bits = 32
+        self.tensor.dtype.lanes = 1
+        self.tensor.shape = ctypes.cast(self._shape_array, ctypes.POINTER(ctypes.c_int64))
+        self.tensor.strides = None
+        self.tensor.byte_offset = 0
+
+    def copy_from_host(self, host: np.ndarray) -> None:
+        arr = np.ascontiguousarray(host, dtype=np.float32)
+        self._check(
+            self._cuda.cuMemcpyHtoD_v2(self.ptr.value, ctypes.c_void_p(arr.ctypes.data), arr.nbytes),
+            "cuMemcpyHtoD",
+        )
+        self._check(self._cuda.cuCtxSynchronize(), "cuCtxSynchronize")
+
+    def copy_to_host(self, host: np.ndarray) -> None:
+        arr = np.asarray(host, dtype=np.float32)
+        self._check(
+            self._cuda.cuMemcpyDtoH_v2(ctypes.c_void_p(arr.ctypes.data), self.ptr.value, arr.nbytes),
+            "cuMemcpyDtoH",
+        )
+        self._check(self._cuda.cuCtxSynchronize(), "cuCtxSynchronize")
+
+    def free(self) -> None:
+        if getattr(self, "ptr", None) is not None and self.ptr.value:
+            try:
+                self._cuda.cuMemFree_v2(self.ptr.value)
+            except Exception:
+                pass
+            self.ptr = ctypes.c_uint64()
 
 
 class PhysicsWorker:
@@ -60,6 +163,8 @@ class PhysicsWorker:
         self._cook_warning = ""
         self._ccd_enabled = False
         self._unstable = False
+        self._use_cuda_tensors = False
+        self._cuda_buffers: dict[int, _CudaTensorBuffer] = {}
 
     def run(self) -> None:
         for line in sys.stdin:
@@ -156,16 +261,20 @@ class PhysicsWorker:
             from ovphysx import TensorType
 
         self._emit_progress(18, "Creating PhysX scene...")
-        device = os.environ.get("SIMREADY_OVPHYSX_DEVICE", "cpu").strip().lower() or "cpu"
+        device = os.environ.get("SIMREADY_OVPHYSX_DEVICE", "auto").strip().lower() or "auto"
         if device.startswith("cuda"):
             device = "gpu"
+        selected_device = device
         try:
             self._physx = PhysX(device=device)
         except Exception:
             try:
                 self._physx = PhysX(device="cpu")
+                selected_device = "cpu"
             except TypeError:
                 self._physx = PhysX()
+                selected_device = "cpu"
+        self._use_cuda_tensors = selected_device in {"auto", "gpu"} and _CudaTensorBuffer.available()
 
         self._emit_progress(30, "Loading USD and authored physics payloads...")
         result = self._physx.add_usd(scene_path)
@@ -178,7 +287,7 @@ class PhysicsWorker:
         self._active_body_count = self._binding_count(self._pose_binding)
         self._pose_buffer = np.zeros(self._pose_binding.shape, dtype=np.float32)
         try:
-            self._pose_binding.read(self._pose_buffer)
+            self._tensor_read(self._pose_binding, self._pose_buffer)
         except Exception:
             pass
         self._reference_pose_buffer = np.array(self._pose_buffer, dtype=np.float32, copy=True)
@@ -319,10 +428,11 @@ class PhysicsWorker:
                 self._pose_buffer[0, :] = root_pose
         else:
             self._pose_buffer[0, :] = root_pose
-        self._pose_binding.write(self._pose_buffer)
+        self._tensor_write(self._pose_binding, self._pose_buffer)
         if zero_velocity and self._velocity_binding is not None and self._velocity_buffer is not None:
             self._velocity_buffer.fill(0.0)
-            self._velocity_binding.write(self._velocity_buffer)
+            self._tensor_write(self._velocity_binding, self._velocity_buffer)
+        self._wait_all()
         if emit:
             self._emit_pose()
 
@@ -374,10 +484,11 @@ class PhysicsWorker:
             except Exception:
                 self._pose_buffer[index, :] = target_pose
 
-        self._pose_binding.write(self._pose_buffer)
+        self._tensor_write(self._pose_binding, self._pose_buffer)
         if zero_velocity and self._velocity_binding is not None and self._velocity_buffer is not None:
             self._velocity_buffer.fill(0.0)
-            self._velocity_binding.write(self._velocity_buffer)
+            self._tensor_write(self._velocity_binding, self._velocity_buffer)
+        self._wait_all()
         if emit:
             self._emit_pose()
 
@@ -450,13 +561,13 @@ class PhysicsWorker:
             angular = np.zeros(3, dtype=np.float32)
 
         speed_limit = self._release_speed_limit(self._effective_mass_kg)
-        self._velocity_binding.read(self._velocity_buffer)
+        self._tensor_read(self._velocity_binding, self._velocity_buffer)
         body_index = self._buffer_body_index(self._velocity_buffer, body_index)
         if self._velocity_buffer.shape[-1] >= 3:
             self._velocity_buffer[body_index, 0:3] = self._clamp_vector(linear.reshape(3), speed_limit)
         if self._velocity_buffer.shape[-1] >= 6:
             self._velocity_buffer[body_index, 3:6] = self._clamp_vector(angular.reshape(3), min(12.0, speed_limit))
-        self._velocity_binding.write(self._velocity_buffer)
+        self._tensor_write(self._velocity_binding, self._velocity_buffer)
 
     def set_ccd_enabled(self, enabled: bool) -> None:
         self._ccd_enabled = bool(enabled)
@@ -523,6 +634,54 @@ class PhysicsWorker:
                 pass
         self._physx = None
         self._usd_handle = None
+        self._free_cuda_buffers()
+
+    def _tensor_read(self, binding, host: np.ndarray) -> None:
+        if self._use_cuda_tensors:
+            buffer = self._cuda_buffer_for(host)
+            binding.read(buffer.tensor)
+            buffer.copy_to_host(host)
+            return
+        binding.read(host)
+
+    def _tensor_write(self, binding, host: np.ndarray) -> None:
+        if self._use_cuda_tensors:
+            buffer = self._cuda_buffer_for(host)
+            buffer.copy_from_host(host)
+            binding.write(buffer.tensor)
+            return
+        binding.write(host)
+
+    def _cuda_buffer_for(self, host: np.ndarray) -> _CudaTensorBuffer:
+        arr = np.asarray(host, dtype=np.float32)
+        key = id(host)
+        shape = tuple(int(value) for value in arr.shape)
+        existing = self._cuda_buffers.get(key)
+        if existing is not None and existing.shape == shape:
+            return existing
+        if existing is not None:
+            existing.free()
+        buffer = _CudaTensorBuffer(shape)
+        self._cuda_buffers[key] = buffer
+        return buffer
+
+    def _free_cuda_buffers(self) -> None:
+        for buffer in list(self._cuda_buffers.values()):
+            try:
+                buffer.free()
+            except Exception:
+                pass
+        self._cuda_buffers.clear()
+
+    def _wait_all(self) -> None:
+        if self._physx is None:
+            return
+        wait_all = getattr(self._physx, "wait_all", None)
+        if callable(wait_all):
+            try:
+                wait_all()
+            except Exception:
+                pass
 
     def _create_pose_binding(self, tensor_type):
         if self._body_paths:
@@ -820,7 +979,7 @@ class PhysicsWorker:
         if self._pose_binding is None or self._pose_buffer is None:
             return
         try:
-            self._pose_binding.read(self._pose_buffer)
+            self._tensor_read(self._pose_binding, self._pose_buffer)
         except Exception as exc:
             self._fail_unstable(f"Physics pose read failed; physics was stopped. {exc}")
             return
@@ -883,7 +1042,7 @@ class PhysicsWorker:
             return
 
         try:
-            self._pose_binding.read(self._pose_buffer)
+            self._tensor_read(self._pose_binding, self._pose_buffer)
         except Exception as exc:
             self._fail_unstable(f"Physics pose read failed during grab; physics was stopped. {exc}")
             return
@@ -903,7 +1062,7 @@ class PhysicsWorker:
         linear_velocity = np.zeros(3, dtype=np.float32)
         angular_velocity = np.zeros(3, dtype=np.float32)
         if self._velocity_binding is not None and self._velocity_buffer is not None:
-            self._velocity_binding.read(self._velocity_buffer)
+            self._tensor_read(self._velocity_binding, self._velocity_buffer)
             velocity_index = self._buffer_body_index(self._velocity_buffer, body_index)
             if self._velocity_buffer.shape[-1] >= 3:
                 linear_velocity = np.array(self._velocity_buffer[velocity_index, 0:3], dtype=np.float32)
@@ -940,7 +1099,7 @@ class PhysicsWorker:
                 self._wrench_buffer[wrench_index, 3:6] = torque
             if self._wrench_buffer.shape[-1] >= 9:
                 self._wrench_buffer[wrench_index, 6:9] = anchor_world
-            self._wrench_binding.write(self._wrench_buffer)
+            self._tensor_write(self._wrench_binding, self._wrench_buffer)
             return
 
         if self._velocity_binding is not None and self._velocity_buffer is not None:
@@ -953,7 +1112,7 @@ class PhysicsWorker:
             self._velocity_buffer[velocity_index, 0:3] = self._clamp_vector(desired_linear, self._release_speed_limit(mass))
             if self._velocity_buffer.shape[-1] >= 6:
                 self._velocity_buffer[velocity_index, 3:6] = self._clamp_vector(desired_angular, 10.0)
-            self._velocity_binding.write(self._velocity_buffer)
+            self._tensor_write(self._velocity_binding, self._velocity_buffer)
 
     def _root_anchor_to_active_body_local(self, anchor_root: np.ndarray) -> np.ndarray:
         anchor = np.asarray(anchor_root, dtype=np.float32).reshape(3)
@@ -973,7 +1132,7 @@ class PhysicsWorker:
             return self._sanitize_mass(fallback, DEFAULT_GRAB_MASS_KG)
 
         try:
-            self._mass_binding.read(self._mass_buffer)
+            self._tensor_read(self._mass_binding, self._mass_buffer)
             mass_array = np.asarray(self._mass_buffer, dtype=np.float64)
         except Exception:
             return self._sanitize_mass(fallback, DEFAULT_GRAB_MASS_KG)
@@ -1127,7 +1286,7 @@ class PhysicsWorker:
             return
         self._wrench_buffer.fill(0.0)
         try:
-            self._wrench_binding.write(self._wrench_buffer)
+            self._tensor_write(self._wrench_binding, self._wrench_buffer)
         except Exception:
             pass
 
@@ -1137,47 +1296,42 @@ class PhysicsWorker:
         rest_binding = None
         material_binding = None
         shape_patterns = self._shape_binding_patterns()
-        shape_prim_paths = self._bound_body_paths if self._bound_body_paths else None
         try:
-            contact_binding = self._create_tensor_binding(
-                tensor_types.RIGID_BODY_CONTACT_OFFSET,
-                patterns=shape_patterns,
-                prim_paths=shape_prim_paths,
-                update_active=False,
-            )
-            contact_buffer = np.zeros(contact_binding.shape, dtype=np.float32)
-            contact_binding.read(contact_buffer)
+            contact_binding = self._create_shape_tensor_binding(tensor_types.RIGID_BODY_CONTACT_OFFSET, shape_patterns)
             shape_count = self._shape_entry_count(contact_binding)
-            contact_buffer = np.maximum(contact_buffer, np.float32(self._contact_offset))
-            contact_binding.write(contact_buffer)
-
+            if self._use_cuda_tensors:
+                return int(shape_count)
+            contact_buffer = np.zeros(contact_binding.shape, dtype=np.float32)
             try:
-                rest_binding = self._create_tensor_binding(
-                    tensor_types.RIGID_BODY_REST_OFFSET,
-                    patterns=shape_patterns,
-                    prim_paths=shape_prim_paths,
-                    update_active=False,
-                )
-                rest_buffer = np.zeros(rest_binding.shape, dtype=np.float32)
-                rest_binding.read(rest_buffer)
-                rest_buffer = np.minimum(rest_buffer, contact_buffer - np.float32(0.0005))
-                rest_buffer = np.minimum(rest_buffer, np.float32(0.0))
-                rest_binding.write(rest_buffer)
+                self._tensor_read(contact_binding, contact_buffer)
+                contact_buffer = np.maximum(contact_buffer, np.float32(self._contact_offset))
+                self._tensor_write(contact_binding, contact_buffer)
             except Exception:
                 pass
 
             try:
-                material_binding = self._create_tensor_binding(
+                rest_binding = self._create_shape_tensor_binding(tensor_types.RIGID_BODY_REST_OFFSET, shape_patterns)
+                rest_buffer = np.zeros(rest_binding.shape, dtype=np.float32)
+                self._tensor_read(rest_binding, rest_buffer)
+                try:
+                    rest_buffer = np.minimum(rest_buffer, contact_buffer - np.float32(0.0005))
+                    rest_buffer = np.minimum(rest_buffer, np.float32(0.0))
+                    self._tensor_write(rest_binding, rest_buffer)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            try:
+                material_binding = self._create_shape_tensor_binding(
                     tensor_types.RIGID_BODY_SHAPE_FRICTION_AND_RESTITUTION,
-                    patterns=shape_patterns,
-                    prim_paths=shape_prim_paths,
-                    update_active=False,
+                    shape_patterns,
                 )
                 material_buffer = np.zeros(material_binding.shape, dtype=np.float32)
-                material_binding.read(material_buffer)
+                self._tensor_read(material_binding, material_buffer)
                 if material_buffer.ndim == 3 and material_buffer.shape[-1] >= 3:
                     material_buffer[:, :, 2] = np.minimum(np.maximum(material_buffer[:, :, 2], 0.0), 0.05)
-                    material_binding.write(material_buffer)
+                    self._tensor_write(material_binding, material_buffer)
             except Exception:
                 pass
         except Exception:
@@ -1207,6 +1361,57 @@ class PhysicsWorker:
                 add(f"{pattern}/*/*")
                 add(f"{pattern}/*/*/*")
         return patterns or [self._active_body_pattern]
+
+    def _create_shape_tensor_binding(self, tensor_type, patterns: list[str]):
+        last_exc: Optional[Exception] = None
+        exact_paths = list(self._bound_body_paths or self._body_paths or [])
+        if exact_paths:
+            binding = None
+            try:
+                binding = self._physx.create_tensor_binding(prim_paths=exact_paths, tensor_type=tensor_type)
+                if self._binding_count(binding) <= 0 or self._shape_entry_count(binding) <= 0:
+                    raise RuntimeError("No collider shapes matched exact body paths")
+                return binding
+            except Exception as exc:
+                last_exc = exc
+                if binding is not None:
+                    try:
+                        binding.destroy()
+                    except Exception:
+                        pass
+
+        candidates = []
+        for pattern in self._normalize_patterns(patterns):
+            for attempt in self._binding_attempts(pattern, tensor_type):
+                binding = None
+                try:
+                    binding = attempt()
+                    body_count = self._binding_count(binding)
+                    shape_count = self._shape_entry_count(binding)
+                    if body_count <= 0 or shape_count <= 0:
+                        raise RuntimeError(f"No collider shapes matched {pattern}")
+                    candidates.append((shape_count, body_count, self._pattern_score(pattern), pattern, binding))
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if binding is not None:
+                        try:
+                            binding.destroy()
+                        except Exception:
+                            pass
+
+        if not candidates:
+            joined = ", ".join(self._normalize_patterns(patterns))
+            raise RuntimeError(f"Could not bind collider shape tensor for {joined}: {last_exc}")
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        _shape_count, _body_count, _score, _pattern, binding = candidates[0]
+        for _other_shape_count, _other_body_count, _other_score, _other_pattern, other_binding in candidates[1:]:
+            try:
+                other_binding.destroy()
+            except Exception:
+                pass
+        return binding
 
     def _force_collider_cook(self, tensor_types) -> int:
         if self._physx is None:

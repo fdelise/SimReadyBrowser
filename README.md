@@ -10,6 +10,7 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 - Uses the S3-side manifest and local cache data where available so asset discovery is fast.
 - Loads thumbnails lazily and caches them locally to keep category browsing responsive.
 - Double-clicks an asset card to load the USD into the OVRTX viewport.
+- Opens local USD files directly, or opens CAD/neutral 3D files by converting them to USD through the external CAD2USD tool.
 - Provides a Z-up Isaac-style review stage with ground plane, shadows, dome light, and direct light controls.
 - Supports Kit-style camera navigation, WASD fly movement, zoom-to-extents with `F`, and viewport progress feedback.
 - Runs OVPhysX in a subprocess so Qt, OVRTX, OpenUSD, and PhysX runtime state stay isolated.
@@ -30,6 +31,8 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 7. Play starts from the asset's current viewport pose; Drop places one or more copies above the base scene and starts physics.
 8. Hold Shift + left mouse button on the asset to grab it with a force-based physics handle, drag it, then release to drop or throw it.
 
+To review a CAD file, use `File > Open CAD File...`. The app launches CAD2USD in a separate process, writes the converted USD under `cache/cad2usd/`, then loads that USD into the viewport. Set `CAD2USD_ROOT` to the CAD2USD checkout, or select `convert.bat` the first time the app asks for it.
+
 ## Project Layout
 
 ```text
@@ -39,6 +42,7 @@ SimReadyBrowser/
   requirements.txt                Python dependencies available from public PyPI
   core/
     s3_client.py                  S3 catalog, manifest, asset, and thumbnail loading
+    cad2usd_bridge.py             CAD2USD discovery, file filters, and output path helpers
     ovrtx_renderer.py             OVRTX stage setup, viewport rendering, lights, overlays
     camera_controller.py          Kit-style camera and WASD movement
     physics_controller.py         Qt-side OVPhysX worker controller and scene authoring
@@ -65,6 +69,7 @@ SimReadyBrowser/
 - Network access to the public Omniverse S3 bucket.
 - NVIDIA Python package access through `https://pypi.nvidia.com`.
 - Optional but recommended: `uv` for creating the isolated USD discovery environment.
+- Optional for CAD import: a local checkout of [CAD2USD](https://github.com/fdelise/CAD2USD) installed with its `install.bat`. CAD2USD requires Python 3.12 and runs in its own environment.
 
 ## Setup
 
@@ -92,6 +97,48 @@ You can also run:
 ```
 
 The launcher checks the local environment, sets the expected runtime paths, and starts the app.
+
+## CAD2USD Import Setup
+
+CAD import is optional and is intentionally kept outside this app's Python environment. CAD2USD uses Omniverse Kit from pip and currently requires Windows with Python 3.12 exactly.
+
+Install CAD2USD once in a separate checkout:
+
+```powershell
+cd C:\AIProjects
+git clone https://github.com/fdelise/CAD2USD.git
+cd CAD2USD
+.\install.bat
+.\validate.bat
+```
+
+Point SimReady Browser at that checkout. For the current terminal session:
+
+```powershell
+$env:CAD2USD_ROOT = "C:\AIProjects\CAD2USD"
+```
+
+To make it permanent for future launches:
+
+```powershell
+[Environment]::SetEnvironmentVariable("CAD2USD_ROOT", "C:\AIProjects\CAD2USD", "User")
+```
+
+You can verify the converter before using the browser:
+
+```powershell
+cd C:\AIProjects\CAD2USD
+.\convert.bat --formats
+.\convert.bat "C:\Path\To\part.step" "C:\Path\To\part.usd"
+```
+
+Then start SimReady Browser and use `File > Open CAD File...`. The app runs `CAD2USD\convert.bat` in a separate process, writes converted USD files and logs under `cache/cad2usd/`, and loads the resulting USD into the OVRTX viewport.
+
+Notes:
+
+- Open formats such as STEP, IGES, OBJ, FBX, glTF, STL, Parasolid, SAT, and Rhino do not need a CAD Converter license.
+- Proprietary CAD formats such as Creo, CATIA, NX, SolidWorks, Inventor, Solid Edge, and JT require the licensed Omniverse CAD Converter extension.
+- CAD2USD accepts the NVIDIA Kit EULA non-interactively with `OMNI_KIT_ACCEPT_EULA=yes`; SimReady Browser sets this for its converter subprocess.
 
 ## Running
 
@@ -166,6 +213,8 @@ If collision discovery fails with a USD package conflict, recreate the `.usd_dis
 If physics starts but an asset falls through the floor, check the status panel and collision overlay. The app should only play physics when OVPhysX exposes usable authored collision shapes for the asset. If it reports zero usable shapes, the issue is in discovery, binding, or local OVPhysX cooking rather than the review floor.
 
 If thumbnails or catalog browsing feel slow, delete stale cache data under `cache/` and restart. The app will rebuild the catalog and thumbnail cache.
+
+If `File > Open CAD File...` fails, check the matching `.log` file under `cache/cad2usd/` and the terminal output prefixed with `[CAD2USD STDOUT]` or `[CAD2USD STDERR]`. If the error says `failed to acquire interface`, run `CAD2USD\validate.bat`, confirm CAD2USD is installed with Python 3.12, and restart SimReady Browser from a fresh terminal where `CAD2USD_ROOT` points to the CAD2USD checkout.
 
 If closing the app crashes inside OVRTX/OVPhysX, make sure the latest committed subprocess-based physics path is running. The app is structured so OVPhysX shutdown happens outside the Qt/OVRTX process.
 

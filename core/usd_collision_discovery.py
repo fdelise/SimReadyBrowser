@@ -291,11 +291,25 @@ def _articulation_root_paths(entries, UsdPhysics) -> list[str]:
 
 def _is_collision_prim(prim, UsdPhysics) -> bool:
     schemas = list(prim.GetAppliedSchemas())
-    has_api = "PhysicsCollisionAPI" in schemas
+    has_api = any(
+        schema in schemas
+        for schema in (
+            "PhysicsCollisionAPI",
+            "PhysicsMeshCollisionAPI",
+            "PhysxSDFMeshCollisionAPI",
+            "PhysxConvexDecompositionCollisionAPI",
+            "PhysxConvexHullCollisionAPI",
+        )
+    )
     try:
         has_api = has_api or prim.HasAPI(UsdPhysics.CollisionAPI)
     except Exception:
         pass
+    if not has_api:
+        approximation = _token_attr(prim, "physics:approximation").lower()
+        has_api = approximation in {"sdf", "convexdecomposition", "convexhull", "mesh", "trianglemesh"}
+    if not has_api:
+        has_api = bool(prim.GetAttribute("physxSDFMeshCollision:sdfResolution"))
     return bool(has_api)
 
 
