@@ -23,6 +23,8 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
+    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -39,16 +41,21 @@ from styles.nvidia_theme import (
     COLOR_TEXT_SECONDARY,
 )
 
-THUMB_SIZE = 128   # px per thumbnail card
+THUMB_SIZE = 88   # px per thumbnail image
+CARD_WIDTH_PAD = 8
+CARD_HEIGHT_PAD = 24
+CARD_GRID_GAP = 4
 DOWNLOAD_THUMBNAILS = True
-RENDER_BATCH_SIZE = 24
-INITIAL_RENDER_AHEAD_ROWS = 4
-LOAD_MORE_ROWS = 8
+RENDER_BATCH_SIZE = 48
+INITIAL_RENDER_AHEAD_ROWS = 5
+LOAD_MORE_ROWS = 10
 LOAD_MORE_THRESHOLD_ROWS = 3
+BROWSER_MIN_WIDTH = 310
+BROWSER_MAX_WIDTH = 380
 
 
 class _ThumbnailDecodeSignals(QObject):
-    ready = pyqtSignal(str, str, object)  # usd_key, thumbnail path, QImage
+    ready = pyqtSignal(str, str, int, object)  # usd_key, thumbnail path, size, QImage
 
 
 class _ThumbnailDecodeWorker(QRunnable):
@@ -71,7 +78,7 @@ class _ThumbnailDecodeWorker(QRunnable):
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation,
             )
-        self.signals.ready.emit(self.usd_key, self.path, image)
+        self.signals.ready.emit(self.usd_key, self.path, self.size, image)
 
 
 class AssetBrowserPanel(QWidget):
@@ -83,10 +90,13 @@ class AssetBrowserPanel(QWidget):
     asset_activated = pyqtSignal(object)  # AssetInfo
     load_selected_requested = pyqtSignal(object)  # list[AssetInfo]
     status_message = pyqtSignal(str)
+    fullscreen_requested = pyqtSignal(bool)
 
     def __init__(self, s3_client: S3Client, parent=None):
         super().__init__(parent)
         self._client  = s3_client
+        self._thumb_size = THUMB_SIZE
+        self._pending_thumb_size = THUMB_SIZE
         self._assets: List[AssetInfo] = []
         self._visible_assets: List[AssetInfo] = []
         self._cards:  List[AssetCard] = []
@@ -110,6 +120,9 @@ class AssetBrowserPanel(QWidget):
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._filter_assets)
+        self._thumbnail_size_timer = QTimer(self)
+        self._thumbnail_size_timer.setSingleShot(True)
+        self._thumbnail_size_timer.timeout.connect(self._apply_thumbnail_size)
         self._last_column_count = 0
 
         self._build_ui()
@@ -123,13 +136,30 @@ class AssetBrowserPanel(QWidget):
         root.setSpacing(6)
 
         # ── Header ───────────────────────────────────────────────────────────
+        header_row = QHBoxLayout()
+        header_row.setSpacing(4)
+
         header = QLabel("SimReady Assets")
         header.setObjectName("section_header")
         header.setStyleSheet(
             f"color: {COLOR_ACCENT}; font-size: 14px; font-weight: bold; "
             f"border-bottom: 1px solid {COLOR_ACCENT}; padding-bottom: 4px;"
         )
-        root.addWidget(header)
+        header_row.addWidget(header, 1)
+
+        self._fullscreen_btn = QToolButton()
+        self._fullscreen_btn.setCheckable(True)
+        self._fullscreen_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+        self._fullscreen_btn.setToolTip("Expand asset browser")
+        self._fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
+        self._fullscreen_btn.setStyleSheet(
+            f"QToolButton {{ border: 1px solid {COLOR_BORDER}; border-radius: 4px; "
+            f"padding: 4px; color: {COLOR_ACCENT}; }}"
+            f"QToolButton:hover {{ background: {COLOR_BG_WIDGET}; }}"
+            f"QToolButton:checked {{ background: #2a3d1a; border-color: {COLOR_ACCENT}; }}"
+        )
+        header_row.addWidget(self._fullscreen_btn)
+        root.addLayout(header_row)
 
         # ── Search bar ────────────────────────────────────────────────────────
         search_row = QHBoxLayout()
@@ -168,6 +198,32 @@ class AssetBrowserPanel(QWidget):
 
         root.addLayout(filter_row)
 
+        size_row = QHBoxLayout()
+        size_row.setSpacing(6)
+
+        size_label = QLabel("Thumbnail:")
+        size_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 11px;")
+        size_row.addWidget(size_label)
+
+        self._thumb_size_slider = QSlider(Qt.Horizontal)
+        self._thumb_size_slider.setRange(56, 256)
+        self._thumb_size_slider.setSingleStep(4)
+        self._thumb_size_slider.setPageStep(16)
+        self._thumb_size_slider.setTickInterval(32)
+        self._thumb_size_slider.setTickPosition(QSlider.TicksBelow)
+        self._thumb_size_slider.setValue(self._thumb_size)
+        self._thumb_size_slider.setToolTip("Resize asset thumbnails")
+        size_row.addWidget(self._thumb_size_slider, 1)
+
+        self._thumb_size_value = QLabel(f"{self._thumb_size}px")
+        self._thumb_size_value.setMinimumWidth(38)
+        self._thumb_size_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._thumb_size_value.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px;")
+        size_row.addWidget(self._thumb_size_value)
+
+        self._thumb_size_slider.valueChanged.connect(self._schedule_thumbnail_size)
+        root.addLayout(size_row)
+
         # ── Asset count ───────────────────────────────────────────────────────
         self._count_label = QLabel("Loading…")
         self._count_label.setStyleSheet(f"color: {COLOR_TEXT_DISABLED}; font-size: 10px;")
@@ -203,8 +259,8 @@ class AssetBrowserPanel(QWidget):
         self._grid_widget = QWidget()
         self._grid_widget.setStyleSheet("background: transparent;")
         self._grid = QGridLayout(self._grid_widget)
-        self._grid.setSpacing(6)
-        self._grid.setContentsMargins(4, 4, 4, 4)
+        self._grid.setSpacing(CARD_GRID_GAP)
+        self._grid.setContentsMargins(2, 2, 2, 2)
 
         self._scroll.setWidget(self._grid_widget)
         root.addWidget(self._scroll, 1)
@@ -230,10 +286,63 @@ class AssetBrowserPanel(QWidget):
         root.addWidget(self._progress)
 
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self.setMinimumWidth(310)
-        self.setMaximumWidth(380)
+        self.setMinimumWidth(BROWSER_MIN_WIDTH)
+        self.setMaximumWidth(BROWSER_MAX_WIDTH)
+
+    def set_fullscreen_mode(self, enabled: bool):
+        if hasattr(self, "_fullscreen_btn"):
+            self._fullscreen_btn.blockSignals(True)
+            self._fullscreen_btn.setChecked(enabled)
+            self._fullscreen_btn.setIcon(
+                self.style().standardIcon(
+                    QStyle.SP_TitleBarNormalButton if enabled else QStyle.SP_TitleBarMaxButton
+                )
+            )
+            self._fullscreen_btn.setToolTip(
+                "Restore viewport and controls" if enabled else "Expand asset browser"
+            )
+            self._fullscreen_btn.blockSignals(False)
+
+        if enabled:
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(16777215)
+        else:
+            self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+            self.setMinimumWidth(BROWSER_MIN_WIDTH)
+            self.setMaximumWidth(BROWSER_MAX_WIDTH)
+
+        self.updateGeometry()
+        self._schedule_visible_thumbnail_requests()
 
     # ── Signal wiring ──────────────────────────────────────────────────────────
+
+    def _schedule_thumbnail_size(self, value: int):
+        self._pending_thumb_size = value
+        if hasattr(self, "_thumb_size_value"):
+            self._thumb_size_value.setText(f"{value}px")
+        self._thumbnail_size_timer.start(120)
+
+    def _apply_thumbnail_size(self):
+        if self._pending_thumb_size == self._thumb_size:
+            return
+
+        self._thumb_size = self._pending_thumb_size
+        self._last_column_count = 0
+        self._render_generation += 1
+        generation = self._render_generation
+        self._render_index = 0
+        self._render_target_index = 0
+        self._requested_thumbnails.clear()
+        self._thumbnail_decodes.clear()
+        self._thumb_request_timer.stop()
+        self._clear_grid()
+        self._scroll.verticalScrollBar().setValue(0)
+        self._update_selection_ui()
+
+        if self._visible_assets:
+            self._extend_render_target(self._initial_render_target())
+            QTimer.singleShot(0, lambda: self._render_asset_batch(generation))
 
     def _connect_signals(self):
         self._client.assets_loaded.connect(self._on_assets_loaded)
@@ -275,20 +384,21 @@ class AssetBrowserPanel(QWidget):
         if card.set_cached_thumbnail(asset.local_thumbnail):
             return
 
-        decode_key = (str(asset.local_thumbnail), THUMB_SIZE)
+        thumb_size = self._thumb_size
+        decode_key = (str(asset.local_thumbnail), thumb_size)
         if decode_key in self._thumbnail_decodes:
             return
         self._thumbnail_decodes.add(decode_key)
         self._thumb_decode_pool.start(
-            _ThumbnailDecodeWorker(asset.usd_key, str(asset.local_thumbnail), THUMB_SIZE, self._thumb_decode_signals)
+            _ThumbnailDecodeWorker(asset.usd_key, str(asset.local_thumbnail), thumb_size, self._thumb_decode_signals)
         )
 
-    def _on_thumbnail_decoded(self, usd_key: str, path: str, image: QImage):
-        self._thumbnail_decodes.discard((path, THUMB_SIZE))
+    def _on_thumbnail_decoded(self, usd_key: str, path: str, size: int, image: QImage):
+        self._thumbnail_decodes.discard((path, size))
         if image.isNull():
             return
         card = self._card_by_usd.get(usd_key)
-        if card:
+        if card and size == self._thumb_size and getattr(card, "_size", size) == size:
             card.set_thumbnail_image(path, image)
 
     def _on_status(self, msg: str):
@@ -377,7 +487,7 @@ class AssetBrowserPanel(QWidget):
         for i in range(self._render_index, batch_end):
             asset = self._visible_assets[i]
             row, col = divmod(i, cols)
-            card = AssetCard(asset, size=THUMB_SIZE)
+            card = AssetCard(asset, size=self._thumb_size)
             card.grid_row = row
             card.clicked.connect(self._on_card_clicked)
             card.double_clicked.connect(self._on_card_double_clicked)
@@ -412,10 +522,14 @@ class AssetBrowserPanel(QWidget):
         self._schedule_visible_thumbnail_requests()
 
     def _column_count(self) -> int:
-        return max(1, (self._scroll.viewport().width() - 16) // (THUMB_SIZE + 10))
+        margins = self._grid.contentsMargins()
+        spacing = max(0, self._grid.horizontalSpacing())
+        card_width = self._thumb_size + CARD_WIDTH_PAD
+        available = max(1, self._scroll.viewport().width() - margins.left() - margins.right())
+        return max(1, (available + spacing) // (card_width + spacing))
 
     def _row_step(self) -> int:
-        return self._grid.verticalSpacing() + THUMB_SIZE + 30
+        return self._grid.verticalSpacing() + self._thumb_size + CARD_HEIGHT_PAD
 
     def _initial_render_target(self) -> int:
         visible_rows = max(1, (self._scroll.viewport().height() // max(1, self._row_step())) + 1)
@@ -456,8 +570,8 @@ class AssetBrowserPanel(QWidget):
 
         top = self._scroll.verticalScrollBar().value()
         bottom = top + self._scroll.viewport().height()
-        margin = THUMB_SIZE * 2
-        row_step = self._grid.verticalSpacing() + THUMB_SIZE + 30
+        margin = self._thumb_size * 2
+        row_step = self._row_step()
 
         for card in self._cards:
             card_top = self._grid.contentsMargins().top() + getattr(card, "grid_row", 0) * row_step
@@ -556,18 +670,18 @@ class AssetCard(QFrame):
     _PIXMAP_CACHE: Dict[tuple[str, int], QPixmap] = {}
     _MAX_PIXMAP_CACHE = 256
 
-    def __init__(self, asset: AssetInfo, size: int = 128, parent=None):
+    def __init__(self, asset: AssetInfo, size: int = THUMB_SIZE, parent=None):
         super().__init__(parent)
         self.asset = asset
         self._size = size
         self.setObjectName("asset_card")
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(f"{asset.display_name}\n{asset.category}\n{asset.usd_key}")
-        self.setFixedSize(size + 8, size + 30)
+        self.setFixedSize(size + CARD_WIDTH_PAD, size + CARD_HEIGHT_PAD)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(3, 3, 3, 3)
-        layout.setSpacing(2)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(1)
 
         self._thumb = QLabel()
         self._thumb.setAlignment(Qt.AlignCenter)
@@ -580,7 +694,7 @@ class AssetCard(QFrame):
         name.setAlignment(Qt.AlignCenter)
         name.setWordWrap(False)
         name.setStyleSheet(
-            f"color: {COLOR_TEXT_PRIMARY}; font-size: 10px; background: transparent;"
+            f"color: {COLOR_TEXT_PRIMARY}; font-size: 9px; background: transparent;"
         )
         # Truncate long names
         fm = name.fontMetrics()

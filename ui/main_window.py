@@ -86,6 +86,8 @@ class MainWindow(QMainWindow):
         self._cad2usd_log_path: Optional[Path] = None
         self._cad2usd_job_id = 0
         self._cad2usd_base_env = QProcessEnvironment.systemEnvironment()
+        self._browser_fullscreen = False
+        self._browser_fullscreen_state = None
 
         # ── Window setup ────────────────────────────────────────────────────────
         self.setWindowTitle(APP_NAME)
@@ -159,6 +161,11 @@ class MainWindow(QMainWindow):
         self._act_toggle_browser = QAction("Show Asset Browser", self, checkable=True, checked=True)
         self._act_toggle_browser.triggered.connect(self._toggle_browser)
         view_menu.addAction(self._act_toggle_browser)
+
+        self._act_browser_fullscreen = QAction("Asset Browser Full Screen", self, checkable=True)
+        self._act_browser_fullscreen.setShortcut("F11")
+        self._act_browser_fullscreen.triggered.connect(self._toggle_browser_fullscreen)
+        view_menu.addAction(self._act_browser_fullscreen)
 
         self._act_toggle_controls = QAction("Show Controls", self, checkable=True, checked=True)
         self._act_toggle_controls.triggered.connect(self._toggle_controls)
@@ -295,6 +302,7 @@ class MainWindow(QMainWindow):
         self._browser.asset_activated.connect(self._load_asset)
         self._browser.load_selected_requested.connect(self._load_assets)
         self._browser.status_message.connect(self._set_status)
+        self._browser.fullscreen_requested.connect(self._toggle_browser_fullscreen)
 
         # Viewport → status / FPS
         self._viewport.status_msg.connect(self._set_status)
@@ -576,10 +584,68 @@ class MainWindow(QMainWindow):
             self._set_status(msg)
 
     def _toggle_browser(self, checked: bool):
+        if self._browser_fullscreen:
+            return
         self._browser.setVisible(checked)
 
     def _toggle_controls(self, checked: bool):
+        if self._browser_fullscreen:
+            return
         self._controls.setVisible(checked)
+
+    def _toggle_browser_fullscreen(self, checked: bool):
+        if checked == self._browser_fullscreen:
+            self._browser.set_fullscreen_mode(checked)
+            self._set_action_checked(self._act_browser_fullscreen, checked)
+            return
+
+        if checked:
+            self._browser_fullscreen_state = {
+                "sizes": self._splitter.sizes(),
+                "browser_visible": self._browser.isVisible(),
+                "controls_visible": self._controls.isVisible(),
+            }
+            self._browser_fullscreen = True
+            self._browser.set_fullscreen_mode(True)
+            self._browser.show()
+            self._viewport.hide()
+            self._controls.hide()
+            self._set_action_checked(self._act_browser_fullscreen, True)
+            self._set_action_checked(self._act_toggle_browser, True)
+            self._set_action_checked(self._act_toggle_controls, False)
+            self._act_toggle_browser.setEnabled(False)
+            self._act_toggle_controls.setEnabled(False)
+            self._splitter.setSizes([max(1, self.width()), 0, 0])
+            self._set_status("Asset browser full screen. Press F11 to restore.")
+            return
+
+        state = self._browser_fullscreen_state or {}
+        self._browser_fullscreen = False
+        self._browser.set_fullscreen_mode(False)
+        self._viewport.show()
+
+        browser_visible = state.get("browser_visible", True)
+        controls_visible = state.get("controls_visible", True)
+        self._browser.setVisible(browser_visible)
+        self._controls.setVisible(controls_visible)
+
+        self._act_toggle_browser.setEnabled(True)
+        self._act_toggle_controls.setEnabled(True)
+        self._set_action_checked(self._act_browser_fullscreen, False)
+        self._set_action_checked(self._act_toggle_browser, browser_visible)
+        self._set_action_checked(self._act_toggle_controls, controls_visible)
+
+        sizes = state.get("sizes")
+        if sizes:
+            self._splitter.setSizes(sizes)
+        self._browser_fullscreen_state = None
+        self._set_status("Viewport restored.")
+
+    @staticmethod
+    def _set_action_checked(action: QAction, checked: bool):
+        action.blockSignals(True)
+        action.setChecked(checked)
+        action.blockSignals(False)
 
     def _detect_gpu(self):
         """Try to read GPU name via nvidia-smi or pynvml."""
