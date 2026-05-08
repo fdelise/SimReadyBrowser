@@ -71,6 +71,8 @@ def discover(asset_ref: str, root_path: str = "/World/Asset") -> dict:
         "override_paths": _dedupe(override_paths),
         "override_count": len(_dedupe(override_paths)),
         "body_paths": body_paths,
+        "rigid_body_paths": rigid_paths,
+        "rigid_body_count": len(rigid_paths),
         "body_patterns": body_patterns,
         "articulation_paths": articulation_paths,
         "type_counts": type_counts,

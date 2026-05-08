@@ -162,6 +162,10 @@ class PhysicsWorker:
         self._shape_count = 0
         self._cook_warning = ""
         self._ccd_enabled = False
+        self._steps_per_second = 60
+        self._requested_device = "auto"
+        self._selected_device = "auto"
+        self._device_warning = ""
         self._unstable = False
         self._use_cuda_tensors = False
         self._cuda_buffers: dict[int, _CudaTensorBuffer] = {}
@@ -190,6 +194,8 @@ class PhysicsWorker:
                         clone_parent_poses=message.get("clone_parent_poses", []),
                         clone_groups=message.get("clone_groups", []),
                         ccd_enabled=bool(message.get("ccd_enabled", False)),
+                        steps_per_second=message.get("steps_per_second", 60),
+                        device_mode=message.get("device_mode", ""),
                     )
                 elif cmd == "step":
                     self.step(
@@ -230,11 +236,22 @@ class PhysicsWorker:
         clone_parent_poses=None,
         clone_groups=None,
         ccd_enabled: bool = False,
+        steps_per_second=60,
+        device_mode: str = "",
     ) -> None:
         self.shutdown()
         self._shape_count = 0
         self._cook_warning = ""
         self._ccd_enabled = bool(ccd_enabled)
+        try:
+            self._steps_per_second = max(1, int(steps_per_second))
+        except Exception:
+            self._steps_per_second = 60
+        self._requested_device = self._normalize_device_mode(
+            device_mode or os.environ.get("SIMREADY_OVPHYSX_DEVICE", "auto")
+        )
+        self._selected_device = self._requested_device
+        self._device_warning = ""
         self._unstable = False
         self._emit_progress(4, "Preparing OVPhysX collider cook...")
         self._body_patterns = self._normalize_patterns(body_patterns)
@@ -247,7 +264,7 @@ class PhysicsWorker:
         self._active_body_index = 0
         self._active_body_pattern = self._body_patterns[0]
         try:
-            self._contact_offset = max(0.001, min(0.08, float(contact_offset)))
+            self._contact_offset = max(0.001, min(0.1, float(contact_offset)))
         except Exception:
             self._contact_offset = 0.01
 
@@ -260,20 +277,22 @@ class PhysicsWorker:
         except Exception:
             from ovphysx import TensorType
 
-        self._emit_progress(18, "Creating PhysX scene...")
-        device = os.environ.get("SIMREADY_OVPHYSX_DEVICE", "auto").strip().lower() or "auto"
-        if device.startswith("cuda"):
-            device = "gpu"
+        self._emit_progress(18, f"Creating PhysX scene ({self._requested_device.upper()} mode)...")
+        device = self._requested_device
         selected_device = device
         try:
             self._physx = PhysX(device=device)
-        except Exception:
+        except Exception as exc:
+            first_error = exc
             try:
                 self._physx = PhysX(device="cpu")
                 selected_device = "cpu"
             except TypeError:
                 self._physx = PhysX()
                 selected_device = "cpu"
+            if device != "cpu":
+                self._device_warning = f"{device.upper()} PhysX mode fell back to CPU: {first_error}"
+        self._selected_device = selected_device
         self._use_cuda_tensors = selected_device in {"auto", "gpu"} and _CudaTensorBuffer.available()
 
         self._emit_progress(30, "Loading USD and authored physics payloads...")
@@ -351,6 +370,11 @@ class PhysicsWorker:
                     "shape_count": self._shape_count,
                     "cook_warning": self._cook_warning,
                     "ccd_enabled": self._ccd_enabled,
+                    "steps_per_second": self._steps_per_second,
+                    "device": self._selected_device,
+                    "requested_device": self._requested_device,
+                    "cuda_tensors": self._use_cuda_tensors,
+                    "device_warning": self._device_warning,
                 }
             )
             return
@@ -367,6 +391,11 @@ class PhysicsWorker:
                 "shape_count": self._shape_count,
                 "cook_warning": self._cook_warning,
                 "ccd_enabled": self._ccd_enabled,
+                "steps_per_second": self._steps_per_second,
+                "device": self._selected_device,
+                "requested_device": self._requested_device,
+                "cuda_tensors": self._use_cuda_tensors,
+                "device_warning": self._device_warning,
             }
         )
         self._emit_pose()
@@ -594,6 +623,15 @@ class PhysicsWorker:
                 ),
             }
         )
+
+    @staticmethod
+    def _normalize_device_mode(value: str) -> str:
+        mode = str(value or "").strip().lower()
+        if mode.startswith("cuda"):
+            mode = "gpu"
+        if mode not in {"auto", "cpu", "gpu"}:
+            mode = "auto"
+        return mode
 
     def shutdown(self) -> None:
         self._magnet = None
@@ -1327,11 +1365,6 @@ class PhysicsWorker:
                     tensor_types.RIGID_BODY_SHAPE_FRICTION_AND_RESTITUTION,
                     shape_patterns,
                 )
-                material_buffer = np.zeros(material_binding.shape, dtype=np.float32)
-                self._tensor_read(material_binding, material_buffer)
-                if material_buffer.ndim == 3 and material_buffer.shape[-1] >= 3:
-                    material_buffer[:, :, 2] = np.minimum(np.maximum(material_buffer[:, :, 2], 0.0), 0.05)
-                    self._tensor_write(material_binding, material_buffer)
             except Exception:
                 pass
         except Exception:

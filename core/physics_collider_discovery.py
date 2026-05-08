@@ -38,6 +38,7 @@ def main(argv: list[str]) -> int:
             "collision_overrides": discovery.collision_overrides,
             "body_patterns": discovery.body_patterns,
             "body_paths": discovery.body_paths,
+            "rigid_body_paths": discovery.rigid_body_paths,
             "articulation_paths": discovery.articulation_paths,
             "collider_count": discovery.collider_count,
             "override_count": discovery.override_count,

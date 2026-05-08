@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QObject, QProcess, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
 
 PROXY_PATH = "/World/AssetProxy"
@@ -41,7 +41,7 @@ AUTHORED_BODY_PATTERNS = [
 MAX_DISCOVERED_BODY_PATTERNS = 256
 USD_DISCOVERY_PYTHON_ENV = "SIMREADY_USD_PYTHON"
 ENABLE_SLOW_USD_COLLIDER_DISCOVERY_ENV = "SIMREADY_ENABLE_SLOW_USD_COLLIDER_DISCOVERY"
-DISCOVERY_CACHE_VERSION = 8
+DISCOVERY_CACHE_VERSION = 9
 PHYSICS_MODE_AUTHORED = "authored"
 PHYSICS_MODE_PROXY = "proxy"
 GROUND_HALF_SIZE = 20.0
@@ -60,11 +60,32 @@ DEFAULT_DROP_RANDOMNESS = 0.25
 MIN_DROP_RANDOMNESS = 0.0
 MAX_DROP_RANDOMNESS = 6.0
 DEFAULT_DT = 1.0 / 60.0
-DEFAULT_SUBSTEPS = 4
+DEFAULT_SUBSTEPS = 1
+ISAAC_PHYSICS_STEPS_PER_SECOND = 60
+DEFAULT_PHYSX_STEPS_PER_SECOND = ISAAC_PHYSICS_STEPS_PER_SECOND
+USD_STAGE_FRAMES_PER_SECOND = 60
+MIN_PHYSX_STEPS_PER_SECOND = 15
+MAX_PHYSX_STEPS_PER_SECOND = 240
+MIN_PHYSX_SUBSTEPS = 1
+MAX_PHYSX_SUBSTEPS = 16
+DEFAULT_PHYSX_DEVICE_MODE = "gpu"
+PHYSX_DEVICE_MODES = {"auto", "cpu", "gpu"}
+DYNAMIC_COLLIDER_APPROXIMATION = "convexDecomposition"
+BOX_COLLIDER_APPROXIMATION = "boundingCube"
 BASE_SCENES = {"none", "plane", "ramp", "obstacles"}
 ESTIMATED_ASSET_DENSITY_KG_M3 = 260.0
 MIN_ESTIMATED_MASS_KG = 0.05
 MAX_ESTIMATED_MASS_KG = 500.0
+ISAAC_DYNAMIC_STATIC_FRICTION = 0.2
+ISAAC_DYNAMIC_FRICTION = 1.0
+ISAAC_DYNAMIC_RESTITUTION = 0.0
+ISAAC_GROUND_STATIC_FRICTION = 0.5
+ISAAC_GROUND_DYNAMIC_FRICTION = 0.5
+ISAAC_GROUND_RESTITUTION = 0.8
+ISAAC_CUBOID_CONTACT_OFFSET = 0.1
+ISAAC_CUBOID_REST_OFFSET = 0.0
+ISAAC_CUBOID_TORSIONAL_PATCH_RADIUS = 1.0
+ISAAC_CUBOID_MIN_TORSIONAL_PATCH_RADIUS = 0.8
 DEFAULT_GRAB_FORCE_AMOUNT = 2.0
 MIN_GRAB_FORCE_AMOUNT = 0.25
 MAX_GRAB_FORCE_AMOUNT = 100.0
@@ -88,6 +109,7 @@ class AuthoredColliderDiscovery:
     collision_overrides: str
     body_patterns: list[str]
     body_paths: list[str]
+    rigid_body_paths: list[str]
     articulation_paths: list[str]
     collider_count: int
     override_count: int
@@ -144,8 +166,11 @@ class PhysicsController(QObject):
         self._size = np.ones(3, dtype=np.float64)
         self._estimated_mass_kg = 10.0
         self._sim_time = 0.0
-        self._dt = DEFAULT_DT
+        self._steps_per_second = DEFAULT_PHYSX_STEPS_PER_SECOND
+        self._dt = 1.0 / float(self._steps_per_second)
         self._substeps = DEFAULT_SUBSTEPS
+        self._physx_device_mode = DEFAULT_PHYSX_DEVICE_MODE
+        self._live_settings_dirty = False
         self._running = False
         self._status_text = "Load an asset, then use Play or Restart physics."
         self._scene_path: Optional[Path] = None
@@ -174,6 +199,8 @@ class PhysicsController(QObject):
         self._cooked_asset_refs: tuple[str, ...] = ()
         self._cooked_base_scene = ""
         self._cooked_ccd_enabled = False
+        self._cooked_steps_per_second = 0
+        self._cooked_physx_device_mode = ""
         self._cooked_instance_capacity = 0
         self._cooked_contact_instances_required = False
         self._authored_contact_instances_required = False
@@ -189,6 +216,10 @@ class PhysicsController(QObject):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def ccd_enabled(self) -> bool:
+        return bool(self._ccd_enabled)
 
     @property
     def has_scene(self) -> bool:
@@ -297,7 +328,11 @@ class PhysicsController(QObject):
         self._authored_scene_asset_indices = self._scene_asset_indices(active_count, len(self._active_asset_refs()))
         asset_refs = self._active_asset_refs()
         can_reuse_pool = self._can_reuse_live_scene(asset_refs, active_count)
-        force_rebuild = bool(force_rebuild or (active_count > self._scene_instance_count and not can_reuse_pool))
+        force_rebuild = bool(
+            force_rebuild
+            or self._live_settings_dirty
+            or (active_count > self._scene_instance_count and not can_reuse_pool)
+        )
         reset_instances = (
             self._pad_instance_transforms(instances, self._cooked_instance_capacity)
             if can_reuse_pool
@@ -518,6 +553,8 @@ class PhysicsController(QObject):
             return
 
         self._ccd_enabled = enabled
+        if self._process is not None:
+            self._live_settings_dirty = True
         mode = "enabled" if enabled else "disabled"
         if self._bounds is None:
             self._set_status(f"CCD {mode}. Load an asset to apply it.")
@@ -526,14 +563,80 @@ class PhysicsController(QObject):
         if self._process is not None:
             self._send({"cmd": "set_ccd", "enabled": enabled})
             if self._worker_ready:
-                self._cooked_ccd_enabled = enabled
-                self._set_status(f"CCD {mode}; current cooked collider cache was left intact.")
+                self._set_status(f"CCD {mode}; restart the PhysX engine to re-author the scene setting.")
             else:
                 self._set_status(
-                    f"CCD {mode}; current collider cook will finish without restarting, then the setting applies next start."
+                    f"CCD {mode}; the current collider cook will finish, then restart the PhysX engine to apply it."
                 )
         else:
             self._set_status(f"CCD {mode}. It will apply when physics starts.")
+
+    def set_steps_per_second(self, steps_per_second: int) -> None:
+        value = self._sanitize_steps_per_second(steps_per_second)
+        if value == self._steps_per_second:
+            return
+        self._steps_per_second = value
+        self._dt = 1.0 / float(value)
+        if self._process is not None:
+            self._live_settings_dirty = True
+            self._set_status(f"PhysX steps set to {value}/s; restart the PhysX engine to re-author the scene.")
+        else:
+            self._set_status(f"PhysX steps set to {value}/s.")
+
+    def set_substeps(self, substeps: int) -> None:
+        value = self._sanitize_substeps(substeps)
+        if value == self._substeps:
+            return
+        self._substeps = value
+        self._set_status(f"PhysX substeps set to {value}x.")
+
+    def set_device_mode(self, mode: str) -> None:
+        value = self._sanitize_device_mode(mode)
+        if value == self._physx_device_mode:
+            return
+        self._physx_device_mode = value
+        if self._process is not None:
+            self._live_settings_dirty = True
+            self._set_status(f"PhysX device mode set to {value.upper()}; restart the PhysX engine to apply it.")
+        else:
+            self._set_status(f"PhysX device mode set to {value.upper()}.")
+
+    def reset_physx_settings(self) -> None:
+        had_live_scene = self._process is not None
+        self.set_ccd_enabled(False)
+        self.set_steps_per_second(DEFAULT_PHYSX_STEPS_PER_SECOND)
+        self.set_substeps(DEFAULT_SUBSTEPS)
+        self.set_device_mode(DEFAULT_PHYSX_DEVICE_MODE)
+        if had_live_scene:
+            self._set_status("PhysX settings reset to defaults; restart the PhysX engine to apply scene/device changes.")
+        else:
+            self._set_status("PhysX settings reset to defaults.")
+
+    def restart_engine(
+        self,
+        visual_transform: Optional[np.ndarray] = None,
+        play: bool = True,
+        instance_transforms: Optional[list[np.ndarray]] = None,
+    ) -> bool:
+        if self._bounds is None:
+            self._set_status("Load an asset before restarting the PhysX engine.")
+            self.running_changed.emit(False)
+            return False
+        preserved_instances = instance_transforms
+        if preserved_instances is None and self._scene_instance_count > 1:
+            active_existing = max(1, min(self._active_instance_count, len(self._last_start_instance_transforms)))
+            preserved_instances = [
+                np.array(item, dtype=np.float64, copy=True)
+                for item in self._last_start_instance_transforms[:active_existing]
+            ]
+        self._set_status("Restarting PhysX engine...")
+        self._release_scene()
+        return self.restart(
+            visual_transform=visual_transform,
+            play=play,
+            force_rebuild=True,
+            instance_transforms=preserved_instances,
+        )
 
     def set_visual_transform(self, matrix: np.ndarray, zero_velocity: bool = True) -> None:
         visual = np.array(matrix, dtype=np.float64, copy=True)
@@ -785,6 +888,9 @@ class PhysicsController(QObject):
         self._set_status("Starting OVPhysX worker...")
         self._process = QProcess(self)
         self._process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("SIMREADY_OVPHYSX_DEVICE", self._physx_device_mode)
+        self._process.setProcessEnvironment(env)
         self._process.readyReadStandardOutput.connect(self._on_worker_stdout)
         self._process.readyReadStandardError.connect(self._on_worker_stderr)
         self._process.finished.connect(self._on_worker_finished)
@@ -826,13 +932,18 @@ class PhysicsController(QObject):
                 "contact_offset": self._contact_offset(),
                 "cook_only": bool(cook_only),
                 "ccd_enabled": bool(self._ccd_enabled),
+                "steps_per_second": int(self._steps_per_second),
+                "device_mode": self._physx_device_mode,
             }
         )
         self._cooked_asset_refs = tuple(self._active_asset_refs())
         self._cooked_base_scene = self._base_scene
         self._cooked_ccd_enabled = bool(self._ccd_enabled)
+        self._cooked_steps_per_second = int(self._steps_per_second)
+        self._cooked_physx_device_mode = self._physx_device_mode
         self._cooked_instance_capacity = max(1, int(self._last_start_instance_count))
         self._cooked_contact_instances_required = bool(self._authored_contact_instances_required)
+        self._live_settings_dirty = False
         return True
 
     def _send_step(self) -> None:
@@ -893,6 +1004,8 @@ class PhysicsController(QObject):
             else:
                 shape_text = "zero usable collider shapes"
             ccd_text = ", CCD on" if bool(message.get("ccd_enabled", False)) else ""
+            device = str(message.get("device", self._physx_device_mode) or self._physx_device_mode).upper()
+            device_text = f", {device} PhysX"
             authored_text = (
                 f"{self._authored_collider_count} authored collider prims found, "
                 if self._authored_collider_count > 0
@@ -900,9 +1013,12 @@ class PhysicsController(QObject):
             )
             text = (
                 f"Physics colliders cooked ({authored_text}{body_count} {body_suffix}, "
-                f"{shape_text}, {pattern}{ccd_text})."
+                f"{shape_text}, {pattern}{ccd_text}{device_text})."
             )
             warning = str(message.get("cook_warning", "") or "")
+            device_warning = str(message.get("device_warning", "") or "")
+            if device_warning:
+                warning = f"{warning} {device_warning}".strip()
             if warning:
                 text = f"{text} {warning}"
             self.cooking_progress.emit(100, text)
@@ -954,6 +1070,8 @@ class PhysicsController(QObject):
                     else ", authored collider tensors pending"
                 )
                 ccd_text = ", CCD on" if bool(message.get("ccd_enabled", False)) else ""
+                device = str(message.get("device", self._physx_device_mode) or self._physx_device_mode).upper()
+                device_text = f", {device} PhysX"
                 prefix = "Physics reset with authored colliders"
                 if not self._pending_play and not self._pending_step_after_start:
                     prefix = "Physics colliders cooked and ready"
@@ -965,8 +1083,12 @@ class PhysicsController(QObject):
                 text = (
                     f"{prefix} ({self._authored_collider_count} authored prims, "
                     f"{body_count} {suffix}{shape_text}, "
-                    f"{pattern}{instance_text}, {self._substeps}x substeps{ccd_text})."
+                    f"{pattern}{instance_text}, {self._steps_per_second}/s, "
+                    f"{self._substeps}x substeps{ccd_text}{device_text})."
                 )
+                device_warning = str(message.get("device_warning", "") or "")
+                if device_warning:
+                    warning = f"{warning} {device_warning}".strip()
                 if warning:
                     text = f"{text} {warning}"
                 self._set_status(text)
@@ -1079,6 +1201,7 @@ class PhysicsController(QObject):
         self._step_in_flight = False
         self._pending_instance_reset = False
         self._clear_live_cooked_scene_state()
+        self._live_settings_dirty = False
         if self._timer.isActive():
             self._timer.stop()
         if self._running:
@@ -1104,6 +1227,7 @@ class PhysicsController(QObject):
         self._scene_instance_count = 1
         self._active_instance_count = 1
         self._clear_live_cooked_scene_state()
+        self._live_settings_dirty = False
         self._clear_runtime_clone_state()
         if self._running:
             self._running = False
@@ -1281,17 +1405,31 @@ class PhysicsController(QObject):
         self._current_body_paths = []
         self._current_articulation_paths = []
         for index, item_discovery in enumerate(body_discoveries):
-            self._extend_unique(
-                self._current_body_patterns,
-                self._map_authored_paths_for_index(
-                    item_discovery.body_patterns or list(AUTHORED_BODY_PATTERNS),
-                    index,
-                ),
-            )
-            self._extend_unique(
-                self._current_body_paths,
-                self._map_authored_paths_for_index(item_discovery.body_paths, index),
-            )
+            if self._needs_dynamic_body_apis(item_discovery):
+                body_paths = self._dynamic_body_paths(item_discovery, index)
+                if item_discovery.body_paths:
+                    self._extend_unique(
+                        self._current_body_patterns,
+                        self._map_authored_paths_for_index(
+                            item_discovery.body_patterns or list(AUTHORED_BODY_PATTERNS),
+                            index,
+                        ),
+                    )
+                else:
+                    self._extend_unique(self._current_body_patterns, self._dynamic_root_body_patterns(index))
+                self._extend_unique(self._current_body_paths, body_paths)
+            else:
+                self._extend_unique(
+                    self._current_body_patterns,
+                    self._map_authored_paths_for_index(
+                        item_discovery.body_patterns or list(AUTHORED_BODY_PATTERNS),
+                        index,
+                    ),
+                )
+                self._extend_unique(
+                    self._current_body_paths,
+                    self._map_authored_paths_for_index(item_discovery.body_paths, index),
+                )
             self._extend_unique(
                 self._current_articulation_paths,
                 self._map_authored_paths_for_index(item_discovery.articulation_paths, index),
@@ -1306,8 +1444,10 @@ class PhysicsController(QObject):
             self._authored_asset_usda_block(
                 instance_index,
                 asset_refs[source_index],
-                "",
+                discovery_item.collision_overrides if self._needs_dynamic_body_apis(discovery_item) else "",
                 instance_transforms[instance_index],
+                discovery_item,
+                self._estimated_mass_for_source(source_index),
             )
             for instance_index, source_index, discovery_item in scene_entries
         )
@@ -1330,12 +1470,13 @@ class PhysicsController(QObject):
             self._set_status(
                 "No authored collider prims were found by discovery; OVPhysX will inspect the loaded stage."
             )
-        proxy_mass = self._fmt(self._estimated_mass_kg)
 
         text = f"""#usda 1.0
 (
     defaultPrim = "World"
     doc = "SimReady Browser OVPhysX authored-collider scene"
+    framesPerSecond = {USD_STAGE_FRAMES_PER_SECOND}
+    timeCodesPerSecond = {USD_STAGE_FRAMES_PER_SECOND}
     metersPerUnit = 1
     upAxis = "Z"
     kilogramsPerMass = 1
@@ -1346,19 +1487,25 @@ def Xform "World" (
 )
 {{
     def PhysicsScene "PhysicsScene" (
-        prepend apiSchemas = ["PhysxSceneAPI"]
+        prepend apiSchemas = ["PhysxSceneAPI", "MaterialBindingAPI"]
     )
     {{
         vector3f physics:gravityDirection = (0, 0, -1)
         float physics:gravityMagnitude = 9.81
         uniform token physxScene:solverType = "TGS"
+        uniform uint physxScene:timeStepsPerSecond = {int(self._steps_per_second)}
         bool physxScene:enableStabilization = 1
         bool physxScene:enableExternalForcesEveryIteration = 1
         bool physxScene:solveArticulationContactLast = 1
         uniform uint physxScene:minPositionIterationCount = 8
         uniform uint physxScene:minVelocityIterationCount = 2
         bool physxScene:enableCCD = {scene_ccd}
+        rel material:binding:physics = </World/PhysicsMaterials/DynamicMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
     }}
+
+{self._physics_materials_usda()}
 
 {asset_blocks}
 
@@ -1384,6 +1531,8 @@ def Xform "World" (
 (
     defaultPrim = "World"
     doc = "SimReady Browser OVPhysX proxy scene"
+    framesPerSecond = {USD_STAGE_FRAMES_PER_SECOND}
+    timeCodesPerSecond = {USD_STAGE_FRAMES_PER_SECOND}
     metersPerUnit = 1
     upAxis = "Y"
     kilogramsPerMass = 1
@@ -1394,22 +1543,28 @@ def Xform "World" (
 )
 {{
     def PhysicsScene "PhysicsScene" (
-        prepend apiSchemas = ["PhysxSceneAPI"]
+        prepend apiSchemas = ["PhysxSceneAPI", "MaterialBindingAPI"]
     )
     {{
         vector3f physics:gravityDirection = (0, -1, 0)
         float physics:gravityMagnitude = 9.81
         uniform token physxScene:solverType = "TGS"
+        uniform uint physxScene:timeStepsPerSecond = {int(self._steps_per_second)}
         bool physxScene:enableStabilization = 1
         bool physxScene:enableExternalForcesEveryIteration = 1
         bool physxScene:solveArticulationContactLast = 1
         uniform uint physxScene:minPositionIterationCount = 8
         uniform uint physxScene:minVelocityIterationCount = 2
         bool physxScene:enableCCD = {"1" if self._ccd_enabled else "0"}
+        rel material:binding:physics = </World/PhysicsMaterials/DynamicMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
     }}
 
+{self._physics_materials_usda()}
+
     def Xform "AssetProxy" (
-        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI", "PhysxRigidBodyAPI"]
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI", "PhysxRigidBodyAPI", "MaterialBindingAPI"]
     )
     {{
         double3 xformOp:translate = ({self._fmt(body_pos[0])}, {self._fmt(body_pos[1])}, {self._fmt(body_pos[2])})
@@ -1420,15 +1575,24 @@ def Xform "World" (
         vector3f physics:velocity = (0, 0, 0)
         vector3f physics:angularVelocity = (0, 0, 0)
         bool physxRigidBody:enableCCD = {"1" if self._ccd_enabled else "0"}
+        rel material:binding:physics = </World/PhysicsMaterials/DynamicMaterial> (
+            bindMaterialAs = "weakerThanDescendants"
+        )
 
         def Cube "CubeGeom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
+            uniform token physics:approximation = "{BOX_COLLIDER_APPROXIMATION}"
+            float physxCollision:contactOffset = {self._fmt(ISAAC_CUBOID_CONTACT_OFFSET)}
+            float physxCollision:restOffset = {self._fmt(ISAAC_CUBOID_REST_OFFSET)}
+            float physxCollision:torsionalPatchRadius = {self._fmt(ISAAC_CUBOID_TORSIONAL_PATCH_RADIUS)}
+            float physxCollision:minTorsionalPatchRadius = {self._fmt(ISAAC_CUBOID_MIN_TORSIONAL_PATCH_RADIUS)}
             double3 xformOp:scale = ({self._fmt(size_y[0])}, {self._fmt(size_y[1])}, {self._fmt(size_y[2])})
             uniform token[] xformOpOrder = ["xformOp:scale"]
+            rel material:binding:physics = </World/PhysicsMaterials/DynamicMaterial>
         }}
     }}
 
@@ -1444,18 +1608,48 @@ def Xform "World" (
         asset_ref: str,
         collision_overrides: str,
         transform: np.ndarray,
+        discovery: Optional[AuthoredColliderDiscovery] = None,
+        mass_kg: Optional[float] = None,
     ) -> str:
         name = self._authored_asset_name(index)
         matrix = np.asarray(transform, dtype=np.float64).reshape(4, 4)
         quat = self._quat_xyzw_from_row_rotation(matrix[:3, :3])
         schema_lines = [f"        prepend references = @{asset_ref}@"]
+        dynamic_root = self._uses_dynamic_root(discovery)
+        if dynamic_root:
+            schema_lines.append(
+                '        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI", '
+                '"PhysxRigidBodyAPI", "MaterialBindingAPI"]'
+            )
         xform_lines = [
             f"        double3 xformOp:translate = ({self._fmt(matrix[3, 0])}, {self._fmt(matrix[3, 1])}, {self._fmt(matrix[3, 2])})",
             f"        quatd xformOp:orient = ({self._fmt(quat[3])}, {self._fmt(quat[0])}, {self._fmt(quat[1])}, {self._fmt(quat[2])})",
             "        double3 xformOp:scale = (1, 1, 1)",
             '        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]',
         ]
-        overrides = f"\n{collision_overrides}" if collision_overrides else ""
+        if dynamic_root:
+            mass = self._fmt(mass_kg if mass_kg is not None else self._estimated_mass_kg)
+            xform_lines.extend(
+                [
+                    f"        float physics:mass = {mass}",
+                    "        vector3f physics:velocity = (0, 0, 0)",
+                    "        vector3f physics:angularVelocity = (0, 0, 0)",
+                    f"        bool physxRigidBody:enableCCD = {'1' if self._ccd_enabled else '0'}",
+                    "        rel material:binding:physics = </World/PhysicsMaterials/DynamicMaterial> (",
+                    '            bindMaterialAs = "weakerThanDescendants"',
+                    "        )",
+                ]
+            )
+        body_overrides = ""
+        if self._needs_dynamic_body_apis(discovery) and not dynamic_root:
+            body_overrides = self._dynamic_body_api_override_blocks(discovery.body_paths)
+        ccd_overrides = ""
+        if discovery is not None and not dynamic_root and not self._needs_dynamic_body_apis(discovery):
+            ccd_overrides = self._ccd_body_api_override_blocks(self._ccd_body_paths(discovery))
+        overrides = "\n".join(
+            block for block in (body_overrides, ccd_overrides, collision_overrides) if str(block or "").strip()
+        )
+        overrides = f"\n{overrides}" if overrides else ""
         return f"""    def Xform "{name}" (
 {chr(10).join(schema_lines)}
     )
@@ -1714,6 +1908,34 @@ def Xform "World" (
         return f"/World/{cls._authored_asset_name(index)}"
 
     @classmethod
+    def _dynamic_root_body_patterns(cls, index: int) -> list[str]:
+        root = cls._authored_asset_path(index)
+        return [root, f"{root}/*", f"{root}/Geometry/*", f"{root}/Geometry/*/*"]
+
+    @staticmethod
+    def _needs_dynamic_body_apis(discovery: Optional[AuthoredColliderDiscovery]) -> bool:
+        if discovery is None:
+            return False
+        return (
+            int(discovery.collider_count) > 0
+            and not discovery.rigid_body_paths
+            and not discovery.articulation_paths
+        )
+
+    @classmethod
+    def _uses_dynamic_root(cls, discovery: Optional[AuthoredColliderDiscovery]) -> bool:
+        return cls._needs_dynamic_body_apis(discovery) and not list(getattr(discovery, "body_paths", []) or [])
+
+    @classmethod
+    def _dynamic_body_paths(cls, discovery: Optional[AuthoredColliderDiscovery], index: int) -> list[str]:
+        if not cls._needs_dynamic_body_apis(discovery):
+            return []
+        paths = list(getattr(discovery, "body_paths", []) or [])
+        if not paths:
+            paths = [AUTHORED_ASSET_PATH]
+        return cls._map_authored_paths_for_index(paths, index)
+
+    @classmethod
     def _instance_root_paths(cls, count: int) -> list[str]:
         return [cls._authored_asset_path(index) for index in range(max(1, int(count)))]
 
@@ -1821,6 +2043,8 @@ def Xform "World" (
             tuple(asset_refs or []) == self._cooked_asset_refs
             and self._base_scene == self._cooked_base_scene
             and bool(self._ccd_enabled) == bool(self._cooked_ccd_enabled)
+            and int(self._steps_per_second) == int(self._cooked_steps_per_second)
+            and self._physx_device_mode == self._cooked_physx_device_mode
             and bool(self._authored_contact_instances_required) == bool(self._cooked_contact_instances_required)
             and self._cooked_instance_capacity >= count
         )
@@ -1890,6 +2114,8 @@ def Xform "World" (
         self._cooked_asset_refs = ()
         self._cooked_base_scene = ""
         self._cooked_ccd_enabled = False
+        self._cooked_steps_per_second = 0
+        self._cooked_physx_device_mode = ""
         self._cooked_instance_capacity = 0
         self._cooked_contact_instances_required = False
 
@@ -1954,7 +2180,7 @@ def Xform "World" (
 
     @staticmethod
     def _empty_discovery() -> AuthoredColliderDiscovery:
-        return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+        return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], [], 0, 0)
 
     @classmethod
     def _cached_discovery(cls, asset_ref: str) -> Optional[AuthoredColliderDiscovery]:
@@ -2075,25 +2301,105 @@ def Xform "World" (
         except Exception:
             collider_count = 0
         return AuthoredColliderDiscovery(
-            "",
+            PhysicsController._collision_overrides_from_payload(payload),
             [str(path) for path in payload.get("body_patterns", []) if str(path or "").strip()]
             or list(AUTHORED_BODY_PATTERNS),
             [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()],
+            [str(path) for path in payload.get("rigid_body_paths", []) if str(path or "").strip()],
             [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
             collider_count,
             0,
         )
 
+    @classmethod
+    def _collision_overrides_from_payload(cls, payload: dict) -> str:
+        explicit = str(payload.get("collision_overrides", "") or "")
+        if explicit.strip():
+            return explicit
+
+        collider_paths: list[str] = []
+        for item in payload.get("colliders", []) or []:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "") or "").strip()
+            if not path.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                continue
+
+            prim_type = str(item.get("prim_type", "") or "")
+            if prim_type and prim_type != "Mesh":
+                continue
+
+            schemas = {str(schema).lower() for schema in item.get("schemas", []) or []}
+            approximation = str(item.get("approximation", "") or "").strip().lower()
+            collider_type = str(item.get("type", "") or "").strip().lower()
+            dynamic_ready = {
+                "sdf",
+                "convexhull",
+                "convexdecomposition",
+            }
+            if approximation in dynamic_ready or collider_type in dynamic_ready:
+                continue
+            if "physxsdfmeshcollisionapi" in schemas:
+                continue
+            if path not in collider_paths:
+                collider_paths.append(path)
+        return cls._collision_override_blocks(collider_paths)
+
     @staticmethod
     def _discovery_to_payload(discovery: AuthoredColliderDiscovery) -> dict:
         return {
-            "collision_overrides": "",
+            "collision_overrides": str(discovery.collision_overrides or ""),
             "body_patterns": list(discovery.body_patterns or []),
             "body_paths": list(discovery.body_paths or []),
+            "rigid_body_paths": list(discovery.rigid_body_paths or []),
             "articulation_paths": list(discovery.articulation_paths or []),
             "collider_count": int(discovery.collider_count),
             "override_count": 0,
         }
+
+    @classmethod
+    def _collision_override_blocks(cls, collider_paths: list[str]) -> str:
+        tree: dict[str, dict] = {}
+        for path in collider_paths or []:
+            text = str(path or "").strip()
+            if not text.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                continue
+            parts = [part for part in text[len(f"{AUTHORED_ASSET_PATH}/") :].split("/") if part]
+            if not parts:
+                continue
+            node = tree
+            for part in parts:
+                node = node.setdefault(cls._usd_name(part), {})
+            node["__collider__"] = {}
+        return "\n".join(cls._render_collision_override_tree(tree, 2))
+
+    @classmethod
+    def _render_collision_override_tree(cls, tree: dict, indent_level: int) -> list[str]:
+        lines: list[str] = []
+        indent = " " * (indent_level * 4)
+        child_indent = " " * ((indent_level + 1) * 4)
+        for name in sorted(key for key in tree.keys() if key != "__collider__"):
+            child = tree.get(name, {})
+            is_collider = "__collider__" in child
+            if is_collider:
+                lines.append(f'{indent}over "{name}" (')
+                lines.append(
+                    f'{child_indent}prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", '
+                    '"PhysxConvexDecompositionCollisionAPI"]'
+                )
+                lines.append(f"{indent})")
+            else:
+                lines.append(f'{indent}over "{name}"')
+            lines.append(f"{indent}{{")
+            if is_collider:
+                lines.append(
+                    f'{child_indent}uniform token physics:approximation = "{DYNAMIC_COLLIDER_APPROXIMATION}"'
+                )
+                lines.append(f"{child_indent}int physxConvexDecompositionCollision:maxConvexHulls = 32")
+                lines.append(f"{child_indent}int physxConvexDecompositionCollision:hullVertexLimit = 64")
+            lines.extend(cls._render_collision_override_tree(child, indent_level + 1))
+            lines.append(f"{indent}}}")
+        return lines
 
     def _stage_collider_discovery(self, asset_ref: str) -> Optional[AuthoredColliderDiscovery]:
         helper_pythons = self._usd_discovery_python_candidates()
@@ -2140,17 +2446,19 @@ def Xform "World" (
 
     def _discovery_from_stage_payload(self, payload: dict) -> AuthoredColliderDiscovery:
         if not isinstance(payload, dict):
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], [], 0, 0)
 
         body_patterns = [str(path) for path in payload.get("body_patterns", []) if str(path or "").strip()]
         body_paths = [str(path) for path in payload.get("body_paths", []) if str(path or "").strip()]
+        rigid_body_paths = [str(path) for path in payload.get("rigid_body_paths", []) if str(path or "").strip()]
         collider_count = int(payload.get("collider_count", 0) or 0)
         if collider_count <= 0:
-            return AuthoredColliderDiscovery("", body_patterns or list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+            return AuthoredColliderDiscovery("", body_patterns or list(AUTHORED_BODY_PATTERNS), [], [], [], 0, 0)
         return AuthoredColliderDiscovery(
-            "",
+            self._collision_overrides_from_payload(payload),
             body_patterns or list(AUTHORED_BODY_PATTERNS),
             body_paths,
+            rigid_body_paths,
             [str(path) for path in payload.get("articulation_paths", []) if str(path or "").strip()],
             collider_count,
             0,
@@ -2202,23 +2510,25 @@ def Xform "World" (
         base_text = self._read_simready_payload_text(asset_ref, "base.usda")
         instances_text = self._read_simready_payload_text(asset_ref, "instances.usda")
         if not base_text or not instances_text:
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], [], 0, 0)
 
         collision_instances = self._collision_instances(instances_text)
         if not collision_instances:
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], [], 0, 0)
 
         references = self._simready_instance_references(base_text)
         collision_refs = [(path, name) for path, name in references if name in collision_instances]
         if not collision_refs:
-            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], 0, 0)
+            return AuthoredColliderDiscovery("", list(AUTHORED_BODY_PATTERNS), [], [], [], 0, 0)
 
         body_patterns = self._authored_body_patterns_from_refs(collision_refs)
         body_paths = self._authored_body_paths_from_refs(collision_refs)
+        collision_paths = self._authored_collider_paths_from_refs(collision_refs, collision_instances)
         return AuthoredColliderDiscovery(
-            "",
+            self._collision_override_blocks(collision_paths),
             body_patterns,
             body_paths,
+            [],
             [],
             len(collision_refs),
             0,
@@ -2273,6 +2583,41 @@ def Xform "World" (
             else:
                 full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
                 add("/".join(full_parts[:2]))
+        return paths
+
+    def _authored_collider_paths_from_refs(
+        self,
+        refs: list[tuple[tuple[str, ...], str]],
+        collision_instances: dict[str, str],
+    ) -> list[str]:
+        paths: list[str] = []
+
+        def add(path: str) -> None:
+            if path and path not in paths and len(paths) < MAX_DISCOVERED_BODY_PATTERNS:
+                paths.append(path)
+
+        for rel_path, instance_name in refs:
+            approximation = str(collision_instances.get(instance_name, "") or "").strip().lower()
+            if approximation in {"sdf", "convexdecomposition", "convexhull"}:
+                continue
+
+            clean_parts = [self._usd_name(part) for part in rel_path if part]
+            instance_name = self._usd_name(instance_name)
+            if not clean_parts:
+                continue
+            if clean_parts[0] == "Geometry" and len(clean_parts) > 1:
+                object_path = f"{AUTHORED_ASSET_PATH}/Geometry/{clean_parts[1]}"
+                if len(clean_parts) >= 3:
+                    mesh_path = f"{object_path}/{clean_parts[-1]}"
+                elif instance_name:
+                    mesh_path = f"{object_path}/{instance_name}"
+                else:
+                    mesh_path = object_path
+            else:
+                full_parts = [AUTHORED_ASSET_PATH, *clean_parts]
+                object_path = "/".join(full_parts[:2])
+                mesh_path = f"{object_path}/{instance_name}" if len(clean_parts) == 1 and instance_name else "/".join(full_parts)
+            add(mesh_path)
         return paths
 
     @staticmethod
@@ -2420,9 +2765,126 @@ def Xform "World" (
             )
         return "\n".join(parts)
 
+    def _physics_materials_usda(self) -> str:
+        return f"""    def Scope "PhysicsMaterials"
+    {{
+        def Material "DynamicMaterial" (
+            prepend apiSchemas = ["PhysicsMaterialAPI"]
+        )
+        {{
+            float physics:staticFriction = {self._fmt(ISAAC_DYNAMIC_STATIC_FRICTION)}
+            float physics:dynamicFriction = {self._fmt(ISAAC_DYNAMIC_FRICTION)}
+            float physics:restitution = {self._fmt(ISAAC_DYNAMIC_RESTITUTION)}
+        }}
+
+        def Material "GroundMaterial" (
+            prepend apiSchemas = ["PhysicsMaterialAPI"]
+        )
+        {{
+            float physics:staticFriction = {self._fmt(ISAAC_GROUND_STATIC_FRICTION)}
+            float physics:dynamicFriction = {self._fmt(ISAAC_GROUND_DYNAMIC_FRICTION)}
+            float physics:restitution = {self._fmt(ISAAC_GROUND_RESTITUTION)}
+        }}
+    }}"""
+
+    def _dynamic_body_api_override_blocks(self, body_paths: list[str]) -> str:
+        tree: dict[str, dict] = {}
+        for path in body_paths or []:
+            text = str(path or "").strip()
+            if not text.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                continue
+            parts = [part for part in text[len(f"{AUTHORED_ASSET_PATH}/") :].split("/") if part]
+            if not parts:
+                continue
+            node = tree
+            for part in parts:
+                node = node.setdefault(self._usd_name(part), {})
+            node["__rigid_body__"] = {}
+        return "\n".join(self._render_dynamic_body_api_tree(tree, 2))
+
+    def _ccd_body_api_override_blocks(self, body_paths: list[str]) -> str:
+        tree: dict[str, dict] = {}
+        for path in body_paths or []:
+            text = str(path or "").strip()
+            if not text.startswith(f"{AUTHORED_ASSET_PATH}/"):
+                continue
+            parts = [part for part in text[len(f"{AUTHORED_ASSET_PATH}/") :].split("/") if part]
+            if not parts:
+                continue
+            node = tree
+            for part in parts:
+                node = node.setdefault(self._usd_name(part), {})
+            node["__ccd_body__"] = {}
+        return "\n".join(self._render_ccd_body_api_tree(tree, 2))
+
+    @staticmethod
+    def _ccd_body_paths(discovery: Optional[AuthoredColliderDiscovery]) -> list[str]:
+        paths: list[str] = []
+        if discovery is None:
+            return paths
+        PhysicsController._extend_unique(paths, list(getattr(discovery, "rigid_body_paths", []) or []))
+        PhysicsController._extend_unique(paths, list(getattr(discovery, "body_paths", []) or []))
+        return paths
+
+    def _render_ccd_body_api_tree(self, tree: dict, indent_level: int) -> list[str]:
+        lines: list[str] = []
+        indent = " " * (indent_level * 4)
+        child_indent = " " * ((indent_level + 1) * 4)
+        for name in sorted(key for key in tree.keys() if key != "__ccd_body__"):
+            child = tree.get(name, {})
+            is_rigid_body = "__ccd_body__" in child
+            if is_rigid_body:
+                lines.append(f'{indent}over "{name}" (')
+                lines.append(f'{child_indent}prepend apiSchemas = ["PhysxRigidBodyAPI"]')
+                lines.append(f"{indent})")
+            else:
+                lines.append(f'{indent}over "{name}"')
+            lines.append(f"{indent}{{")
+            if is_rigid_body:
+                lines.append(f"{child_indent}bool physxRigidBody:enableCCD = {'1' if self._ccd_enabled else '0'}")
+            lines.extend(self._render_ccd_body_api_tree(child, indent_level + 1))
+            lines.append(f"{indent}}}")
+        return lines
+
+    def _render_dynamic_body_api_tree(self, tree: dict, indent_level: int) -> list[str]:
+        lines: list[str] = []
+        indent = " " * (indent_level * 4)
+        child_indent = " " * ((indent_level + 1) * 4)
+        for name in sorted(key for key in tree.keys() if key != "__rigid_body__"):
+            child = tree.get(name, {})
+            is_rigid_body = "__rigid_body__" in child
+            if is_rigid_body:
+                lines.append(f'{indent}over "{name}" (')
+                lines.append(
+                    f'{child_indent}prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysxRigidBodyAPI", '
+                    '"MaterialBindingAPI"]'
+                )
+                lines.append(f"{indent})")
+            else:
+                lines.append(f'{indent}over "{name}"')
+            lines.append(f"{indent}{{")
+            if is_rigid_body:
+                lines.append(f"{child_indent}vector3f physics:velocity = (0, 0, 0)")
+                lines.append(f"{child_indent}vector3f physics:angularVelocity = (0, 0, 0)")
+                lines.append(f"{child_indent}bool physxRigidBody:enableCCD = {'1' if self._ccd_enabled else '0'}")
+                lines.append(f"{child_indent}rel material:binding:physics = </World/PhysicsMaterials/DynamicMaterial> (")
+                lines.append(f'{child_indent}    bindMaterialAs = "weakerThanDescendants"')
+                lines.append(f"{child_indent})")
+            lines.extend(self._render_dynamic_body_api_tree(child, indent_level + 1))
+            lines.append(f"{indent}}}")
+        return lines
+
     def _contact_offset(self) -> float:
         min_size = float(np.min(np.maximum(self._size, 0.001)))
-        return max(0.003, min(0.04, min_size * 0.025))
+        return max(0.003, min(0.1, min_size * 0.025))
+
+    def _estimated_mass_for_source(self, source_index: int) -> float:
+        try:
+            bounds = self._drop_source_bounds(source_index)
+            size = np.asarray(bounds.get("size", self._size), dtype=np.float64).reshape(3)
+        except Exception:
+            size = np.asarray(self._size, dtype=np.float64).reshape(3)
+        return self._estimate_asset_mass(size)
 
     @staticmethod
     def _estimate_asset_mass(size: np.ndarray) -> float:
@@ -2467,6 +2929,31 @@ def Xform "World" (
             amount = DEFAULT_DROP_RANDOMNESS
         return max(MIN_DROP_RANDOMNESS, min(amount, MAX_DROP_RANDOMNESS))
 
+    @staticmethod
+    def _sanitize_steps_per_second(value: int) -> int:
+        try:
+            steps = int(value)
+        except Exception:
+            steps = DEFAULT_PHYSX_STEPS_PER_SECOND
+        return max(MIN_PHYSX_STEPS_PER_SECOND, min(steps, MAX_PHYSX_STEPS_PER_SECOND))
+
+    @staticmethod
+    def _sanitize_substeps(value: int) -> int:
+        try:
+            substeps = int(value)
+        except Exception:
+            substeps = DEFAULT_SUBSTEPS
+        return max(MIN_PHYSX_SUBSTEPS, min(substeps, MAX_PHYSX_SUBSTEPS))
+
+    @staticmethod
+    def _sanitize_device_mode(value: str) -> str:
+        mode = str(value or "").strip().lower()
+        if mode.startswith("cuda"):
+            mode = "gpu"
+        if mode not in PHYSX_DEVICE_MODES:
+            mode = DEFAULT_PHYSX_DEVICE_MODE
+        return mode
+
     def _ground_usda_z_up(self) -> str:
         ground_z = -GROUND_THICKNESS * 0.5
         return f"""    def Xform "Ground"
@@ -2475,14 +2962,20 @@ def Xform "World" (
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Cube "GroundGeom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
+            uniform token physics:approximation = "{BOX_COLLIDER_APPROXIMATION}"
+            float physxCollision:contactOffset = {self._fmt(ISAAC_CUBOID_CONTACT_OFFSET)}
+            float physxCollision:restOffset = {self._fmt(ISAAC_CUBOID_REST_OFFSET)}
+            float physxCollision:torsionalPatchRadius = {self._fmt(ISAAC_CUBOID_TORSIONAL_PATCH_RADIUS)}
+            float physxCollision:minTorsionalPatchRadius = {self._fmt(ISAAC_CUBOID_MIN_TORSIONAL_PATCH_RADIUS)}
             double3 xformOp:translate = (0, 0, {self._fmt(ground_z)})
             double3 xformOp:scale = ({self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_THICKNESS)})
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding:physics = </World/PhysicsMaterials/GroundMaterial>
         }}
     }}"""
 
@@ -2490,7 +2983,7 @@ def Xform "World" (
         return f"""    def Xform "Ramp"
     {{
         def Mesh "RampGeom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
@@ -2502,6 +2995,7 @@ def Xform "World" (
             int physxConvexDecompositionCollision:hullVertexLimit = 64
             color3f[] primvars:displayColor = [(0.22, 0.24, 0.25)]
             uniform token primvars:displayColor:interpolation = "constant"
+            rel material:binding:physics = </World/PhysicsMaterials/GroundMaterial>
         }}
     }}"""
 
@@ -2515,13 +3009,19 @@ def Xform "World" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
 
         def Cube "Geom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
+            uniform token physics:approximation = "{BOX_COLLIDER_APPROXIMATION}"
+            float physxCollision:contactOffset = {self._fmt(ISAAC_CUBOID_CONTACT_OFFSET)}
+            float physxCollision:restOffset = {self._fmt(ISAAC_CUBOID_REST_OFFSET)}
+            float physxCollision:torsionalPatchRadius = {self._fmt(ISAAC_CUBOID_TORSIONAL_PATCH_RADIUS)}
+            float physxCollision:minTorsionalPatchRadius = {self._fmt(ISAAC_CUBOID_MIN_TORSIONAL_PATCH_RADIUS)}
             double3 xformOp:scale = ({self._fmt(sx)}, {self._fmt(sy)}, {self._fmt(sz)})
             uniform token[] xformOpOrder = ["xformOp:scale"]
+            rel material:binding:physics = </World/PhysicsMaterials/GroundMaterial>
         }}
     }}"""
 
@@ -2549,14 +3049,20 @@ def Xform "World" (
         uniform token[] xformOpOrder = ["xformOp:translate"]
 
         def Cube "GroundGeom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
+            uniform token physics:approximation = "{BOX_COLLIDER_APPROXIMATION}"
+            float physxCollision:contactOffset = {self._fmt(ISAAC_CUBOID_CONTACT_OFFSET)}
+            float physxCollision:restOffset = {self._fmt(ISAAC_CUBOID_REST_OFFSET)}
+            float physxCollision:torsionalPatchRadius = {self._fmt(ISAAC_CUBOID_TORSIONAL_PATCH_RADIUS)}
+            float physxCollision:minTorsionalPatchRadius = {self._fmt(ISAAC_CUBOID_MIN_TORSIONAL_PATCH_RADIUS)}
             double3 xformOp:translate = (0, {self._fmt(ground_y)}, 0)
             double3 xformOp:scale = ({self._fmt(GROUND_HALF_SIZE * 2.0)}, {self._fmt(GROUND_THICKNESS)}, {self._fmt(GROUND_HALF_SIZE * 2.0)})
             uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding:physics = </World/PhysicsMaterials/GroundMaterial>
         }}
     }}"""
 
@@ -2564,7 +3070,7 @@ def Xform "World" (
         return f"""    def Xform "Ramp"
     {{
         def Mesh "RampGeom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxConvexDecompositionCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
@@ -2576,6 +3082,7 @@ def Xform "World" (
             int physxConvexDecompositionCollision:hullVertexLimit = 64
             color3f[] primvars:displayColor = [(0.22, 0.24, 0.25)]
             uniform token primvars:displayColor:interpolation = "constant"
+            rel material:binding:physics = </World/PhysicsMaterials/GroundMaterial>
         }}
     }}"""
 
@@ -2589,13 +3096,19 @@ def Xform "World" (
         uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
 
         def Cube "Geom" (
-            prepend apiSchemas = ["PhysicsCollisionAPI"]
+            prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI", "PhysxCollisionAPI", "MaterialBindingAPI"]
         )
         {{
             float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
             double size = 1
+            uniform token physics:approximation = "{BOX_COLLIDER_APPROXIMATION}"
+            float physxCollision:contactOffset = {self._fmt(ISAAC_CUBOID_CONTACT_OFFSET)}
+            float physxCollision:restOffset = {self._fmt(ISAAC_CUBOID_REST_OFFSET)}
+            float physxCollision:torsionalPatchRadius = {self._fmt(ISAAC_CUBOID_TORSIONAL_PATCH_RADIUS)}
+            float physxCollision:minTorsionalPatchRadius = {self._fmt(ISAAC_CUBOID_MIN_TORSIONAL_PATCH_RADIUS)}
             double3 xformOp:scale = ({self._fmt(sx)}, {self._fmt(sy)}, {self._fmt(sz)})
             uniform token[] xformOpOrder = ["xformOp:scale"]
+            rel material:binding:physics = </World/PhysicsMaterials/GroundMaterial>
         }}
     }}"""
 

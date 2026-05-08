@@ -18,7 +18,8 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 - Uses the asset's authored colliders for physics review. It does not create fake asset colliders when authored colliders are missing or unavailable.
 - Adds review base scenes: plane, ramp, and obstacles.
 - Shows collision debug overlays as wireframe curves so you can compare the visible render asset against the collision representation.
-- Supports physics playback, restart, explicit single or multi-asset drop-from-air testing, current-pose simulation startup, optional CCD, and Shift + left mouse physics grabbing with adjustable grab force.
+- Supports physics playback, restart, explicit PhysX engine restart, single or multi-asset drop-from-air testing, current-pose simulation startup, session CCD, persistent step-rate / CPU-GPU settings, and Shift + left mouse physics grabbing with adjustable grab force.
+- Adds a right-panel Scene Explorer tab that lists discovered asset parts in a USD-style tree and lets you select prims, inspect paths/properties, and author viewport transform or visibility overrides.
 
 ## Typical Workflow
 
@@ -27,9 +28,10 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 3. Double-click a thumbnail to load the asset into the viewport.
 4. Review the asset visually using Kit-style camera controls.
 5. Toggle collision visualization to inspect authored collider wireframes.
-6. Use the Physics panel to select a base scene, then press Play or Drop.
-7. Play starts from the asset's current viewport pose; Drop places one or more copies above the base scene and starts physics.
-8. Hold Shift + left mouse button on the asset to grab it with a force-based physics handle, drag it, then release to drop or throw it.
+6. Open the Scene Explorer tab to inspect the loaded asset parts or edit selected prim visibility/transform overrides.
+7. Use the Physics panel to select a base scene, then press Play or Drop.
+8. Play starts from the asset's current viewport pose; Drop places one or more copies above the base scene and starts physics.
+9. Hold Shift + left mouse button on the asset to grab it with a force-based physics handle, drag it, then release to drop or throw it.
 
 To review a CAD file, use `File > Open CAD File...`. The app launches CAD2USD in a separate process, writes the converted USD under `cache/cad2usd/`, then loads that USD into the viewport. Set `CAD2USD_ROOT` to the CAD2USD checkout, or select `convert.bat` the first time the app asks for it.
 
@@ -51,7 +53,7 @@ SimReadyBrowser/
   ui/
     asset_browser.py              Search, category browser, and asset cards
     viewport_widget.py            Qt viewport host and input routing
-    controls_panel.py             Lighting, view, collision, and physics controls
+    controls_panel.py             Lighting, view, collision, physics controls, scene explorer UI
     main_window.py                Main Qt layout and signal wiring
   styles/
     nvidia_theme.py               NVIDIA-style Qt palette and widget styling
@@ -172,10 +174,12 @@ The physics path is designed to validate authored SimReady collision data, not t
 - If no usable authored collision shapes are exposed by OVPhysX, the app reports that instead of creating a fake asset collider.
 - The floor is authored as a simple box collider, not a triangle mesh.
 - The ramp base scene uses a closed convex wedge collider so the ramp itself has reliable collision.
+- App-authored USD review and physics layers set `framesPerSecond` and `timeCodesPerSecond` to 60.
 - Physics Play starts from the asset's current viewport pose. It no longer automatically drops the asset from above the base scene.
 - Drop places the selected number of asset copies above the base scene with tight random offsets so they collide. The UI caps this at 100 copies. Re-dropping the same count reuses the cooked OVPhysX scene; changing the count rebuilds because the number of rigid-body instances changes.
-- The CCD checkbox authors scene-level `physxScene:enableCCD` on the next physics scene start. It does not mutate authored asset body or collider schemas, and toggling it does not force a collider re-cook.
-- Restart resets the cooked physics scene without re-cooking when possible.
+- Persistent PhysX settings include authored steps per second, per-frame substeps, and CPU/GPU/Auto worker device mode. CCD is intentionally session-only and defaults off. Reset Defaults restores GPU device, CCD off, 60 steps/s, and 1 substep.
+- The CCD checkbox globally authors scene-level `physxScene:enableCCD` and per-body `physxRigidBody:enableCCD` overrides for discovered asset rigid bodies. Changing it restarts the active physics scene so the setting is actually removed or applied.
+- Restart resets the cooked physics scene without re-cooking when possible. Restart Engine tears down the OVPhysX subprocess and starts a fresh scene, which is required for CPU/GPU mode changes and other settings that affect scene authoring.
 - Grab force is scaled by the estimated mass and by the user-controlled grab force multiplier, which supports 0.25x to 100x.
 
 ## Collision Debug Overlay

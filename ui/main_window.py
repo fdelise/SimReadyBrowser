@@ -257,7 +257,7 @@ class MainWindow(QMainWindow):
         self._controls = ControlsPanel()
         self._splitter.addWidget(self._controls)
 
-        self._splitter.setSizes([320, 1000, 260])
+        self._splitter.setSizes([320, 960, 340])
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setStretchFactor(2, 0)
@@ -312,6 +312,8 @@ class MainWindow(QMainWindow):
         )
         self._viewport.physics_status_changed.connect(self._controls.set_physics_status)
         self._viewport.physics_running_changed.connect(self._controls.set_physics_running)
+        self._viewport.scene_tree_changed.connect(self._controls.set_scene_tree)
+        self._viewport.scene_part_selection_changed.connect(self._controls.set_selected_scene_part)
 
         # Controls → viewport
         self._controls.dome_intensity_changed.connect(self._viewport.set_dome_intensity)
@@ -329,6 +331,19 @@ class MainWindow(QMainWindow):
         self._controls.physics_grab_force_changed.connect(self._viewport.set_physics_grab_force)
         self._controls.physics_drop_options_changed.connect(self._viewport.set_physics_drop_options)
         self._controls.physics_ccd_changed.connect(self._viewport.set_physics_ccd_enabled)
+        self._controls.physics_steps_changed.connect(self._viewport.set_physx_steps_per_second)
+        self._controls.physics_substeps_changed.connect(self._viewport.set_physx_substeps)
+        self._controls.physics_device_changed.connect(self._viewport.set_physx_device_mode)
+        self._controls.physics_settings_reset_requested.connect(self._viewport.reset_physx_settings)
+        self._controls.physics_engine_restart_requested.connect(self._viewport.restart_physics_engine)
+        self._controls.scene_part_selected.connect(self._viewport.select_scene_part)
+        self._controls.scene_part_property_changed.connect(self._viewport.set_scene_part_property)
+        self._controls.scene_explorer_refresh_requested.connect(self._viewport.refresh_scene_explorer)
+        physics_settings = self._controls.physics_settings()
+        self._viewport.set_physics_ccd_enabled(bool(physics_settings["ccd_enabled"]))
+        self._viewport.set_physx_steps_per_second(int(physics_settings["steps_per_second"]))
+        self._viewport.set_physx_substeps(int(physics_settings["substeps"]))
+        self._viewport.set_physx_device_mode(str(physics_settings["device_mode"]))
         self._controls.set_physics_status(self._viewport.physics_status)
 
     # ── Slots ──────────────────────────────────────────────────────────────────

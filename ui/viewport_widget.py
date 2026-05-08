@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import sys
 import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PyQt5.QtCore import QEvent, QPoint, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QPoint, QProcess, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QLabel, QProgressBar, QSizePolicy, QVBoxLayout, QWidget
 
 from core.camera_controller import SphericalCamera
 from core.physics_controller import PhysicsController
+from core.scene_explorer_model import build_scene_tree
 from styles.nvidia_theme import COLOR_ACCENT, COLOR_TEXT_SECONDARY, COLOR_VIEWPORT_BG
 
 LOAD_START_DELAY_MS = 150
@@ -22,8 +25,6 @@ GRAB_THROW_VELOCITY_LIMIT = 10.0
 DEFAULT_GRAB_FORCE_AMOUNT = 2.0
 MIN_GRAB_FORCE_AMOUNT = 0.25
 MAX_GRAB_FORCE_AMOUNT = 100.0
-MAX_GRAB_TARGET_EXTENTS = 8.0
-MIN_GRAB_TARGET_DISTANCE = 2.0
 
 
 class ViewportWidget(QWidget):
@@ -35,6 +36,8 @@ class ViewportWidget(QWidget):
     loading_changed = pyqtSignal(bool, str)
     physics_status_changed = pyqtSignal(str)
     physics_running_changed = pyqtSignal(bool)
+    scene_tree_changed = pyqtSignal(object)
+    scene_part_selection_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,6 +63,12 @@ class ViewportWidget(QWidget):
         self._auto_cook_physics_after_load = True
         self._current_usd_source: Optional[str] = None
         self._current_load_name = ""
+        self._current_scene_items: list[dict] = []
+        self._scene_explorer_process: Optional[QProcess] = None
+        self._scene_explorer_buffer = ""
+        self._scene_explorer_error = ""
+        self._scene_explorer_refs: list[str] = []
+        self._scene_explorer_generation = 0
         self._first_frame_timer_start: Optional[float] = None
         self._physics = PhysicsController(self)
         self._physics.pose_changed.connect(self._on_physics_pose)
@@ -105,6 +114,8 @@ class ViewportWidget(QWidget):
         self._auto_cook_physics_after_load = bool(auto_cook_physics)
         self._current_usd_source = str(path)
         self._current_load_name = Path(str(path).split("?", 1)[0]).name
+        self._current_scene_items = [{"source": str(path), "name": self._current_load_name, "key": str(path)}]
+        self._reset_scene_explorer("Loading scene explorer data...")
         self._begin_first_frame_timer()
         self._last_bounds = None
         self._camera.reset()
@@ -141,6 +152,8 @@ class ViewportWidget(QWidget):
         self._auto_cook_physics_after_load = True
         self._current_usd_source = None
         self._current_load_name = ""
+        self._current_scene_items = list(normalized)
+        self._reset_scene_explorer("Loading scene explorer data...")
         self._begin_first_frame_timer()
         self._last_bounds = None
         self._camera.reset()
@@ -214,6 +227,17 @@ class ViewportWidget(QWidget):
             self.loading_changed.emit(False, self._physics.status_text)
             self._set_loading(False)
 
+    def restart_physics_engine(self) -> None:
+        if self._last_bounds is None:
+            self._on_physics_status("Load an asset before restarting the PhysX engine.")
+            self.physics_running_changed.emit(False)
+            return
+        self._begin_physics_progress("Restarting PhysX engine...", 0)
+        if not self._physics.restart_engine(play=True):
+            self._physics_cooking_active = False
+            self.loading_changed.emit(False, self._physics.status_text)
+            self._set_loading(False)
+
     def drop_physics(self, count: int = 1) -> None:
         if self._last_bounds is None:
             self._on_physics_status("Load an asset before dropping physics.")
@@ -272,12 +296,53 @@ class ViewportWidget(QWidget):
         self._physics.set_drop_options(float(spacing), float(randomness))
 
     def set_physics_ccd_enabled(self, enabled: bool) -> None:
-        self._physics.set_ccd_enabled(bool(enabled))
+        enabled = bool(enabled)
+        previous = self._physics.ccd_enabled
+        live_scene = self._physics.has_scene
+        was_running = self._physics.is_running
+        self._physics.set_ccd_enabled(enabled)
+        if live_scene and previous != enabled:
+            self._begin_physics_progress("Restarting PhysX engine with CCD setting...", 0)
+            if not self._physics.restart_engine(play=was_running):
+                self._physics_cooking_active = False
+                self.loading_changed.emit(False, self._physics.status_text)
+                self._set_loading(False)
+
+    def set_physx_steps_per_second(self, value: int) -> None:
+        self._physics.set_steps_per_second(int(value))
+
+    def set_physx_substeps(self, value: int) -> None:
+        self._physics.set_substeps(int(value))
+
+    def set_physx_device_mode(self, mode: str) -> None:
+        self._physics.set_device_mode(str(mode or "auto"))
+
+    def reset_physx_settings(self) -> None:
+        self._physics.reset_physx_settings()
+
+    def refresh_scene_explorer(self) -> None:
+        self._refresh_scene_explorer(force=True)
+
+    def select_scene_part(self, path: str) -> None:
+        text = str(path or "").strip()
+        if not text:
+            return
+        self.scene_part_selection_changed.emit(text)
+        self.status_msg.emit(f"Selected scene prim {text}")
+
+    def set_scene_part_property(self, path: str, property_name: str, value) -> None:
+        text = str(path or "").strip()
+        prop = str(property_name or "").strip()
+        if not text or not prop:
+            return
+        if self._renderer:
+            self._renderer.set_scene_part_property(text, prop, value)
 
     def shutdown(self, timeout_ms: int = 20000) -> bool:
         self._load_generation += 1
         self._loading_asset = False
         self._set_loading(False)
+        self._release_scene_explorer_process()
         self._physics.shutdown()
 
         if not self._renderer:
@@ -408,6 +473,7 @@ class ViewportWidget(QWidget):
         self._physics_current_transform = np.eye(4, dtype=np.float64)
         if self._renderer:
             self._renderer.set_collision_proxy_bounds(bounds)
+        self._refresh_scene_explorer()
         center = np.array(bounds.get("center", [0.0, 0.0, 0.0]), dtype=np.float64)
         extent = float(bounds.get("extent", 1.0))
         self._camera.frame_bounds(center, extent)
@@ -463,6 +529,167 @@ class ViewportWidget(QWidget):
         self.status_msg.emit(text)
         self.loading_changed.emit(True, text)
         self._set_loading(True, text, progress)
+
+    def _reset_scene_explorer(self, message: str) -> None:
+        self._release_scene_explorer_process()
+        self.scene_tree_changed.emit({"status": str(message or "Loading scene explorer data..."), "roots": []})
+
+    def _refresh_scene_explorer(self, force: bool = False) -> None:
+        items = list(self._current_scene_items or [])
+        if not items:
+            self.scene_tree_changed.emit({"status": "Load an asset to inspect the USD scene.", "roots": []})
+            return
+
+        refs = self._scene_asset_refs(items)
+        if not refs:
+            self.scene_tree_changed.emit(build_scene_tree(items, [], self._last_bounds or {}))
+            return
+
+        cached_payloads: list[dict] = []
+        missing = False
+        for ref in refs:
+            discovery = PhysicsController._cached_discovery(ref)
+            if discovery is None:
+                missing = True
+                cached_payloads.append({})
+            else:
+                cached_payloads.append(PhysicsController._discovery_to_payload(discovery))
+
+        if not missing and not force:
+            self.scene_tree_changed.emit(build_scene_tree(items, cached_payloads, self._last_bounds or {}))
+            return
+
+        self.scene_tree_changed.emit(build_scene_tree(items, cached_payloads, self._last_bounds or {}))
+        self._start_scene_explorer_discovery(refs)
+
+    def _start_scene_explorer_discovery(self, asset_refs: list[str]) -> None:
+        self._release_scene_explorer_process()
+        refs = [str(ref or "").strip() for ref in asset_refs if str(ref or "").strip()]
+        if not refs:
+            return
+
+        process = QProcess(self)
+        process.setWorkingDirectory(str(Path(__file__).resolve().parents[1]))
+        process.readyReadStandardOutput.connect(self._on_scene_explorer_stdout)
+        process.readyReadStandardError.connect(self._on_scene_explorer_stderr)
+        process.finished.connect(self._on_scene_explorer_finished)
+        self._scene_explorer_process = process
+        self._scene_explorer_buffer = ""
+        self._scene_explorer_error = ""
+        self._scene_explorer_refs = list(refs)
+        self._scene_explorer_generation = self._load_generation
+        args = ["-u", "-m", "core.physics_collider_discovery"]
+        if len(refs) > 1:
+            args.extend(["--multi", *refs])
+        else:
+            args.extend([refs[0], "/World/Asset"])
+        process.start(sys.executable, args)
+        if not process.waitForStarted(1000):
+            detail = process.errorString()
+            self._release_scene_explorer_process()
+            self.status_msg.emit(f"Scene explorer discovery could not start: {detail}")
+
+    def _on_scene_explorer_stdout(self) -> None:
+        process = self._scene_explorer_process
+        if process is None:
+            return
+        self._scene_explorer_buffer += bytes(process.readAllStandardOutput()).decode("utf-8", "replace")
+
+    def _on_scene_explorer_stderr(self) -> None:
+        process = self._scene_explorer_process
+        if process is None:
+            return
+        text = bytes(process.readAllStandardError()).decode("utf-8", "replace").strip()
+        if text:
+            self._scene_explorer_error = text
+
+    def _on_scene_explorer_finished(self, exit_code: int, _exit_status) -> None:
+        process = self._scene_explorer_process
+        refs = list(self._scene_explorer_refs)
+        generation = self._scene_explorer_generation
+        buffer = self._scene_explorer_buffer
+        error = self._scene_explorer_error
+        self._scene_explorer_process = None
+        self._scene_explorer_refs = []
+        self._scene_explorer_buffer = ""
+        self._scene_explorer_error = ""
+        if process is not None:
+            process.deleteLater()
+
+        if generation != self._load_generation or refs != self._scene_asset_refs(self._current_scene_items):
+            return
+
+        discoveries = self._scene_discoveries_from_stdout(buffer, len(refs))
+        if exit_code != 0 or discoveries is None:
+            detail = error.splitlines()[-1] if error else "no discovery payload returned"
+            self.status_msg.emit(f"Scene explorer is showing asset roots only; part discovery skipped ({detail}).")
+            discoveries = [{} for _ref in refs]
+        else:
+            for ref, payload in zip(refs, discoveries):
+                try:
+                    PhysicsController._store_discovery(ref, PhysicsController._discovery_from_payload(payload))
+                except Exception:
+                    pass
+
+        self.scene_tree_changed.emit(build_scene_tree(self._current_scene_items, discoveries, self._last_bounds or {}))
+
+    def _release_scene_explorer_process(self) -> None:
+        process = self._scene_explorer_process
+        self._scene_explorer_process = None
+        self._scene_explorer_refs = []
+        self._scene_explorer_buffer = ""
+        self._scene_explorer_error = ""
+        if process is None:
+            return
+        try:
+            try:
+                process.finished.disconnect(self._on_scene_explorer_finished)
+            except Exception:
+                pass
+            if process.state() == QProcess.Running:
+                process.terminate()
+                if not process.waitForFinished(1000):
+                    process.kill()
+                    process.waitForFinished(1000)
+        finally:
+            process.deleteLater()
+
+    @staticmethod
+    def _scene_asset_refs(items: list[dict]) -> list[str]:
+        refs: list[str] = []
+        try:
+            raw_items = list(items or [])
+        except TypeError:
+            raw_items = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "").strip()
+            if not source:
+                continue
+            refs.append(PhysicsController._usd_asset_reference(source))
+        return refs
+
+    @staticmethod
+    def _scene_discoveries_from_stdout(text: str, expected_count: int) -> Optional[list[dict]]:
+        payload = None
+        for line in reversed(str(text or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            return None
+        if "discoveries" in payload:
+            items = payload.get("discoveries")
+            if not isinstance(items, list) or len(items) != expected_count:
+                return None
+            return [item if isinstance(item, dict) else {} for item in items]
+        return [payload] if expected_count == 1 else None
 
     def _begin_first_frame_timer(self) -> None:
         self._first_frame_timer_start = time.perf_counter()
@@ -770,19 +997,7 @@ class ViewportWidget(QWidget):
         return self._camera.eye.copy(), direction / direction_norm
 
     def _scaled_grab_target(self, target: np.ndarray) -> np.ndarray:
-        amount = self._physics_grab_force_amount
-        if abs(amount - 1.0) < 1.0e-6:
-            return np.array(target, dtype=np.float64, copy=True)
-        offset = np.asarray(target, dtype=np.float64) - self._physics_grab_target_start
-        scaled = offset * amount
-        extent = 1.0
-        if self._last_bounds:
-            try:
-                extent = max(float(self._last_bounds.get("extent", extent)), 0.1)
-            except Exception:
-                extent = 1.0
-        limit = max(extent * MAX_GRAB_TARGET_EXTENTS, MIN_GRAB_TARGET_DISTANCE)
-        return self._physics_grab_target_start + self._clamp_vector(scaled, limit)
+        return np.array(target, dtype=np.float64, copy=True)
 
     def _finish_physics_grab(self, drop: bool, pos: Optional[QPoint] = None) -> None:
         if pos is not None:

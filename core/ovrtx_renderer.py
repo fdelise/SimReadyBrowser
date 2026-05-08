@@ -64,6 +64,7 @@ COLLISION_OBSTACLE_PATHS = [
 DEFAULT_FRAME_BOUNDS = {"center": [0.0, 0.0, 0.0], "extent": 1.0}
 STAGE_UP_AXIS = "Z"
 STAGE_METERS_PER_UNIT = 1
+STAGE_FRAMES_PER_SECOND = 60
 GROUND_PLANE_HALF_SIZE = 20.0
 GROUND_PLANE_Z = -0.005
 GROUND_COLLIDER_THICKNESS = 0.5
@@ -126,6 +127,7 @@ class OVRTXRenderer(QObject):
     _base_scene_requested = pyqtSignal(str)
     _collision_overlay_requested = pyqtSignal(bool)
     _collision_bounds_requested = pyqtSignal(object)
+    _scene_part_property_requested = pyqtSignal(str, str, object)
     _dome_intensity_requested = pyqtSignal(float)
     _dir_light_requested = pyqtSignal(float, float, float)
     _render_requested = pyqtSignal()
@@ -166,6 +168,8 @@ class OVRTXRenderer(QObject):
         self._physics_body_transform_dirty = False
         self._physics_body_reset_paths: set[str] = set()
         self._physics_body_transform_warning_shown = False
+        self._scene_part_overrides: dict[str, dict] = {}
+        self._scene_part_warning_shown = False
         self._base_scene = "plane"
         self._base_scene_dirty = True
         self._collision_overlay_enabled = False
@@ -207,6 +211,7 @@ class OVRTXRenderer(QObject):
         self._base_scene_requested.connect(self._set_base_scene, Qt.QueuedConnection)
         self._collision_overlay_requested.connect(self._set_collision_overlay_enabled, Qt.QueuedConnection)
         self._collision_bounds_requested.connect(self._set_collision_proxy_bounds, Qt.QueuedConnection)
+        self._scene_part_property_requested.connect(self._set_scene_part_property, Qt.QueuedConnection)
         self._dome_intensity_requested.connect(self._set_dome_intensity, Qt.QueuedConnection)
         self._dir_light_requested.connect(self._set_directional_light, Qt.QueuedConnection)
         self._render_requested.connect(self._render_one, Qt.QueuedConnection)
@@ -273,6 +278,11 @@ class OVRTXRenderer(QObject):
         if self._shutdown_started:
             return
         self._collision_bounds_requested.emit(dict(bounds or {}))
+
+    def set_scene_part_property(self, path: str, property_name: str, value) -> None:
+        if self._shutdown_started:
+            return
+        self._scene_part_property_requested.emit(str(path or ""), str(property_name or ""), value)
 
     def set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
@@ -389,6 +399,8 @@ class OVRTXRenderer(QObject):
             self._physics_body_transform_dirty = False
             self._physics_body_reset_paths = set()
             self._physics_body_transform_warning_shown = False
+            self._scene_part_overrides = {}
+            self._scene_part_warning_shown = False
             self._release_collision_overlay_process()
             self._collision_asset_overlay_loaded = False
             self._collision_asset_overlay_path = None
@@ -468,6 +480,8 @@ class OVRTXRenderer(QObject):
         return f"""#usda 1.0
 (
     defaultPrim = "SimReadyStageSettings"
+    framesPerSecond = {STAGE_FRAMES_PER_SECOND}
+    timeCodesPerSecond = {STAGE_FRAMES_PER_SECOND}
     metersPerUnit = {STAGE_METERS_PER_UNIT}
     upAxis = "{STAGE_UP_AXIS}"
 )
@@ -659,6 +673,8 @@ def Scope "SimReadyStageSettings"
         return f"""#usda 1.0
 (
     defaultPrim = "SimReadyReview"
+    framesPerSecond = {STAGE_FRAMES_PER_SECOND}
+    timeCodesPerSecond = {STAGE_FRAMES_PER_SECOND}
     metersPerUnit = {STAGE_METERS_PER_UNIT}
     upAxis = "{STAGE_UP_AXIS}"
 )
@@ -881,6 +897,32 @@ def Xform "SimReadyReview"
         self._collision_overlay_dirty = True
         self._apply_collision_overlay()
 
+    def _set_scene_part_property(self, path: str, property_name: str, value) -> None:
+        if self._shutdown_started or not self._stage_loaded:
+            return
+        render_path = self._render_path_from_physics_path(path)
+        if not render_path:
+            return
+
+        prop = str(property_name or "").strip()
+        overrides = self._scene_part_overrides.setdefault(render_path, self._scene_part_default_override())
+        if prop == "reset":
+            if isinstance(value, dict):
+                overrides = self._scene_part_default_override(value)
+            else:
+                overrides = self._scene_part_default_override()
+            self._scene_part_overrides[render_path] = overrides
+        elif prop == "visible":
+            overrides["visible"] = bool(value)
+        elif prop in {"translate", "rotate", "scale"}:
+            fallback = [1.0, 1.0, 1.0] if prop == "scale" else [0.0, 0.0, 0.0]
+            overrides[prop] = self._normalize_scene_vector(value, fallback)
+        else:
+            return
+
+        self._apply_scene_part_override(render_path, overrides)
+        self._render_one()
+
     def _set_dome_intensity(self, value: float) -> None:
         if self._shutdown_started:
             return
@@ -1048,6 +1090,39 @@ def Xform "SimReadyReview"
             if applied <= 0 and not self._physics_body_transform_warning_shown:
                 self._physics_body_transform_warning_shown = True
                 self.status_changed.emit(f"Per-body physics transform update skipped: {last_exc}")
+
+    def _apply_scene_part_override(self, render_path: str, override: dict) -> None:
+        if not self._renderer or not self._stage_loaded:
+            return
+        try:
+            matrix = self._compose_scene_part_matrix(
+                override.get("translate"),
+                override.get("rotate"),
+                override.get("scale"),
+            )
+            self._renderer.write_attribute(
+                prim_paths=[render_path],
+                attribute_name="omni:resetXformStack",
+                tensor=np.ones(1, dtype=np.bool_),
+                prim_mode=PrimMode.CREATE_NEW,
+            )
+            self._renderer.write_attribute(
+                prim_paths=[render_path],
+                attribute_name="omni:xform",
+                tensor=matrix.reshape(1, 4, 4),
+                semantic=Semantic.XFORM_MAT4x4,
+                prim_mode=PrimMode.MUST_EXIST,
+            )
+            self._renderer.write_attribute(
+                prim_paths=[render_path],
+                attribute_name="visibility",
+                tensor=["inherited" if bool(override.get("visible", True)) else "invisible"],
+                prim_mode=PrimMode.CREATE_NEW,
+            )
+        except Exception as exc:
+            if not self._scene_part_warning_shown:
+                self._scene_part_warning_shown = True
+                self.status_changed.emit(f"Scene prim edit skipped for {render_path}: {exc}")
 
     def _apply_base_scene(self) -> None:
         if not self._renderer or not self._stage_loaded:
@@ -1398,6 +1473,67 @@ def Xform "SimReadyReview"
             if text.startswith(f"{physics_root}/"):
                 return render_root + text[len(physics_root) :]
         return ""
+
+    @staticmethod
+    def _scene_part_default_override(values: Optional[dict] = None) -> dict:
+        values = values if isinstance(values, dict) else {}
+        return {
+            "visible": bool(values.get("visible", True)),
+            "translate": OVRTXRenderer._normalize_scene_vector(values.get("translate"), [0.0, 0.0, 0.0]),
+            "rotate": OVRTXRenderer._normalize_scene_vector(values.get("rotate"), [0.0, 0.0, 0.0]),
+            "scale": OVRTXRenderer._normalize_scene_vector(values.get("scale"), [1.0, 1.0, 1.0]),
+        }
+
+    @staticmethod
+    def _normalize_scene_vector(value, fallback: list[float]) -> list[float]:
+        try:
+            values = list(value)
+        except TypeError:
+            values = list(fallback)
+        values = (values + list(fallback))[:3]
+        result: list[float] = []
+        for index, item in enumerate(values):
+            try:
+                number = float(item)
+            except Exception:
+                number = float(fallback[index])
+            if not math.isfinite(number):
+                number = float(fallback[index])
+            result.append(number)
+        return result
+
+    @staticmethod
+    def _compose_scene_part_matrix(translate, rotate, scale) -> np.ndarray:
+        t = OVRTXRenderer._normalize_scene_vector(translate, [0.0, 0.0, 0.0])
+        r = OVRTXRenderer._normalize_scene_vector(rotate, [0.0, 0.0, 0.0])
+        s = OVRTXRenderer._normalize_scene_vector(scale, [1.0, 1.0, 1.0])
+        matrix = np.eye(4, dtype=np.float64)
+        matrix[0, 0] = max(abs(float(s[0])), 0.001)
+        matrix[1, 1] = max(abs(float(s[1])), 0.001)
+        matrix[2, 2] = max(abs(float(s[2])), 0.001)
+        matrix = matrix @ OVRTXRenderer._row_rotation_matrix(float(r[0]), float(r[1]), float(r[2]))
+        matrix[3, :3] = [float(t[0]), float(t[1]), float(t[2])]
+        return matrix
+
+    @staticmethod
+    def _row_rotation_matrix(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+        rx, ry, rz = [math.radians(v) for v in (rx_deg, ry_deg, rz_deg)]
+        cx, sx = math.cos(rx), math.sin(rx)
+        cy, sy = math.cos(ry), math.sin(ry)
+        cz, sz = math.cos(rz), math.sin(rz)
+        rx_m = np.array(
+            [[1.0, 0.0, 0.0, 0.0], [0.0, cx, sx, 0.0], [0.0, -sx, cx, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        ry_m = np.array(
+            [[cy, 0.0, -sy, 0.0], [0.0, 1.0, 0.0, 0.0], [sy, 0.0, cy, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        rz_m = np.array(
+            [[cz, sz, 0.0, 0.0], [-sz, cz, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        return rx_m @ ry_m @ rz_m
 
     @staticmethod
     def _normalize_stage_items(items) -> list[dict]:

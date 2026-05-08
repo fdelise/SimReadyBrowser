@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QSettings, Qt, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -28,6 +28,9 @@ from PyQt5.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +44,18 @@ from styles.nvidia_theme import (
     COLOR_TEXT_PRIMARY,
     COLOR_TEXT_SECONDARY,
 )
+
+
+PHYSX_DEFAULT_CCD = False
+PHYSX_DEFAULT_STEPS_PER_SECOND = 60
+PHYSX_MIN_STEPS_PER_SECOND = 15
+PHYSX_MAX_STEPS_PER_SECOND = 240
+PHYSX_DEFAULT_SUBSTEPS = 1
+PHYSX_OLD_DEFAULT_SUBSTEPS = 4
+PHYSX_MIN_SUBSTEPS = 1
+PHYSX_MAX_SUBSTEPS = 16
+PHYSX_DEFAULT_DEVICE = "gpu"
+PHYSX_SETTINGS_VERSION = 2
 
 
 class ControlsPanel(QWidget):
@@ -68,16 +83,33 @@ class ControlsPanel(QWidget):
     physics_collision_vis_changed = pyqtSignal(bool)
     physics_grab_force_changed = pyqtSignal(float)
     physics_ccd_changed = pyqtSignal(bool)
+    physics_steps_changed = pyqtSignal(int)
+    physics_substeps_changed = pyqtSignal(int)
+    physics_device_changed = pyqtSignal(str)
+    physics_settings_reset_requested = pyqtSignal()
+    physics_engine_restart_requested = pyqtSignal()
     physics_drop_options_changed = pyqtSignal(float, float)
+    scene_part_selected = pyqtSignal(str)
+    scene_part_property_changed = pyqtSignal(str, str, object)
+    scene_explorer_refresh_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_asset: Optional[AssetInfo] = None
+        self._settings = QSettings("NVIDIA Corporation", "NVIDIA SimReady Browser")
+        self._loading_physx_settings = False
+        self._scene_nodes_by_path: dict[str, dict] = {}
+        self._scene_items_by_path: dict[str, QTreeWidgetItem] = {}
+        self._scene_default_properties_by_path: dict[str, dict] = {}
+        self._scene_edit_properties_by_path: dict[str, dict] = {}
+        self._selected_scene_path = ""
+        self._updating_scene_ui = False
         self._build_ui()
+        self._load_physx_settings()
 
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        self.setMinimumWidth(240)
-        self.setMaximumWidth(300)
+        self.setMinimumWidth(280)
+        self.setMaximumWidth(380)
 
     # ── UI ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +118,19 @@ class ControlsPanel(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+        self._tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: 1px solid {COLOR_BORDER}; background: {COLOR_BG_PANEL}; }}"
+            "QTabBar::tab { background: #202020; color: #b8b8b8; padding: 7px 9px; "
+            "border: 1px solid #333; border-bottom: none; }"
+            f"QTabBar::tab:selected {{ color: {COLOR_ACCENT}; background: #151515; }}"
+        )
+        self._tabs.addTab(self._build_app_settings_tab(), "App Settings")
+        self._tabs.addTab(self._build_scene_explorer_tab(), "Scene Explorer")
+        root.addWidget(self._tabs)
+
+    def _build_app_settings_tab(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -104,7 +149,123 @@ class ControlsPanel(QWidget):
         inner_layout.addStretch(1)
 
         scroll.setWidget(inner)
-        root.addWidget(scroll)
+        return scroll
+
+    def _build_scene_explorer_tab(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet("background: transparent;")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(8)
+
+        header_row = QHBoxLayout()
+        self._scene_status = QLabel("Load an asset to inspect the USD scene.")
+        self._scene_status.setWordWrap(True)
+        self._scene_status.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        header_row.addWidget(self._scene_status, 1)
+
+        refresh_btn = _small_button("Refresh")
+        refresh_btn.setToolTip("Refresh scene parts from the loaded USD asset.")
+        refresh_btn.clicked.connect(self.scene_explorer_refresh_requested)
+        header_row.addWidget(refresh_btn)
+
+        header_widget = QWidget()
+        header_widget.setStyleSheet("background: transparent;")
+        header_widget.setLayout(header_row)
+        lay.addWidget(header_widget)
+
+        self._scene_tree = QTreeWidget()
+        self._scene_tree.setHeaderLabels(["Prim", "Type"])
+        self._scene_tree.setRootIsDecorated(True)
+        self._scene_tree.setUniformRowHeights(True)
+        self._scene_tree.setAlternatingRowColors(False)
+        self._scene_tree.setColumnWidth(0, 185)
+        self._scene_tree.setStyleSheet(
+            f"QTreeWidget {{ background: #141414; border: 1px solid {COLOR_BORDER}; "
+            f"color: {COLOR_TEXT_PRIMARY}; font-size: 10px; }}"
+            f"QTreeWidget::item:selected {{ background: {COLOR_ACCENT}; color: #101010; }}"
+            "QHeaderView::section { background: #202020; color: #b8b8b8; border: none; padding: 4px; }"
+        )
+        self._scene_tree.itemSelectionChanged.connect(self._on_scene_tree_selection_changed)
+        lay.addWidget(self._scene_tree, 1)
+
+        self._scene_properties_group = QGroupBox("Selected Prim")
+        prop_lay = QFormLayout(self._scene_properties_group)
+        prop_lay.setSpacing(8)
+        prop_lay.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        prop_lay.setFormAlignment(Qt.AlignTop)
+        prop_lay.setContentsMargins(10, 30, 10, 10)
+
+        self._scene_name_value = self._scene_value_label()
+        self._scene_type_value = self._scene_value_label()
+        self._scene_path_value = self._scene_value_label(font_size=9, color=COLOR_TEXT_DISABLED)
+        self._scene_physics_value = self._scene_value_label(font_size=9, color=COLOR_TEXT_DISABLED)
+        prop_lay.addRow(_label("Name:"), self._scene_name_value)
+        prop_lay.addRow(_label("Type:"), self._scene_type_value)
+        prop_lay.addRow(_label("Path:"), self._scene_path_value)
+        prop_lay.addRow(_label("Physics:"), self._scene_physics_value)
+
+        self._scene_visible = QCheckBox("Visible")
+        self._scene_visible.setToolTip("Authors a viewport visibility override on the selected prim.")
+        self._scene_visible.toggled.connect(lambda checked: self._emit_scene_scalar_property("visible", bool(checked)))
+        prop_lay.addRow(_label("Vis:"), self._scene_visible)
+
+        self._scene_translate_spins, translate_row = self._scene_vector_row(-100000.0, 100000.0, 0.1, 3)
+        self._scene_rotate_spins, rotate_row = self._scene_vector_row(-3600.0, 3600.0, 1.0, 2)
+        self._scene_scale_spins, scale_row = self._scene_vector_row(0.001, 1000.0, 0.05, 3)
+        for spin in self._scene_translate_spins:
+            spin.valueChanged.connect(lambda _value: self._emit_scene_vector_property("translate"))
+        for spin in self._scene_rotate_spins:
+            spin.valueChanged.connect(lambda _value: self._emit_scene_vector_property("rotate"))
+        for spin in self._scene_scale_spins:
+            spin.valueChanged.connect(lambda _value: self._emit_scene_vector_property("scale"))
+        prop_lay.addRow(_label("T:"), translate_row)
+        prop_lay.addRow(_label("R:"), rotate_row)
+        prop_lay.addRow(_label("S:"), scale_row)
+
+        reset_part_btn = _small_button("Reset Prim Edits")
+        reset_part_btn.setToolTip("Restore the selected prim to the transform values discovered for this scene load.")
+        reset_part_btn.clicked.connect(self._reset_scene_part_edits)
+        prop_lay.addRow(reset_part_btn)
+
+        self._scene_properties_group.setEnabled(False)
+        lay.addWidget(self._scene_properties_group)
+
+        self.clear_scene_tree()
+        return page
+
+    def _scene_value_label(self, text: str = "-", font_size: int = 10, color: str = COLOR_TEXT_PRIMARY) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet(f"color: {color}; font-size: {font_size}px; background: transparent;")
+        return lbl
+
+    def _scene_vector_row(
+        self,
+        minimum: float,
+        maximum: float,
+        step: float,
+        decimals: int,
+    ) -> tuple[list[QDoubleSpinBox], QWidget]:
+        row_widget = QWidget()
+        row_widget.setStyleSheet("background: transparent;")
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        spins: list[QDoubleSpinBox] = []
+        for axis in ("X", "Y", "Z"):
+            spin = QDoubleSpinBox()
+            spin.setRange(float(minimum), float(maximum))
+            spin.setDecimals(decimals)
+            spin.setSingleStep(float(step))
+            spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+            spin.setMinimumWidth(58)
+            spin.setToolTip(axis)
+            row.addWidget(spin)
+            spins.append(spin)
+        return spins, row_widget
 
     # ── Lighting ───────────────────────────────────────────────────────────────
 
@@ -233,7 +394,7 @@ class ControlsPanel(QWidget):
         self._physics_grab_force.setSingleStep(1.0)
         self._physics_grab_force.setValue(2.0)
         self._physics_grab_force.setSuffix("x")
-        self._physics_grab_force.setToolTip("Higher values pull harder and need less mouse travel while grabbing.")
+        self._physics_grab_force.setToolTip("Higher values pull harder toward the cursor while grabbing.")
         self._physics_grab_force.valueChanged.connect(
             lambda value: self.physics_grab_force_changed.emit(float(value))
         )
@@ -243,6 +404,60 @@ class ControlsPanel(QWidget):
         force_widget.setStyleSheet("background: transparent;")
         force_widget.setLayout(force_row)
         lay.addWidget(force_widget)
+
+        device_row = QHBoxLayout()
+        device_label = QLabel("Device:")
+        device_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        device_row.addWidget(device_label)
+
+        self._physics_device = QComboBox()
+        self._physics_device.addItem("Auto", "auto")
+        self._physics_device.addItem("CPU", "cpu")
+        self._physics_device.addItem("GPU", "gpu")
+        self._physics_device.setToolTip("Selects the OVPhysX device mode used when the PhysX worker starts.")
+        self._physics_device.currentIndexChanged.connect(lambda _idx: self._on_physx_device_changed())
+        device_row.addWidget(self._physics_device, 1)
+
+        device_widget = QWidget()
+        device_widget.setStyleSheet("background: transparent;")
+        device_widget.setLayout(device_row)
+        lay.addWidget(device_widget)
+
+        steps_row = QHBoxLayout()
+        steps_label = QLabel("Steps/s:")
+        steps_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        steps_row.addWidget(steps_label)
+
+        self._physics_steps = QSpinBox()
+        self._physics_steps.setRange(PHYSX_MIN_STEPS_PER_SECOND, PHYSX_MAX_STEPS_PER_SECOND)
+        self._physics_steps.setValue(PHYSX_DEFAULT_STEPS_PER_SECOND)
+        self._physics_steps.setSingleStep(5)
+        self._physics_steps.setToolTip("Authors physxScene:timeStepsPerSecond and drives the simulation dt.")
+        self._physics_steps.valueChanged.connect(lambda value: self._on_physx_steps_changed(int(value)))
+        steps_row.addWidget(self._physics_steps, 1)
+
+        substeps_label = QLabel("Sub:")
+        substeps_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; background: transparent;"
+        )
+        steps_row.addWidget(substeps_label)
+
+        self._physics_substeps = QSpinBox()
+        self._physics_substeps.setRange(PHYSX_MIN_SUBSTEPS, PHYSX_MAX_SUBSTEPS)
+        self._physics_substeps.setValue(PHYSX_DEFAULT_SUBSTEPS)
+        self._physics_substeps.setSingleStep(1)
+        self._physics_substeps.setToolTip("Runs this many PhysX substeps for each displayed simulation step.")
+        self._physics_substeps.valueChanged.connect(lambda value: self._on_physx_substeps_changed(int(value)))
+        steps_row.addWidget(self._physics_substeps, 1)
+
+        steps_widget = QWidget()
+        steps_widget.setStyleSheet("background: transparent;")
+        steps_widget.setLayout(steps_row)
+        lay.addWidget(steps_widget)
 
         self._physics_play = QCheckBox("Play physics")
         self._physics_play.toggled.connect(self.physics_play_changed)
@@ -254,9 +469,10 @@ class ControlsPanel(QWidget):
 
         self._physics_ccd = QCheckBox("CCD continuous collision")
         self._physics_ccd.setToolTip(
-            "Authors scene-level PhysX continuous collision detection on the next physics scene start."
+            "Globally authors scene-level and rigid-body PhysX continuous collision detection; changing it restarts the active physics scene."
         )
-        self._physics_ccd.toggled.connect(self.physics_ccd_changed)
+        self._physics_ccd.setChecked(PHYSX_DEFAULT_CCD)
+        self._physics_ccd.toggled.connect(self._on_physx_ccd_changed)
         lay.addWidget(self._physics_ccd)
 
         drop_count_row = QHBoxLayout()
@@ -332,6 +548,22 @@ class ControlsPanel(QWidget):
         row_widget.setStyleSheet("background: transparent;")
         row_widget.setLayout(button_row)
         lay.addWidget(row_widget)
+
+        engine_row = QHBoxLayout()
+        reset_settings_btn = _small_button("Reset Defaults")
+        reset_settings_btn.setToolTip("Restore PhysX defaults: GPU device, 60 steps/s, 1 substep, CCD off.")
+        reset_settings_btn.clicked.connect(self._reset_physx_settings)
+        engine_row.addWidget(reset_settings_btn)
+
+        restart_engine_btn = _small_button("Restart Engine")
+        restart_engine_btn.setToolTip("Stops the current OVPhysX worker and starts a new one with the selected settings.")
+        restart_engine_btn.clicked.connect(self.physics_engine_restart_requested)
+        engine_row.addWidget(restart_engine_btn)
+
+        engine_widget = QWidget()
+        engine_widget.setStyleSheet("background: transparent;")
+        engine_widget.setLayout(engine_row)
+        lay.addWidget(engine_widget)
 
         return grp
 
@@ -473,15 +705,289 @@ class ControlsPanel(QWidget):
         self._physics_play.setChecked(bool(running))
         self._physics_play.blockSignals(old)
 
+    def clear_scene_tree(self, message: str = "Load an asset to inspect the USD scene.") -> None:
+        self.set_scene_tree({"status": message, "roots": []})
+
+    def set_scene_tree(self, payload) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        roots = data.get("roots", []) if isinstance(data.get("roots", []), list) else []
+        status = str(data.get("status") or "Load an asset to inspect the USD scene.")
+
+        self._updating_scene_ui = True
+        try:
+            self._scene_tree.clear()
+            self._scene_nodes_by_path.clear()
+            self._scene_items_by_path.clear()
+            self._scene_default_properties_by_path.clear()
+            self._scene_edit_properties_by_path.clear()
+            self._selected_scene_path = ""
+            self._scene_status.setText(status)
+
+            if not roots:
+                placeholder = QTreeWidgetItem(["No scene loaded", ""])
+                placeholder.setFlags(placeholder.flags() & ~Qt.ItemIsSelectable)
+                self._scene_tree.addTopLevelItem(placeholder)
+                self._clear_scene_properties()
+                return
+
+            for root in roots:
+                if isinstance(root, dict):
+                    self._add_scene_tree_node(root)
+            self._scene_tree.expandToDepth(1)
+            self._scene_tree.resizeColumnToContents(1)
+            self._clear_scene_properties()
+        finally:
+            self._updating_scene_ui = False
+
+    def set_selected_scene_part(self, path: str) -> None:
+        text = str(path or "").strip()
+        item = self._scene_items_by_path.get(text)
+        if item is None:
+            return
+        self._updating_scene_ui = True
+        try:
+            self._scene_tree.setCurrentItem(item)
+            node = self._scene_nodes_by_path.get(text, {})
+            self._selected_scene_path = text
+            self._show_scene_properties(node)
+        finally:
+            self._updating_scene_ui = False
+
+    def physics_settings(self) -> dict:
+        return {
+            "ccd_enabled": bool(self._physics_ccd.isChecked()),
+            "steps_per_second": int(self._physics_steps.value()),
+            "substeps": int(self._physics_substeps.value()),
+            "device_mode": str(self._physics_device.currentData() or PHYSX_DEFAULT_DEVICE),
+        }
+
+    def _load_physx_settings(self) -> None:
+        self._loading_physx_settings = True
+        try:
+            self._settings.remove("physics/ccd_enabled")
+            steps = self._settings.value(
+                "physics/steps_per_second",
+                PHYSX_DEFAULT_STEPS_PER_SECOND,
+                type=int,
+            )
+            settings_version = self._settings.value("physics/settings_version", 0, type=int)
+            substeps = self._settings.value("physics/substeps", PHYSX_DEFAULT_SUBSTEPS, type=int)
+            if int(settings_version or 0) < PHYSX_SETTINGS_VERSION and int(substeps) == PHYSX_OLD_DEFAULT_SUBSTEPS:
+                substeps = PHYSX_DEFAULT_SUBSTEPS
+            device = str(self._settings.value("physics/device_mode", PHYSX_DEFAULT_DEVICE) or PHYSX_DEFAULT_DEVICE)
+
+            self._set_check_silently(self._physics_ccd, PHYSX_DEFAULT_CCD)
+            self._set_spin_silently(
+                self._physics_steps,
+                max(PHYSX_MIN_STEPS_PER_SECOND, min(int(steps), PHYSX_MAX_STEPS_PER_SECOND)),
+            )
+            self._set_spin_silently(
+                self._physics_substeps,
+                max(PHYSX_MIN_SUBSTEPS, min(int(substeps), PHYSX_MAX_SUBSTEPS)),
+            )
+            self._set_device_silently(device)
+            self._settings.setValue("physics/settings_version", PHYSX_SETTINGS_VERSION)
+            if int(substeps) == PHYSX_DEFAULT_SUBSTEPS:
+                self._settings.setValue("physics/substeps", PHYSX_DEFAULT_SUBSTEPS)
+        finally:
+            self._loading_physx_settings = False
+
+    def _save_physx_settings(self) -> None:
+        settings = self.physics_settings()
+        self._settings.remove("physics/ccd_enabled")
+        self._settings.setValue("physics/settings_version", PHYSX_SETTINGS_VERSION)
+        self._settings.setValue("physics/steps_per_second", settings["steps_per_second"])
+        self._settings.setValue("physics/substeps", settings["substeps"])
+        self._settings.setValue("physics/device_mode", settings["device_mode"])
+
+    def _on_physx_ccd_changed(self, enabled: bool) -> None:
+        self._settings.remove("physics/ccd_enabled")
+        self.physics_ccd_changed.emit(bool(enabled))
+
+    def _on_physx_steps_changed(self, value: int) -> None:
+        if not self._loading_physx_settings:
+            self._save_physx_settings()
+        self.physics_steps_changed.emit(int(value))
+
+    def _on_physx_substeps_changed(self, value: int) -> None:
+        if not self._loading_physx_settings:
+            self._save_physx_settings()
+        self.physics_substeps_changed.emit(int(value))
+
+    def _on_physx_device_changed(self) -> None:
+        mode = str(self._physics_device.currentData() or PHYSX_DEFAULT_DEVICE)
+        if not self._loading_physx_settings:
+            self._save_physx_settings()
+        self.physics_device_changed.emit(mode)
+
+    def _reset_physx_settings(self) -> None:
+        self._loading_physx_settings = True
+        try:
+            self._set_check_silently(self._physics_ccd, PHYSX_DEFAULT_CCD)
+            self._set_spin_silently(self._physics_steps, PHYSX_DEFAULT_STEPS_PER_SECOND)
+            self._set_spin_silently(self._physics_substeps, PHYSX_DEFAULT_SUBSTEPS)
+            self._set_device_silently(PHYSX_DEFAULT_DEVICE)
+        finally:
+            self._loading_physx_settings = False
+        self._save_physx_settings()
+        self.physics_settings_reset_requested.emit()
+
     def _emit_drop_options(self):
         self.physics_drop_options_changed.emit(
             float(self._physics_drop_spacing.value()),
             float(self._physics_drop_random.value()),
         )
 
+    @staticmethod
+    def _set_spin_silently(widget, value: int) -> None:
+        old = widget.blockSignals(True)
+        widget.setValue(int(value))
+        widget.blockSignals(old)
+
+    @staticmethod
+    def _set_check_silently(widget, value: bool) -> None:
+        old = widget.blockSignals(True)
+        widget.setChecked(bool(value))
+        widget.blockSignals(old)
+
+    def _set_device_silently(self, value: str) -> None:
+        mode = str(value or PHYSX_DEFAULT_DEVICE).strip().lower()
+        if mode.startswith("cuda"):
+            mode = "gpu"
+        index = self._physics_device.findData(mode)
+        if index < 0:
+            index = self._physics_device.findData(PHYSX_DEFAULT_DEVICE)
+        old = self._physics_device.blockSignals(True)
+        self._physics_device.setCurrentIndex(max(0, index))
+        self._physics_device.blockSignals(old)
+
     def _request_load(self):
         if self._current_asset:
             self.load_asset_requested.emit(self._current_asset)
+
+    def _add_scene_tree_node(self, node: dict, parent: Optional[QTreeWidgetItem] = None) -> QTreeWidgetItem:
+        name = str(node.get("name") or node.get("path") or "Prim")
+        type_name = str(node.get("type") or "Xform")
+        path = str(node.get("path") or "")
+        item = QTreeWidgetItem([name, type_name])
+        item.setData(0, Qt.UserRole, path)
+        if parent is None:
+            self._scene_tree.addTopLevelItem(item)
+        else:
+            parent.addChild(item)
+        if path:
+            self._scene_nodes_by_path[path] = node
+            self._scene_items_by_path[path] = item
+            props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+            self._scene_default_properties_by_path[path] = dict(props)
+        for child in node.get("children", []) or []:
+            if isinstance(child, dict):
+                self._add_scene_tree_node(child, item)
+        return item
+
+    def _on_scene_tree_selection_changed(self) -> None:
+        if self._updating_scene_ui:
+            return
+        items = self._scene_tree.selectedItems()
+        if not items:
+            self._clear_scene_properties()
+            return
+        path = str(items[0].data(0, Qt.UserRole) or "")
+        node = self._scene_nodes_by_path.get(path, {})
+        self._selected_scene_path = path
+        self._show_scene_properties(node)
+        if path:
+            self.scene_part_selected.emit(path)
+
+    def _show_scene_properties(self, node: dict) -> None:
+        if not node:
+            self._clear_scene_properties()
+            return
+        path = str(node.get("path") or "")
+        props = self._scene_properties_for_path(path)
+        self._scene_properties_group.setEnabled(bool(path))
+        self._scene_name_value.setText(str(node.get("name") or "-"))
+        self._scene_type_value.setText(str(node.get("type") or "-"))
+        self._scene_path_value.setText(path or "-")
+        self._scene_physics_value.setText(str(node.get("physics_path") or "-"))
+        self._set_check_silently(self._scene_visible, bool(props.get("visible", True)))
+        self._set_scene_vector_silently(self._scene_translate_spins, props.get("translate"), [0.0, 0.0, 0.0])
+        self._set_scene_vector_silently(self._scene_rotate_spins, props.get("rotate"), [0.0, 0.0, 0.0])
+        self._set_scene_vector_silently(self._scene_scale_spins, props.get("scale"), [1.0, 1.0, 1.0])
+
+    def _clear_scene_properties(self) -> None:
+        self._selected_scene_path = ""
+        self._scene_properties_group.setEnabled(False)
+        self._scene_name_value.setText("-")
+        self._scene_type_value.setText("-")
+        self._scene_path_value.setText("-")
+        self._scene_physics_value.setText("-")
+        self._set_check_silently(self._scene_visible, True)
+        self._set_scene_vector_silently(self._scene_translate_spins, None, [0.0, 0.0, 0.0])
+        self._set_scene_vector_silently(self._scene_rotate_spins, None, [0.0, 0.0, 0.0])
+        self._set_scene_vector_silently(self._scene_scale_spins, None, [1.0, 1.0, 1.0])
+
+    def _emit_scene_scalar_property(self, property_name: str, value) -> None:
+        if self._updating_scene_ui or not self._selected_scene_path:
+            return
+        props = self._scene_properties_for_path(self._selected_scene_path)
+        props[str(property_name)] = value
+        self._scene_edit_properties_by_path[self._selected_scene_path] = props
+        self.scene_part_property_changed.emit(self._selected_scene_path, str(property_name), value)
+
+    def _emit_scene_vector_property(self, property_name: str) -> None:
+        if self._updating_scene_ui or not self._selected_scene_path:
+            return
+        spins = {
+            "translate": self._scene_translate_spins,
+            "rotate": self._scene_rotate_spins,
+            "scale": self._scene_scale_spins,
+        }.get(property_name)
+        if not spins:
+            return
+        values = [float(spin.value()) for spin in spins]
+        props = self._scene_properties_for_path(self._selected_scene_path)
+        props[property_name] = values
+        self._scene_edit_properties_by_path[self._selected_scene_path] = props
+        self.scene_part_property_changed.emit(
+            self._selected_scene_path,
+            property_name,
+            values,
+        )
+
+    def _reset_scene_part_edits(self) -> None:
+        if not self._selected_scene_path:
+            return
+        self._scene_edit_properties_by_path.pop(self._selected_scene_path, None)
+        node = self._scene_nodes_by_path.get(self._selected_scene_path, {})
+        self._show_scene_properties(node)
+        props = self._scene_properties_for_path(self._selected_scene_path)
+        self.scene_part_property_changed.emit(self._selected_scene_path, "reset", dict(props))
+
+    def _scene_properties_for_path(self, path: str) -> dict:
+        text = str(path or "")
+        if text in self._scene_edit_properties_by_path:
+            return dict(self._scene_edit_properties_by_path[text])
+        if text in self._scene_default_properties_by_path:
+            return dict(self._scene_default_properties_by_path[text])
+        node = self._scene_nodes_by_path.get(text, {})
+        props = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        return dict(props)
+
+    @staticmethod
+    def _set_scene_vector_silently(spins: list[QDoubleSpinBox], value, default: list[float]) -> None:
+        try:
+            values = list(value if value is not None else default)
+        except TypeError:
+            values = list(default)
+        values = (values + list(default))[:3]
+        for spin, item in zip(spins, values):
+            old = spin.blockSignals(True)
+            try:
+                spin.setValue(float(item))
+            except Exception:
+                spin.setValue(float(default[0]))
+            spin.blockSignals(old)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
