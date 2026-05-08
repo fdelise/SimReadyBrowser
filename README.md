@@ -138,6 +138,7 @@ Notes:
 
 - Open formats such as STEP, IGES, OBJ, FBX, glTF, STL, Parasolid, SAT, and Rhino do not need a CAD Converter license.
 - Proprietary CAD formats such as Creo, CATIA, NX, SolidWorks, Inventor, Solid Edge, and JT require the licensed Omniverse CAD Converter extension.
+- Creo/PTC versioned file names such as `part.prt.1` and `assembly.asm.3` are accepted by the CAD file picker and passed through to CAD2USD.
 - CAD2USD accepts the NVIDIA Kit EULA non-interactively with `OMNI_KIT_ACCEPT_EULA=yes`; SimReady Browser sets this for its converter subprocess.
 
 ## Running

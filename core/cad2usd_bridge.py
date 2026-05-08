@@ -51,9 +51,22 @@ CAD_EXTENSIONS = (
     ".xpr",
 )
 
+PTC_VERSIONED_EXTENSIONS = (
+    ".asm",
+    ".g",
+    ".neu",
+    ".prt",
+    ".xas",
+    ".xpr",
+)
+
+CAD_DIALOG_PATTERNS = tuple(f"*{ext}" for ext in CAD_EXTENSIONS) + tuple(
+    f"*{ext}.*" for ext in PTC_VERSIONED_EXTENSIONS
+)
+
 CAD_FILE_FILTER = (
     "CAD and 3D files ("
-    + " ".join(f"*{ext}" for ext in CAD_EXTENSIONS)
+    + " ".join(CAD_DIALOG_PATTERNS)
     + ");;All files (*.*)"
 )
 
@@ -103,8 +116,23 @@ def cad2usd_root_candidates(app_root: Optional[Path] = None) -> list[Path]:
     return unique
 
 
+def cad_file_extension(path: str | Path) -> str:
+    """Return the converter extension, including Creo names like part.prt.1."""
+    source = Path(path)
+    suffix = source.suffix.lower()
+    if suffix in CAD_EXTENSIONS:
+        return suffix
+
+    suffixes = [item.lower() for item in source.suffixes]
+    if len(suffixes) >= 2 and suffixes[-1][1:].isdigit():
+        versioned_suffix = suffixes[-2]
+        if versioned_suffix in PTC_VERSIONED_EXTENSIONS:
+            return versioned_suffix
+    return suffix
+
+
 def is_supported_cad_file(path: str | Path) -> bool:
-    return Path(path).suffix.lower() in CAD_EXTENSIONS
+    return cad_file_extension(path) in CAD_EXTENSIONS
 
 
 def make_cad_usd_output_path(input_path: str | Path, output_dir: str | Path) -> Path:
