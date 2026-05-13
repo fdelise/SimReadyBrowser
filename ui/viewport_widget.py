@@ -16,7 +16,14 @@ from PyQt5.QtWidgets import QLabel, QProgressBar, QSizePolicy, QVBoxLayout, QWid
 from core.camera_controller import SphericalCamera
 from core.physics_controller import PhysicsController
 from core.scene_explorer_model import build_scene_tree
-from styles.nvidia_theme import COLOR_ACCENT, COLOR_TEXT_SECONDARY, COLOR_VIEWPORT_BG
+from styles.nvidia_theme import (
+    COLOR_ACCENT,
+    COLOR_BG_WIDGET,
+    COLOR_BORDER,
+    COLOR_TEXT_PRIMARY,
+    COLOR_TEXT_SECONDARY,
+    COLOR_VIEWPORT_BG,
+)
 
 LOAD_START_DELAY_MS = 150
 CAMERA_FOCAL_LENGTH_MM = 24.0
@@ -52,6 +59,7 @@ class ViewportWidget(QWidget):
         self._active_mode: Optional[str] = None
         self._renderer = None
         self._pending_dome_intensity = 1.0
+        self._pending_dome_environment = "flat"
         self._pending_dir_light = (0.8, 45.0, 60.0)
         self._pending_base_scene = "plane"
         self._pending_collision_overlay = False
@@ -200,9 +208,12 @@ class ViewportWidget(QWidget):
             self._renderer.set_dome_intensity(value)
             self._renderer.request_render()
 
-    def set_dome_texture(self, path: Optional[str]) -> None:
-        # Reserved for HDRI support. The current injected review layer uses sky lighting.
-        _ = path
+    def set_dome_environment(self, mode: str) -> None:
+        value = str(mode or "flat")
+        self._pending_dome_environment = value
+        if self._renderer:
+            self._renderer.set_dome_environment(value)
+            self._renderer.request_render()
 
     def set_directional_light(self, intensity: float, azimuth: float, elevation: float) -> None:
         self._pending_dir_light = (intensity, azimuth, elevation)
@@ -397,6 +408,7 @@ class ViewportWidget(QWidget):
         renderer.set_resolution(size.width(), size.height())
         renderer.set_camera_transform(self._camera.get_transform())
         renderer.set_dome_intensity(self._pending_dome_intensity)
+        renderer.set_dome_environment(self._pending_dome_environment)
         renderer.set_directional_light(*self._pending_dir_light)
         renderer.set_base_scene(self._pending_base_scene)
         renderer.set_collision_overlay_enabled(self._pending_collision_overlay)
@@ -546,18 +558,12 @@ class ViewportWidget(QWidget):
             return
 
         cached_payloads: list[dict] = []
-        missing = False
         for ref in refs:
             discovery = PhysicsController._cached_discovery(ref)
             if discovery is None:
-                missing = True
                 cached_payloads.append({})
             else:
                 cached_payloads.append(PhysicsController._discovery_to_payload(discovery))
-
-        if not missing and not force:
-            self.scene_tree_changed.emit(build_scene_tree(items, cached_payloads, self._last_bounds or {}))
-            return
 
         self.scene_tree_changed.emit(build_scene_tree(items, cached_payloads, self._last_bounds or {}))
         self._start_scene_explorer_discovery(refs)
@@ -578,12 +584,13 @@ class ViewportWidget(QWidget):
         self._scene_explorer_error = ""
         self._scene_explorer_refs = list(refs)
         self._scene_explorer_generation = self._load_generation
-        args = ["-u", "-m", "core.physics_collider_discovery"]
+        helper_python = PhysicsController._usd_discovery_python() or sys.executable
+        args = ["-u", "-m", "core.usd_scene_discovery"]
         if len(refs) > 1:
             args.extend(["--multi", *refs])
         else:
             args.extend([refs[0], "/World/Asset"])
-        process.start(sys.executable, args)
+        process.start(helper_python, args)
         if not process.waitForStarted(1000):
             detail = process.errorString()
             self._release_scene_explorer_process()
@@ -1460,8 +1467,8 @@ class _ViewportLoadingOverlay(QWidget):
         self._bar.setTextVisible(True)
         self._bar.setFixedHeight(14)
         self._bar.setStyleSheet(
-            "QProgressBar { background: #2d2d2d; border: 1px solid #464646; "
-            "border-radius: 4px; color: #d8d8d8; text-align: center; font-size: 9px; }"
+            f"QProgressBar {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 5px; color: {COLOR_TEXT_PRIMARY}; text-align: center; font-size: 9px; }}"
             f"QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 3px; }}"
         )
         root.addWidget(self._bar)

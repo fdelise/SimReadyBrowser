@@ -12,6 +12,7 @@ import gc
 import hashlib
 import json
 import os
+import posixpath
 import random
 import re
 import struct
@@ -20,7 +21,9 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from pathlib import Path
+import xml.etree.ElementTree as ET
+import zlib
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 import numpy as np
@@ -73,6 +76,481 @@ HIDDEN_BASE_Z = -10000.0
 MAX_ASSET_INSTANCES = 100
 ENABLE_OVRTX_DEBUG_BOUNDS = os.environ.get("SIMREADY_OVRTX_DEBUG_BOUNDS") == "1"
 USD_DISCOVERY_PYTHON_ENV = "SIMREADY_USD_PYTHON"
+S3_RESOLVER_PROXY_DIR = Path(tempfile.gettempdir()) / "simready_browser_s3_resolver"
+USD_LAYER_EXTS = {".usd", ".usda", ".usdc"}
+USD_TEXT_LAYER_EXTS = {".usda"}
+S3_ASSET_REF_EXTS = {
+    ".bmp",
+    ".dds",
+    ".exr",
+    ".hdr",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tga",
+    ".tif",
+    ".tiff",
+    ".tx",
+    ".webp",
+}
+FLAT_DOME_ENV_NAME = "flat_dome_latlong_16x8.png"
+BLURRY_STUDIO_ENV_NAME = "studio_softbox_latlong_1024x512.hdr"
+AUTOMOTIVE_SHOW_ENV_NAME = "automotive_show_latlong_1024x512.hdr"
+OUTDOOR_DAY_ENV_NAME = "outdoor_day_latlong_1024x512.hdr"
+
+
+def _usd_discovery_python_path() -> Optional[str]:
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        os.environ.get(USD_DISCOVERY_PYTHON_ENV, ""),
+        str(root / ".usd_discovery_venv" / "Scripts" / "python.exe"),
+        str(root / ".usd_discovery_venv" / "bin" / "python"),
+    ]
+    current = Path(sys.executable).resolve() if hasattr(sys, "executable") else None
+    for item in candidates:
+        if not item:
+            continue
+        try:
+            resolved = Path(item).resolve()
+        except Exception:
+            continue
+        if not resolved.exists():
+            continue
+        if current is not None and resolved == current and not os.environ.get(USD_DISCOVERY_PYTHON_ENV):
+            continue
+        return str(resolved)
+    return None
+
+
+def _prepare_s3_resolver_proxy(source: str) -> tuple[str, int]:
+    """Mirror USD layers locally and rewrite case-mismatched S3 asset refs."""
+    parsed = urllib.parse.urlparse(str(source or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return str(source or ""), 0
+
+    root_key = urllib.parse.unquote(parsed.path.lstrip("/"))
+    if not root_key or Path(root_key).suffix.lower() not in USD_LAYER_EXTS:
+        return str(source or ""), 0
+
+    asset_root_key = root_key.rsplit("/", 1)[0] + "/"
+    object_keys = _list_s3_object_keys(parsed, asset_root_key)
+    if root_key not in object_keys:
+        return str(source or ""), 0
+
+    layer_keys = [
+        key
+        for key in sorted(object_keys)
+        if key.startswith(asset_root_key) and Path(key).suffix.lower() in USD_LAYER_EXTS
+    ]
+    if not layer_keys:
+        return str(source or ""), 0
+
+    digest = hashlib.sha1(str(source).encode("utf-8", "replace")).hexdigest()[:20]
+    proxy_root = S3_RESOLVER_PROXY_DIR / digest
+    proxy_root.mkdir(parents=True, exist_ok=True)
+
+    patches = 0
+    asset_keys_to_fetch: set[str] = set()
+    for key in layer_keys:
+        rel_key = key[len(asset_root_key) :]
+        if not rel_key or rel_key.startswith("../"):
+            continue
+        dest = proxy_root / Path(*PurePosixPath(rel_key).parts)
+        data = _fetch_s3_object(parsed, key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if _is_usd_text_layer(key, data):
+            text = data.decode("utf-8")
+            rewritten, count, refs = _rewrite_usd_asset_references_for_s3(
+                text,
+                layer_key=key,
+                asset_root_key=asset_root_key,
+                object_keys=object_keys,
+            )
+            patches += count
+            asset_keys_to_fetch.update(refs)
+            dest.write_text(rewritten, encoding="utf-8")
+        else:
+            dest.write_bytes(data)
+
+    for key in sorted(asset_keys_to_fetch):
+        if not key.startswith(asset_root_key):
+            continue
+        rel_key = key[len(asset_root_key) :]
+        if not rel_key or rel_key.startswith("../"):
+            continue
+        dest = proxy_root / Path(*PurePosixPath(rel_key).parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(_fetch_s3_object(parsed, key))
+
+    local_root = proxy_root / Path(*PurePosixPath(root_key[len(asset_root_key) :]).parts)
+    if not local_root.exists():
+        return str(source or ""), 0
+    return str(local_root), patches
+
+
+def _list_s3_object_keys(source_url: urllib.parse.ParseResult, prefix: str) -> set[str]:
+    keys: set[str] = set()
+    continuation: Optional[str] = None
+    base_url = f"{source_url.scheme}://{source_url.netloc}"
+    while True:
+        params = {
+            "list-type": "2",
+            "prefix": prefix,
+            "max-keys": "1000",
+        }
+        if continuation:
+            params["continuation-token"] = continuation
+        url = f"{base_url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "SimReadyBrowser/1.0"})
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            xml_data = resp.read()
+
+        root = ET.fromstring(xml_data)
+        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+        for node in root.findall("s3:Contents", ns):
+            key = node.findtext("s3:Key", namespaces=ns)
+            if key:
+                keys.add(key)
+        token_el = root.find("s3:NextContinuationToken", ns)
+        continuation = token_el.text if token_el is not None else None
+        if not continuation:
+            return keys
+
+
+def _fetch_s3_object(source_url: urllib.parse.ParseResult, key: str) -> bytes:
+    url = _s3_object_url(source_url, key)
+    req = urllib.request.Request(url, headers={"User-Agent": "SimReadyBrowser/1.0"})
+    with urllib.request.urlopen(req, timeout=20.0) as resp:
+        return resp.read()
+
+
+def _s3_object_url(source_url: urllib.parse.ParseResult, key: str) -> str:
+    path = urllib.parse.quote(str(key).lstrip("/"), safe="/")
+    return f"{source_url.scheme}://{source_url.netloc}/{path}"
+
+
+def _is_usd_text_layer(key: str, data: bytes) -> bool:
+    suffix = Path(key).suffix.lower()
+    if suffix in USD_TEXT_LAYER_EXTS:
+        return True
+    return data[:16].lstrip().startswith(b"#usda")
+
+
+def _rewrite_usd_asset_references_for_s3(
+    layer_text: str,
+    *,
+    layer_key: str,
+    asset_root_key: str,
+    object_keys: set[str],
+) -> tuple[str, int, set[str]]:
+    exact = set(object_keys)
+    by_lower = {key.lower(): key for key in object_keys}
+    by_basename: dict[str, str] = {}
+    for key in sorted(object_keys):
+        suffix = Path(key).suffix.lower()
+        if suffix in S3_ASSET_REF_EXTS:
+            by_basename.setdefault(PurePosixPath(key).name.lower(), key)
+
+    layer_dir = str(PurePosixPath(layer_key).parent)
+    patch_count = 0
+    resolved_refs: set[str] = set()
+
+    def replace(match: re.Match) -> str:
+        nonlocal patch_count
+        ref = match.group(1)
+        resolved = _resolve_s3_asset_ref(
+            ref,
+            layer_dir=layer_dir,
+            asset_root_key=asset_root_key,
+            exact=exact,
+            by_lower=by_lower,
+            by_basename=by_basename,
+        )
+        if not resolved:
+            return match.group(0)
+        local_ref = _local_proxy_ref_for_s3_key(
+            resolved,
+            layer_key=layer_key,
+            asset_root_key=asset_root_key,
+        )
+        if not local_ref:
+            return match.group(0)
+        patch_count += 1
+        resolved_refs.add(resolved)
+        return f"@{local_ref}@"
+
+    return re.sub(r"@([^@\r\n]+)@", replace, layer_text), patch_count, resolved_refs
+
+
+def _local_proxy_ref_for_s3_key(resolved_key: str, *, layer_key: str, asset_root_key: str) -> str:
+    if not resolved_key.startswith(asset_root_key) or not layer_key.startswith(asset_root_key):
+        return ""
+    asset_rel = resolved_key[len(asset_root_key) :].replace("\\", "/")
+    layer_rel = layer_key[len(asset_root_key) :].replace("\\", "/")
+    layer_dir = posixpath.dirname(layer_rel)
+    if not layer_dir:
+        return asset_rel
+    return posixpath.relpath(asset_rel, start=layer_dir).replace("\\", "/")
+
+
+def _resolve_s3_asset_ref(
+    ref: str,
+    *,
+    layer_dir: str,
+    asset_root_key: str,
+    exact: set[str],
+    by_lower: dict[str, str],
+    by_basename: dict[str, str],
+) -> Optional[str]:
+    text = str(ref or "").strip().replace("\\", "/")
+    if not text:
+        return None
+
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme in {"http", "https", "s3"}:
+        return None
+
+    suffix = Path(urllib.parse.unquote(text).split("?", 1)[0]).suffix.lower()
+    if suffix not in S3_ASSET_REF_EXTS:
+        return None
+
+    candidate = posixpath.normpath(posixpath.join(layer_dir, text))
+    if candidate.startswith("../"):
+        candidate = posixpath.normpath(posixpath.join(asset_root_key, text))
+    if candidate in exact:
+        return candidate
+    lowered = candidate.lower()
+    if lowered in by_lower:
+        return by_lower[lowered]
+
+    basename = PurePosixPath(text).name.lower()
+    return by_basename.get(basename)
+
+
+def _ensure_dome_environment_texture(mode: str) -> Path:
+    value = str(mode or "").strip().lower()
+    if value == "blurry_studio":
+        return _ensure_blurry_studio_environment()
+    if value == "automotive_show":
+        return _ensure_automotive_show_environment()
+    if value == "outdoor_day":
+        return _ensure_outdoor_day_environment()
+    return _ensure_flat_dome_environment()
+
+
+def _ensure_flat_dome_environment() -> Path:
+    path = Path(__file__).resolve().parents[1] / "cache" / "render_env" / FLAT_DOME_ENV_NAME
+    if path.exists() and path.stat().st_size > 0:
+        return path
+
+    width, height = 16, 8
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rgb = bytes((230, 234, 226)) * width * height
+    _write_rgb_png(path, width, height, rgb)
+    return path
+
+
+def _ensure_blurry_studio_environment() -> Path:
+    """Create a crisp studio lat-long environment map for dome-light reflections."""
+    path = Path(__file__).resolve().parents[1] / "cache" / "render_env" / BLURRY_STUDIO_ENV_NAME
+    if path.exists() and path.stat().st_size > 0:
+        return path
+
+    width, height = 1024, 512
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixels: list[tuple[float, float, float]] = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        horizon = 1.0 - abs(v - 0.52) * 2.0
+        base = np.array(
+            [
+                0.10 + 0.08 * (1.0 - v) + 0.04 * max(horizon, 0.0),
+                0.11 + 0.09 * (1.0 - v) + 0.05 * max(horizon, 0.0),
+                0.12 + 0.12 * (1.0 - v) + 0.06 * max(horizon, 0.0),
+            ],
+            dtype=np.float64,
+        )
+        for x in range(width):
+            u = x / max(1, width - 1)
+            color = np.array(base, copy=True)
+            color += _latlong_panel(u, v, 0.18, 0.44, 0.045, 0.075, np.array([5.0, 5.4, 6.0]))
+            color += _latlong_panel(u, v, 0.72, 0.48, 0.065, 0.060, np.array([3.6, 4.0, 4.6]))
+            color += _latlong_panel(u, v, 0.52, 0.22, 0.105, 0.045, np.array([1.0, 1.1, 1.35]))
+            color += _latlong_panel(u, v, 0.50, 0.64, 0.18, 0.030, np.array([0.48, 0.52, 0.46]))
+            pixels.append(tuple(float(max(0.0, channel)) for channel in color[:3]))
+
+    _write_rgbe_hdr(path, width, height, pixels)
+    return path
+
+
+def _ensure_automotive_show_environment() -> Path:
+    """Create a high-contrast showroom environment for crisp product reflections."""
+    path = Path(__file__).resolve().parents[1] / "cache" / "render_env" / AUTOMOTIVE_SHOW_ENV_NAME
+    if path.exists() and path.stat().st_size > 0:
+        return path
+
+    width, height = 1024, 512
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixels: list[tuple[float, float, float]] = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        horizon = max(0.0, 1.0 - abs(v - 0.55) * 5.5)
+        ceiling = max(0.0, 1.0 - v)
+        floor = max(0.0, v - 0.50)
+        base = np.array(
+            [
+                0.025 + 0.045 * ceiling + 0.10 * floor + 0.10 * horizon,
+                0.027 + 0.048 * ceiling + 0.095 * floor + 0.10 * horizon,
+                0.030 + 0.055 * ceiling + 0.090 * floor + 0.11 * horizon,
+            ],
+            dtype=np.float64,
+        )
+        for x in range(width):
+            u = x / max(1, width - 1)
+            color = np.array(base, copy=True)
+
+            panel = 0.5 + 0.5 * math.sin(2.0 * math.pi * (u * 9.0 + 0.08))
+            color += np.array([0.050, 0.055, 0.060]) * panel * horizon
+
+            color += _latlong_panel(u, v, 0.16, 0.30, 0.018, 0.018, np.array([9.0, 9.4, 10.0]))
+            color += _latlong_panel(u, v, 0.32, 0.29, 0.022, 0.016, np.array([7.5, 8.0, 8.7]))
+            color += _latlong_panel(u, v, 0.50, 0.28, 0.028, 0.014, np.array([8.5, 9.0, 9.8]))
+            color += _latlong_panel(u, v, 0.68, 0.29, 0.022, 0.016, np.array([7.0, 7.5, 8.2]))
+            color += _latlong_panel(u, v, 0.84, 0.30, 0.018, 0.018, np.array([8.5, 9.0, 9.6]))
+            color += _latlong_panel(u, v, 0.50, 0.58, 0.30, 0.020, np.array([0.42, 0.44, 0.44]))
+            color += _latlong_panel(u, v, 0.08, 0.52, 0.018, 0.070, np.array([1.6, 1.7, 1.9]))
+            color += _latlong_panel(u, v, 0.92, 0.52, 0.018, 0.070, np.array([1.4, 1.5, 1.7]))
+            pixels.append(tuple(float(max(0.0, channel)) for channel in color[:3]))
+
+    _write_rgbe_hdr(path, width, height, pixels)
+    return path
+
+
+def _ensure_outdoor_day_environment() -> Path:
+    """Create a textured outdoor day environment with sky, sun, horizon, and ground."""
+    path = Path(__file__).resolve().parents[1] / "cache" / "render_env" / OUTDOOR_DAY_ENV_NAME
+    if path.exists() and path.stat().st_size > 0:
+        return path
+
+    width, height = 1024, 512
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pixels: list[tuple[float, float, float]] = []
+    for y in range(height):
+        v = y / max(1, height - 1)
+        sky_t = min(1.0, v / 0.55)
+        ground_t = max(0.0, (v - 0.55) / 0.45)
+        for x in range(width):
+            u = x / max(1, width - 1)
+            cloud = (
+                0.5
+                + 0.25 * math.sin(2.0 * math.pi * (u * 3.0 + v * 1.4))
+                + 0.18 * math.sin(2.0 * math.pi * (u * 9.0 - v * 2.2))
+            )
+            cloud = max(0.0, min(1.0, cloud))
+            if v < 0.55:
+                color = np.array(
+                    [
+                        0.35 + 0.22 * (1.0 - sky_t),
+                        0.48 + 0.25 * (1.0 - sky_t),
+                        0.78 + 0.28 * (1.0 - sky_t),
+                    ],
+                    dtype=np.float64,
+                )
+                cloud_band = max(0.0, 1.0 - abs(v - 0.42) * 8.0) * cloud
+                color = color * (1.0 - 0.22 * cloud_band) + np.array([1.00, 0.98, 0.90]) * (0.48 * cloud_band)
+            else:
+                stripe = 0.5 + 0.5 * math.sin(2.0 * math.pi * (u * 16.0 + ground_t * 2.0))
+                color = np.array(
+                    [
+                        0.15 + 0.11 * stripe + 0.10 * ground_t,
+                        0.22 + 0.14 * stripe + 0.10 * ground_t,
+                        0.13 + 0.07 * stripe + 0.08 * ground_t,
+                    ],
+                    dtype=np.float64,
+                )
+
+            horizon = max(0.0, 1.0 - abs(v - 0.55) * 22.0)
+            color += horizon * np.array([0.55, 0.58, 0.52])
+            color += _latlong_panel(u, v, 0.78, 0.28, 0.018, 0.018, np.array([18.0, 15.5, 10.0]))
+            color += _latlong_panel(u, v, 0.78, 0.28, 0.085, 0.070, np.array([1.2, 1.0, 0.55]))
+            pixels.append(tuple(float(max(0.0, channel)) for channel in color[:3]))
+
+    _write_rgbe_hdr(path, width, height, pixels)
+    return path
+
+
+def _latlong_panel(
+    u: float,
+    v: float,
+    center_u: float,
+    center_v: float,
+    sigma_u: float,
+    sigma_v: float,
+    color: np.ndarray,
+) -> np.ndarray:
+    du = abs(float(u) - float(center_u))
+    du = min(du, 1.0 - du)
+    dv = float(v) - float(center_v)
+    weight = math.exp(-0.5 * ((du / sigma_u) ** 2 + (dv / sigma_v) ** 2))
+    return color * weight
+
+
+def _write_rgb_png(path: Path, width: int, height: int, rgb: bytes) -> None:
+    if len(rgb) != width * height * 3:
+        raise ValueError("PNG RGB data does not match image dimensions.")
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    rows = bytearray()
+    stride = width * 3
+    for row in range(height):
+        rows.append(0)
+        start = row * stride
+        rows.extend(rgb[start : start + stride])
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(rows), level=9))
+        + chunk(b"IEND", b"")
+    )
+    path.write_bytes(png)
+
+
+def _write_rgbe_hdr(path: Path, width: int, height: int, pixels: list[tuple[float, float, float]]) -> None:
+    if len(pixels) != width * height:
+        raise ValueError("HDR RGB data does not match image dimensions.")
+
+    data = bytearray()
+    data.extend(f"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {height} +X {width}\n".encode("ascii"))
+    for rgb in pixels:
+        data.extend(_float_rgb_to_rgbe(rgb))
+    path.write_bytes(bytes(data))
+
+
+def _float_rgb_to_rgbe(rgb: tuple[float, float, float]) -> bytes:
+    r = max(0.0, float(rgb[0]))
+    g = max(0.0, float(rgb[1]))
+    b = max(0.0, float(rgb[2]))
+    value = max(r, g, b)
+    if value < 1e-32:
+        return b"\x00\x00\x00\x00"
+    mantissa, exponent = math.frexp(value)
+    scale = mantissa * 256.0 / value
+    return bytes(
+        (
+            max(0, min(255, int(r * scale))),
+            max(0, min(255, int(g * scale))),
+            max(0, min(255, int(b * scale))),
+            max(0, min(255, exponent + 128)),
+        )
+    )
 
 
 def _ensure_ovrtx_available() -> bool:
@@ -129,6 +607,7 @@ class OVRTXRenderer(QObject):
     _collision_bounds_requested = pyqtSignal(object)
     _scene_part_property_requested = pyqtSignal(str, str, object)
     _dome_intensity_requested = pyqtSignal(float)
+    _dome_environment_requested = pyqtSignal(str)
     _dir_light_requested = pyqtSignal(float, float, float)
     _render_requested = pyqtSignal()
     _start_realtime_requested = pyqtSignal(int)
@@ -160,6 +639,8 @@ class OVRTXRenderer(QObject):
         self._asset_transform_dirty = True
         self._asset_layout_transforms: list[np.ndarray] = []
         self._stage_item_sources: list[str] = []
+        self._stage_item_render_sources: list[str] = []
+        self._stage_items_for_reload: list[dict] = []
         self._asset_transform_warning_shown = False
         self._asset_instance_count = 1
         self._loaded_asset_instance_count = 1
@@ -186,7 +667,10 @@ class OVRTXRenderer(QObject):
         self._collision_overlay_dirty = True
         self._collision_overlay_warning_shown = False
         self._current_usd_source: Optional[str] = None
+        self._current_render_usd_source: Optional[str] = None
         self._dome_intensity = 1.0
+        self._dome_environment = "flat"
+        self._dome_texture_warning_shown = False
         self._dir_intensity = 0.8
         self._dir_azimuth = 45.0
         self._dir_elevation = 60.0
@@ -213,6 +697,7 @@ class OVRTXRenderer(QObject):
         self._collision_bounds_requested.connect(self._set_collision_proxy_bounds, Qt.QueuedConnection)
         self._scene_part_property_requested.connect(self._set_scene_part_property, Qt.QueuedConnection)
         self._dome_intensity_requested.connect(self._set_dome_intensity, Qt.QueuedConnection)
+        self._dome_environment_requested.connect(self._set_dome_environment, Qt.QueuedConnection)
         self._dir_light_requested.connect(self._set_directional_light, Qt.QueuedConnection)
         self._render_requested.connect(self._render_one, Qt.QueuedConnection)
         self._start_realtime_requested.connect(self._start_timer, Qt.QueuedConnection)
@@ -288,6 +773,11 @@ class OVRTXRenderer(QObject):
         if self._shutdown_started:
             return
         self._dome_intensity_requested.emit(float(value))
+
+    def set_dome_environment(self, mode: str) -> None:
+        if self._shutdown_started:
+            return
+        self._dome_environment_requested.emit(str(mode or "flat"))
 
     def set_directional_light(self, intensity: float, azimuth: float, elevation: float) -> None:
         if self._shutdown_started:
@@ -388,6 +878,9 @@ class OVRTXRenderer(QObject):
             self._stage_loaded = False
             self._current_usd_source = stage_items[0]["source"] if count == 1 else None
             self._stage_item_sources = [item["source"] for item in stage_items]
+            self._current_render_usd_source = None
+            self._stage_item_render_sources = []
+            self._stage_items_for_reload = [dict(item) for item in stage_items]
             self._asset_transform = np.eye(4, dtype=np.float64)
             self._asset_transform_dirty = True
             self._asset_layout_transforms = []
@@ -423,7 +916,11 @@ class OVRTXRenderer(QObject):
             for index, item in enumerate(stage_items):
                 progress = 35 + int(25 * index / max(1, count))
                 self.loading_progress.emit(progress, f"Streaming {index + 1} of {count}: {item['name']}")
-                self._renderer.add_usd(item["source"], path_prefix=self._asset_render_root(index))
+                render_source = self._render_source_for_stage_item(item["source"])
+                self._stage_item_render_sources.append(render_source)
+                if count == 1:
+                    self._current_render_usd_source = render_source
+                self._renderer.add_usd(render_source, path_prefix=self._asset_render_root(index))
                 self._loaded_asset_instance_count = index + 1
 
             self.loading_progress.emit(60, "Adding review camera and lights...")
@@ -669,7 +1166,23 @@ def Scope "SimReadyStageSettings"
             value = 0.0
         return f"{value:.9g}"
 
+    def _dome_texture_asset_path(self) -> str:
+        try:
+            return str(_ensure_dome_environment_texture(self._dome_environment)).replace("\\", "/")
+        except Exception as exc:
+            if not self._dome_texture_warning_shown:
+                self._dome_texture_warning_shown = True
+                self.status_changed.emit(f"Dome environment texture generation skipped: {exc}")
+            return ""
+
+    def _dome_texture_asset_line(self) -> str:
+        texture_path = self._dome_texture_asset_path()
+        if not texture_path:
+            return "        asset inputs:texture:file = @@"
+        return f"        asset inputs:texture:file = @{texture_path}@"
+
     def _review_layer(self) -> str:
+        dome_texture = self._dome_texture_asset_line()
         return f"""#usda 1.0
 (
     defaultPrim = "SimReadyReview"
@@ -780,6 +1293,7 @@ def Xform "SimReadyReview"
     {{
         color3f inputs:color = (1, 1, 1)
         float inputs:intensity = 1000
+{dome_texture}
         token inputs:texture:format = "latlong"
     }}
 
@@ -929,6 +1443,18 @@ def Xform "SimReadyReview"
         self._dome_intensity = value
         self._apply_dome_light()
 
+    def _set_dome_environment(self, mode: str) -> None:
+        if self._shutdown_started:
+            return
+        value = str(mode or "flat").strip().lower()
+        if value not in {"flat", "blurry_studio", "automotive_show", "outdoor_day"}:
+            value = "flat"
+        if value == self._dome_environment:
+            return
+        self._dome_environment = value
+        if self._stage_loaded and self._stage_items_for_reload:
+            self._load_stage_items([dict(item) for item in self._stage_items_for_reload])
+
     def _set_directional_light(self, intensity: float, azimuth: float, elevation: float) -> None:
         if self._shutdown_started:
             return
@@ -981,15 +1507,28 @@ def Xform "SimReadyReview"
                 break
 
     def _asset_source_for_instance(self, index: int) -> str:
-        if self._current_usd_source:
-            return self._current_usd_source
-        if not self._stage_item_sources:
+        if self._current_render_usd_source:
+            return self._current_render_usd_source
+        sources = self._stage_item_render_sources or self._stage_item_sources
+        if not sources:
             return ""
         try:
-            source_index = max(0, int(index)) % len(self._stage_item_sources)
+            source_index = max(0, int(index)) % len(sources)
         except Exception:
             source_index = 0
-        return str(self._stage_item_sources[source_index] or "")
+        return str(sources[source_index] or "")
+
+    def _render_source_for_stage_item(self, source: str) -> str:
+        original = str(source or "")
+        try:
+            render_source, patch_count = _prepare_s3_resolver_proxy(original)
+        except Exception as exc:
+            self.status_changed.emit(f"S3 texture resolver skipped: {exc}")
+            return original
+        if render_source != original:
+            detail = f" ({patch_count} asset paths case-corrected)" if patch_count else ""
+            self.status_changed.emit(f"Resolved S3 texture paths for rendering{detail}.")
+        return render_source
 
     def _apply_asset_transform(self) -> None:
         if not self._renderer or not self._stage_loaded:
@@ -1387,27 +1926,7 @@ def Xform "SimReadyReview"
 
     @staticmethod
     def _usd_discovery_python() -> Optional[str]:
-        root = Path(__file__).resolve().parents[1]
-        candidates = [
-            os.environ.get(USD_DISCOVERY_PYTHON_ENV, ""),
-            str(root / ".usd_discovery_venv" / "Scripts" / "python.exe"),
-            str(root / ".usd_discovery_venv" / "bin" / "python"),
-        ]
-        current = Path(sys.executable).resolve() if hasattr(sys, "executable") else None
-        for item in candidates:
-            if not item:
-                continue
-            path = Path(item).expanduser()
-            try:
-                resolved = path.resolve()
-            except Exception:
-                resolved = path
-            if not resolved.exists():
-                continue
-            if current is not None and resolved == current and not os.environ.get(USD_DISCOVERY_PYTHON_ENV):
-                continue
-            return str(resolved)
-        return None
+        return _usd_discovery_python_path()
 
     def _expanded_collision_asset_transform(self) -> np.ndarray:
         if not self._collision_proxy_bounds:
@@ -2086,6 +2605,9 @@ def Xform "SimReadyReview"
         self._stage_loaded = False
         self._pending_stage = None
         self._pending_stage_items = None
+        self._current_render_usd_source = None
+        self._stage_item_render_sources = []
+        self._stage_items_for_reload = []
         self._release_collision_overlay_process()
         self._stop_timer()
         if self._placeholder_timer:

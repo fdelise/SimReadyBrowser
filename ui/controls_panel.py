@@ -38,7 +38,11 @@ from PyQt5.QtWidgets import (
 from core.s3_client import AssetInfo
 from styles.nvidia_theme import (
     COLOR_ACCENT,
+    COLOR_ACCENT_DIM,
+    COLOR_BG_HEADER,
+    COLOR_BG_HOVER,
     COLOR_BG_PANEL,
+    COLOR_BG_WIDGET,
     COLOR_BORDER,
     COLOR_TEXT_DISABLED,
     COLOR_TEXT_PRIMARY,
@@ -50,12 +54,10 @@ PHYSX_DEFAULT_CCD = False
 PHYSX_DEFAULT_STEPS_PER_SECOND = 60
 PHYSX_MIN_STEPS_PER_SECOND = 15
 PHYSX_MAX_STEPS_PER_SECOND = 240
-PHYSX_DEFAULT_SUBSTEPS = 1
-PHYSX_OLD_DEFAULT_SUBSTEPS = 4
+PHYSX_DEFAULT_SUBSTEPS = 4
 PHYSX_MIN_SUBSTEPS = 1
 PHYSX_MAX_SUBSTEPS = 16
 PHYSX_DEFAULT_DEVICE = "gpu"
-PHYSX_SETTINGS_VERSION = 2
 
 
 class ControlsPanel(QWidget):
@@ -71,6 +73,7 @@ class ControlsPanel(QWidget):
     """
 
     dome_intensity_changed = pyqtSignal(float)
+    dome_environment_changed = pyqtSignal(str)
     dir_light_changed      = pyqtSignal(float, float, float)
     material_changed       = pyqtSignal(float, float)
     reset_camera_requested = pyqtSignal()
@@ -96,8 +99,6 @@ class ControlsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._current_asset: Optional[AssetInfo] = None
-        self._settings = QSettings("NVIDIA Corporation", "NVIDIA SimReady Browser")
-        self._loading_physx_settings = False
         self._scene_nodes_by_path: dict[str, dict] = {}
         self._scene_items_by_path: dict[str, QTreeWidgetItem] = {}
         self._scene_default_properties_by_path: dict[str, dict] = {}
@@ -105,7 +106,7 @@ class ControlsPanel(QWidget):
         self._selected_scene_path = ""
         self._updating_scene_ui = False
         self._build_ui()
-        self._load_physx_settings()
+        self._load_fast_physx_defaults()
 
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setMinimumWidth(280)
@@ -121,10 +122,15 @@ class ControlsPanel(QWidget):
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
         self._tabs.setStyleSheet(
-            f"QTabWidget::pane {{ border: 1px solid {COLOR_BORDER}; background: {COLOR_BG_PANEL}; }}"
-            "QTabBar::tab { background: #202020; color: #b8b8b8; padding: 7px 9px; "
-            "border: 1px solid #333; border-bottom: none; }"
-            f"QTabBar::tab:selected {{ color: {COLOR_ACCENT}; background: #151515; }}"
+            f"QTabWidget::pane {{ border: 1px solid {COLOR_BORDER}; border-radius: 8px; "
+            f"background: {COLOR_BG_PANEL}; top: -1px; }}"
+            f"QTabBar::tab {{ background: {COLOR_BG_WIDGET}; color: {COLOR_TEXT_SECONDARY}; "
+            f"padding: 7px 10px; border: 1px solid {COLOR_BORDER}; border-radius: 14px; "
+            f"margin: 0 4px 6px 0; }}"
+            f"QTabBar::tab:selected {{ color: #090a08; background: {COLOR_ACCENT}; "
+            f"border-color: {COLOR_ACCENT}; }}"
+            f"QTabBar::tab:hover:!selected {{ background: {COLOR_BG_HOVER}; "
+            f"border-color: {COLOR_ACCENT_DIM}; color: {COLOR_TEXT_PRIMARY}; }}"
         )
         self._tabs.addTab(self._build_app_settings_tab(), "App Settings")
         self._tabs.addTab(self._build_scene_explorer_tab(), "Scene Explorer")
@@ -183,10 +189,13 @@ class ControlsPanel(QWidget):
         self._scene_tree.setAlternatingRowColors(False)
         self._scene_tree.setColumnWidth(0, 185)
         self._scene_tree.setStyleSheet(
-            f"QTreeWidget {{ background: #141414; border: 1px solid {COLOR_BORDER}; "
-            f"color: {COLOR_TEXT_PRIMARY}; font-size: 10px; }}"
-            f"QTreeWidget::item:selected {{ background: {COLOR_ACCENT}; color: #101010; }}"
-            "QHeaderView::section { background: #202020; color: #b8b8b8; border: none; padding: 4px; }"
+            f"QTreeWidget {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 8px; color: {COLOR_TEXT_PRIMARY}; font-size: 10px; }}"
+            f"QTreeWidget::item {{ padding: 4px 5px; border-radius: 4px; }}"
+            f"QTreeWidget::item:hover {{ background: {COLOR_BG_HOVER}; }}"
+            f"QTreeWidget::item:selected {{ background: {COLOR_ACCENT}; color: #090a08; }}"
+            f"QHeaderView::section {{ background: {COLOR_BG_HEADER}; color: {COLOR_TEXT_SECONDARY}; "
+            f"border: none; border-bottom: 1px solid {COLOR_BORDER}; padding: 5px; }}"
         )
         self._scene_tree.itemSelectionChanged.connect(self._on_scene_tree_selection_changed)
         lay.addWidget(self._scene_tree, 1)
@@ -229,6 +238,24 @@ class ControlsPanel(QWidget):
         reset_part_btn.setToolTip("Restore the selected prim to the transform values discovered for this scene load.")
         reset_part_btn.clicked.connect(self._reset_scene_part_edits)
         prop_lay.addRow(reset_part_btn)
+
+        self._scene_usd_tree = QTreeWidget()
+        self._scene_usd_tree.setHeaderLabels(["USD Property", "Type", "Value"])
+        self._scene_usd_tree.setRootIsDecorated(True)
+        self._scene_usd_tree.setUniformRowHeights(True)
+        self._scene_usd_tree.setMinimumHeight(180)
+        self._scene_usd_tree.setStyleSheet(
+            f"QTreeWidget {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 8px; color: {COLOR_TEXT_PRIMARY}; font-size: 10px; }}"
+            f"QTreeWidget::item {{ padding: 4px 5px; border-radius: 4px; }}"
+            f"QTreeWidget::item:hover {{ background: {COLOR_BG_HOVER}; }}"
+            f"QTreeWidget::item:selected {{ background: {COLOR_ACCENT}; color: #090a08; }}"
+            f"QHeaderView::section {{ background: {COLOR_BG_HEADER}; color: {COLOR_TEXT_SECONDARY}; "
+            f"border: none; border-bottom: 1px solid {COLOR_BORDER}; padding: 5px; }}"
+        )
+        self._scene_usd_tree.setColumnWidth(0, 135)
+        self._scene_usd_tree.setColumnWidth(1, 74)
+        prop_lay.addRow(self._scene_usd_tree)
 
         self._scene_properties_group.setEnabled(False)
         lay.addWidget(self._scene_properties_group)
@@ -285,6 +312,15 @@ class ControlsPanel(QWidget):
         dome_row = _slider_with_value(self._dome_slider, fmt=lambda v: f"{v/100:.2f}")
         lay.addRow("Dome:", dome_row)
 
+        self._dome_environment = QComboBox()
+        self._dome_environment.addItem("Flat dome", "flat")
+        self._dome_environment.addItem("Studio softbox HDRI", "blurry_studio")
+        self._dome_environment.addItem("Automotive show HDRI", "automotive_show")
+        self._dome_environment.addItem("Outdoor day HDRI", "outdoor_day")
+        self._dome_environment.setToolTip("Use a lat-long environment texture on the dome light for reflections.")
+        self._dome_environment.currentIndexChanged.connect(self._emit_dome_environment)
+        lay.addRow("Env:", self._dome_environment)
+
         self._dir_enabled = QCheckBox("Direct light")
         self._dir_enabled.setChecked(True)
         self._dir_enabled.toggled.connect(self._emit_dir_light)
@@ -321,6 +357,9 @@ class ControlsPanel(QWidget):
         lay.addRow("Preset:", preset_w)
 
         return grp
+
+    def _emit_dome_environment(self):
+        self.dome_environment_changed.emit(str(self._dome_environment.currentData() or "flat"))
 
     def _emit_dir_light(self):
         intensity = self._dir_int_slider.value() / 100.0
@@ -551,7 +590,7 @@ class ControlsPanel(QWidget):
 
         engine_row = QHBoxLayout()
         reset_settings_btn = _small_button("Reset Defaults")
-        reset_settings_btn.setToolTip("Restore PhysX defaults: GPU device, 60 steps/s, 1 substep, CCD off.")
+        reset_settings_btn.setToolTip("Restore PhysX defaults: GPU device, 60 steps/s, 4 substeps, CCD off.")
         reset_settings_btn.clicked.connect(self._reset_physx_settings)
         engine_row.addWidget(reset_settings_btn)
 
@@ -761,75 +800,38 @@ class ControlsPanel(QWidget):
             "device_mode": str(self._physics_device.currentData() or PHYSX_DEFAULT_DEVICE),
         }
 
-    def _load_physx_settings(self) -> None:
-        self._loading_physx_settings = True
-        try:
-            self._settings.remove("physics/ccd_enabled")
-            steps = self._settings.value(
-                "physics/steps_per_second",
-                PHYSX_DEFAULT_STEPS_PER_SECOND,
-                type=int,
-            )
-            settings_version = self._settings.value("physics/settings_version", 0, type=int)
-            substeps = self._settings.value("physics/substeps", PHYSX_DEFAULT_SUBSTEPS, type=int)
-            if int(settings_version or 0) < PHYSX_SETTINGS_VERSION and int(substeps) == PHYSX_OLD_DEFAULT_SUBSTEPS:
-                substeps = PHYSX_DEFAULT_SUBSTEPS
-            device = str(self._settings.value("physics/device_mode", PHYSX_DEFAULT_DEVICE) or PHYSX_DEFAULT_DEVICE)
+    def _load_fast_physx_defaults(self) -> None:
+        self._clear_persistent_physx_settings()
+        self._set_check_silently(self._physics_ccd, PHYSX_DEFAULT_CCD)
+        self._set_spin_silently(self._physics_steps, PHYSX_DEFAULT_STEPS_PER_SECOND)
+        self._set_spin_silently(self._physics_substeps, PHYSX_DEFAULT_SUBSTEPS)
+        self._set_device_silently(PHYSX_DEFAULT_DEVICE)
 
-            self._set_check_silently(self._physics_ccd, PHYSX_DEFAULT_CCD)
-            self._set_spin_silently(
-                self._physics_steps,
-                max(PHYSX_MIN_STEPS_PER_SECOND, min(int(steps), PHYSX_MAX_STEPS_PER_SECOND)),
-            )
-            self._set_spin_silently(
-                self._physics_substeps,
-                max(PHYSX_MIN_SUBSTEPS, min(int(substeps), PHYSX_MAX_SUBSTEPS)),
-            )
-            self._set_device_silently(device)
-            self._settings.setValue("physics/settings_version", PHYSX_SETTINGS_VERSION)
-            if int(substeps) == PHYSX_DEFAULT_SUBSTEPS:
-                self._settings.setValue("physics/substeps", PHYSX_DEFAULT_SUBSTEPS)
-        finally:
-            self._loading_physx_settings = False
-
-    def _save_physx_settings(self) -> None:
-        settings = self.physics_settings()
-        self._settings.remove("physics/ccd_enabled")
-        self._settings.setValue("physics/settings_version", PHYSX_SETTINGS_VERSION)
-        self._settings.setValue("physics/steps_per_second", settings["steps_per_second"])
-        self._settings.setValue("physics/substeps", settings["substeps"])
-        self._settings.setValue("physics/device_mode", settings["device_mode"])
+    @staticmethod
+    def _clear_persistent_physx_settings() -> None:
+        settings = QSettings("NVIDIA Corporation", "NVIDIA SimReady Browser")
+        settings.remove("physics")
+        settings.sync()
 
     def _on_physx_ccd_changed(self, enabled: bool) -> None:
-        self._settings.remove("physics/ccd_enabled")
         self.physics_ccd_changed.emit(bool(enabled))
 
     def _on_physx_steps_changed(self, value: int) -> None:
-        if not self._loading_physx_settings:
-            self._save_physx_settings()
         self.physics_steps_changed.emit(int(value))
 
     def _on_physx_substeps_changed(self, value: int) -> None:
-        if not self._loading_physx_settings:
-            self._save_physx_settings()
         self.physics_substeps_changed.emit(int(value))
 
     def _on_physx_device_changed(self) -> None:
         mode = str(self._physics_device.currentData() or PHYSX_DEFAULT_DEVICE)
-        if not self._loading_physx_settings:
-            self._save_physx_settings()
         self.physics_device_changed.emit(mode)
 
     def _reset_physx_settings(self) -> None:
-        self._loading_physx_settings = True
-        try:
-            self._set_check_silently(self._physics_ccd, PHYSX_DEFAULT_CCD)
-            self._set_spin_silently(self._physics_steps, PHYSX_DEFAULT_STEPS_PER_SECOND)
-            self._set_spin_silently(self._physics_substeps, PHYSX_DEFAULT_SUBSTEPS)
-            self._set_device_silently(PHYSX_DEFAULT_DEVICE)
-        finally:
-            self._loading_physx_settings = False
-        self._save_physx_settings()
+        self._set_check_silently(self._physics_ccd, PHYSX_DEFAULT_CCD)
+        self._set_spin_silently(self._physics_steps, PHYSX_DEFAULT_STEPS_PER_SECOND)
+        self._set_spin_silently(self._physics_substeps, PHYSX_DEFAULT_SUBSTEPS)
+        self._set_device_silently(PHYSX_DEFAULT_DEVICE)
+        self._clear_persistent_physx_settings()
         self.physics_settings_reset_requested.emit()
 
     def _emit_drop_options(self):
@@ -914,6 +916,7 @@ class ControlsPanel(QWidget):
         self._set_scene_vector_silently(self._scene_translate_spins, props.get("translate"), [0.0, 0.0, 0.0])
         self._set_scene_vector_silently(self._scene_rotate_spins, props.get("rotate"), [0.0, 0.0, 0.0])
         self._set_scene_vector_silently(self._scene_scale_spins, props.get("scale"), [1.0, 1.0, 1.0])
+        self._populate_usd_inspector(node)
 
     def _clear_scene_properties(self) -> None:
         self._selected_scene_path = ""
@@ -926,6 +929,89 @@ class ControlsPanel(QWidget):
         self._set_scene_vector_silently(self._scene_translate_spins, None, [0.0, 0.0, 0.0])
         self._set_scene_vector_silently(self._scene_rotate_spins, None, [0.0, 0.0, 0.0])
         self._set_scene_vector_silently(self._scene_scale_spins, None, [1.0, 1.0, 1.0])
+        self._scene_usd_tree.clear()
+
+    def _populate_usd_inspector(self, node: dict) -> None:
+        self._scene_usd_tree.clear()
+        usd = node.get("usd") if isinstance(node.get("usd"), dict) else {}
+        properties = node.get("usd_properties") if isinstance(node.get("usd_properties"), list) else []
+
+        summary = self._add_inspector_group("Prim Summary", f"{len(properties)} properties")
+        for key in ("type_name", "specifier", "kind", "active", "defined", "loaded", "instance", "instanceable", "prototype"):
+            value = usd.get(key)
+            if value not in ("", None, [], {}):
+                self._add_inspector_row(summary, key, "", value)
+        metadata = usd.get("metadata") if isinstance(usd.get("metadata"), dict) else {}
+        if metadata:
+            meta_group = self._add_inspector_group("Metadata", f"{len(metadata)} items")
+            self._add_mapping_rows(meta_group, metadata)
+
+        schemas = list(usd.get("applied_schemas") or [])
+        schema_group = self._add_inspector_group("Schemas", f"{len(schemas)} applied")
+        concrete = usd.get("type_name")
+        if concrete:
+            self._add_inspector_row(schema_group, "Concrete", "schema", concrete)
+        for schema in schemas:
+            self._add_inspector_row(schema_group, str(schema), "apiSchema", "")
+
+        for title, key in (("Geometry", "geometry"), ("Materials", "materials"), ("Physics", "physics")):
+            data = usd.get(key) if isinstance(usd.get(key), dict) else {}
+            group = self._add_inspector_group(title, f"{len(data)} items")
+            self._add_mapping_rows(group, data)
+            if not data:
+                group.setExpanded(False)
+
+        props_group = self._add_inspector_group("USD Properties", f"{len(properties)} attrs/rels")
+        for prop in properties:
+            if not isinstance(prop, dict):
+                continue
+            flags = []
+            if prop.get("authored"):
+                flags.append("authored")
+            if prop.get("custom"):
+                flags.append("custom")
+            if prop.get("time_samples"):
+                flags.append(f"{prop.get('time_samples')} samples")
+            item = self._add_inspector_row(
+                props_group,
+                str(prop.get("name") or ""),
+                str(prop.get("type") or prop.get("kind") or ""),
+                str(prop.get("value") or ""),
+            )
+            if flags:
+                self._add_inspector_row(item, "flags", "", ", ".join(flags))
+            for label, values in (("connections", prop.get("connections")), ("targets", prop.get("targets"))):
+                if values:
+                    self._add_inspector_row(item, label, "", ", ".join(str(value) for value in values))
+
+        for index in range(self._scene_usd_tree.topLevelItemCount()):
+            self._scene_usd_tree.topLevelItem(index).setExpanded(index < 4)
+
+    def _add_mapping_rows(self, parent: QTreeWidgetItem, mapping: dict) -> None:
+        for key in sorted(mapping.keys()):
+            value = mapping.get(key)
+            if isinstance(value, dict):
+                group = self._add_inspector_row(parent, str(key), "dict", f"{len(value)} items")
+                self._add_mapping_rows(group, value)
+            elif isinstance(value, (list, tuple)):
+                self._add_inspector_row(parent, str(key), "list", ", ".join(str(item) for item in value))
+            else:
+                self._add_inspector_row(parent, str(key), "", value)
+
+    def _add_inspector_group(self, name: str, value: str = "") -> QTreeWidgetItem:
+        item = QTreeWidgetItem([str(name), "", str(value)])
+        font = item.font(0)
+        font.setBold(True)
+        item.setFont(0, font)
+        self._scene_usd_tree.addTopLevelItem(item)
+        return item
+
+    @staticmethod
+    def _add_inspector_row(parent: QTreeWidgetItem, name: str, type_name: str, value) -> QTreeWidgetItem:
+        text = str(value if value is not None else "")
+        item = QTreeWidgetItem([str(name), str(type_name or ""), text])
+        parent.addChild(item)
+        return item
 
     def _emit_scene_scalar_property(self, property_name: str, value) -> None:
         if self._updating_scene_ui or not self._selected_scene_path:
@@ -1026,11 +1112,13 @@ def _slider_with_value(slider: QSlider, fmt=None) -> QWidget:
 
 def _small_button(text: str) -> QPushButton:
     btn = QPushButton(text)
-    btn.setFixedHeight(22)
+    btn.setFixedHeight(24)
     btn.setStyleSheet(
-        f"QPushButton {{ background: #2d2d2d; border: 1px solid {COLOR_BORDER}; "
-        f"border-radius: 3px; padding: 2px 6px; font-size: 10px; color: #c0c0c0; }}"
-        f"QPushButton:hover {{ border-color: {COLOR_ACCENT}; color: {COLOR_ACCENT}; }}"
+        f"QPushButton {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+        f"border-radius: 12px; padding: 3px 8px; font-size: 10px; "
+        f"font-weight: 700; color: {COLOR_TEXT_SECONDARY}; }}"
+        f"QPushButton:hover {{ background: {COLOR_BG_HOVER}; border-color: {COLOR_ACCENT_DIM}; "
+        f"color: {COLOR_ACCENT}; }}"
     )
     return btn
 

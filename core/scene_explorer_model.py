@@ -51,6 +51,19 @@ def build_scene_tree(
             "children": [],
         }
 
+        if isinstance(discovery.get("prim_tree"), dict):
+            root = _scene_node_from_discovery(discovery["prim_tree"], index)
+            root["name"] = item["name"] or root.get("name") or render_root.rsplit("/", 1)[-1]
+            root["path"] = render_root
+            root["physics_path"] = physics_root
+            root["role"] = "asset"
+            root["type"] = root.get("type") or "Asset"
+            node_props = root.get("properties") if isinstance(root.get("properties"), dict) else _default_properties()
+            node_props.update(root_props)
+            root["properties"] = node_props
+            roots.append(root)
+            continue
+
         nodes = {render_root: root}
         role_by_physics_path = _roles_for_discovery(discovery, physics_root)
         for physics_path, role in role_by_physics_path.items():
@@ -200,11 +213,34 @@ def _ensure_node_path(
     return nodes[render_path]
 
 
+def _scene_node_from_discovery(node: dict, asset_index: int) -> dict:
+    physics_path = str(node.get("path") or node.get("physics_path") or "")
+    render_path = render_path_from_physics_path(physics_path, asset_index) or asset_render_root(asset_index)
+    props = node.get("properties") if isinstance(node.get("properties"), dict) else _default_properties()
+    copied = {
+        "name": str(node.get("name") or render_path.rsplit("/", 1)[-1] or "Prim"),
+        "path": render_path,
+        "physics_path": physics_path,
+        "type": str(node.get("type") or "Prim"),
+        "role": str(node.get("role") or "xform"),
+        "properties": {**_default_properties(), **props},
+        "usd": dict(node.get("usd") if isinstance(node.get("usd"), dict) else {}),
+        "usd_properties": list(node.get("usd_properties") if isinstance(node.get("usd_properties"), list) else []),
+        "children": [],
+    }
+    for child in node.get("children", []) or []:
+        if isinstance(child, dict):
+            copied["children"].append(_scene_node_from_discovery(child, asset_index))
+    return copied
+
+
 def _type_from_role(role: str) -> str:
     return {
         "asset": "Asset",
         "rigidBody": "Rigid Body",
         "articulation": "Articulation",
+        "collider": "Collider",
+        "material": "Material",
         "body": "Physics Body",
     }.get(str(role or ""), "Xform")
 

@@ -30,9 +30,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from core.s3_client import AssetInfo, S3Client
+from core.s3_client import AssetInfo, S3Client, parse_s3_location
 from styles.nvidia_theme import (
     COLOR_ACCENT,
+    COLOR_ACCENT_DIM,
+    COLOR_ACCENT_HOVER,
+    COLOR_BG_HOVER,
     COLOR_BG_PANEL,
     COLOR_BG_WIDGET,
     COLOR_BORDER,
@@ -42,9 +45,9 @@ from styles.nvidia_theme import (
 )
 
 THUMB_SIZE = 88   # px per thumbnail image
-CARD_WIDTH_PAD = 8
-CARD_HEIGHT_PAD = 24
-CARD_GRID_GAP = 4
+CARD_WIDTH_PAD = 10
+CARD_HEIGHT_PAD = 34
+CARD_GRID_GAP = 6
 DOWNLOAD_THUMBNAILS = True
 RENDER_BATCH_SIZE = 48
 INITIAL_RENDER_AHEAD_ROWS = 5
@@ -132,18 +135,18 @@ class AssetBrowserPanel(QWidget):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
         # ── Header ───────────────────────────────────────────────────────────
         header_row = QHBoxLayout()
         header_row.setSpacing(4)
 
-        header = QLabel("SimReady Assets")
+        header = QLabel("SIMREADY ASSETS")
         header.setObjectName("section_header")
         header.setStyleSheet(
-            f"color: {COLOR_ACCENT}; font-size: 14px; font-weight: bold; "
-            f"border-bottom: 1px solid {COLOR_ACCENT}; padding-bottom: 4px;"
+            f"color: {COLOR_TEXT_PRIMARY}; font-size: 13px; font-weight: 800; "
+            f"border: none; padding: 2px 0 4px 0;"
         )
         header_row.addWidget(header, 1)
 
@@ -153,10 +156,12 @@ class AssetBrowserPanel(QWidget):
         self._fullscreen_btn.setToolTip("Expand asset browser")
         self._fullscreen_btn.clicked.connect(self.fullscreen_requested.emit)
         self._fullscreen_btn.setStyleSheet(
-            f"QToolButton {{ border: 1px solid {COLOR_BORDER}; border-radius: 4px; "
-            f"padding: 4px; color: {COLOR_ACCENT}; }}"
-            f"QToolButton:hover {{ background: {COLOR_BG_WIDGET}; }}"
-            f"QToolButton:checked {{ background: #2a3d1a; border-color: {COLOR_ACCENT}; }}"
+            f"QToolButton {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 14px; padding: 5px; color: {COLOR_TEXT_PRIMARY}; }}"
+            f"QToolButton:hover {{ background: {COLOR_BG_HOVER}; border-color: {COLOR_ACCENT_DIM}; "
+            f"color: {COLOR_ACCENT}; }}"
+            f"QToolButton:checked {{ background: {COLOR_ACCENT}; border-color: {COLOR_ACCENT}; "
+            f"color: #090a08; }}"
         )
         header_row.addWidget(self._fullscreen_btn)
         root.addLayout(header_row)
@@ -166,29 +171,65 @@ class AssetBrowserPanel(QWidget):
         search_row.setSpacing(4)
 
         self._search = QLineEdit()
-        self._search.setPlaceholderText("Search assets…")
+        self._search.setPlaceholderText("Search assets...")
         self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self._schedule_filter)
         search_row.addWidget(self._search)
 
         refresh_btn = QToolButton()
-        refresh_btn.setText("⟳")
+        refresh_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        refresh_btn.setFixedSize(32, 32)
         refresh_btn.setToolTip("Refresh from S3")
         refresh_btn.clicked.connect(self._refresh)
         refresh_btn.setStyleSheet(
-            f"QToolButton {{ border: 1px solid {COLOR_BORDER}; border-radius: 4px; "
-            f"padding: 4px 6px; color: {COLOR_ACCENT}; font-size: 14px; }}"
-            f"QToolButton:hover {{ background: {COLOR_BG_WIDGET}; }}"
+            f"QToolButton {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 16px; padding: 5px; color: {COLOR_TEXT_PRIMARY}; }}"
+            f"QToolButton:hover {{ background: {COLOR_BG_HOVER}; border-color: {COLOR_ACCENT_DIM}; }}"
         )
         search_row.addWidget(refresh_btn)
         root.addLayout(search_row)
+
+        source_add_row = QHBoxLayout()
+        source_add_row.setSpacing(4)
+
+        self._s3_location_input = QLineEdit()
+        self._s3_location_input.setPlaceholderText("Add S3 location: s3://bucket/path")
+        self._s3_location_input.returnPressed.connect(self._add_s3_location)
+        source_add_row.addWidget(self._s3_location_input, 1)
+
+        add_source_btn = QToolButton()
+        add_source_btn.setText("+")
+        add_source_btn.setFixedSize(32, 32)
+        add_source_btn.setToolTip("Add S3 location")
+        add_source_btn.clicked.connect(self._add_s3_location)
+        add_source_btn.setStyleSheet(
+            f"QToolButton {{ background: {COLOR_ACCENT}; border: none; border-radius: 16px; "
+            f"color: #090a08; font-size: 15px; font-weight: 800; }}"
+            f"QToolButton:hover {{ background: {COLOR_ACCENT_HOVER}; }}"
+        )
+        source_add_row.addWidget(add_source_btn)
+
+        remove_source_btn = QToolButton()
+        remove_source_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogDiscardButton))
+        remove_source_btn.setFixedSize(32, 32)
+        remove_source_btn.setToolTip("Remove the S3 location typed in the field")
+        remove_source_btn.clicked.connect(self._remove_typed_s3_location)
+        remove_source_btn.setStyleSheet(
+            f"QToolButton {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 16px; padding: 5px; color: {COLOR_TEXT_PRIMARY}; }}"
+            f"QToolButton:hover {{ background: {COLOR_BG_HOVER}; border-color: {COLOR_ACCENT_DIM}; }}"
+        )
+        source_add_row.addWidget(remove_source_btn)
+        root.addLayout(source_add_row)
 
         # ── Category filter ───────────────────────────────────────────────────
         filter_row = QHBoxLayout()
         filter_row.setSpacing(4)
 
-        cat_label = QLabel("Category:")
-        cat_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 11px;")
+        cat_label = QLabel("Folder:")
+        cat_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; font-weight: 700;"
+        )
         filter_row.addWidget(cat_label)
 
         self._cat_combo = QComboBox()
@@ -202,7 +243,9 @@ class AssetBrowserPanel(QWidget):
         size_row.setSpacing(6)
 
         size_label = QLabel("Thumbnail:")
-        size_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 11px;")
+        size_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px; font-weight: 700;"
+        )
         size_row.addWidget(size_label)
 
         self._thumb_size_slider = QSlider(Qt.Horizontal)
@@ -218,7 +261,9 @@ class AssetBrowserPanel(QWidget):
         self._thumb_size_value = QLabel(f"{self._thumb_size}px")
         self._thumb_size_value.setMinimumWidth(38)
         self._thumb_size_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self._thumb_size_value.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px;")
+        self._thumb_size_value.setStyleSheet(
+            f"color: {COLOR_ACCENT}; font-size: 10px; font-weight: 700;"
+        )
         size_row.addWidget(self._thumb_size_value)
 
         self._thumb_size_slider.valueChanged.connect(self._schedule_thumbnail_size)
@@ -226,14 +271,18 @@ class AssetBrowserPanel(QWidget):
 
         # ── Asset count ───────────────────────────────────────────────────────
         self._count_label = QLabel("Loading…")
-        self._count_label.setStyleSheet(f"color: {COLOR_TEXT_DISABLED}; font-size: 10px;")
+        self._count_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DISABLED}; font-size: 10px; padding: 1px 0;"
+        )
         root.addWidget(self._count_label)
 
         selection_row = QHBoxLayout()
         selection_row.setSpacing(6)
 
         self._selection_label = QLabel("No assets selected")
-        self._selection_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px;")
+        self._selection_label.setStyleSheet(
+            f"color: {COLOR_TEXT_SECONDARY}; font-size: 10px;"
+        )
         selection_row.addWidget(self._selection_label, 1)
 
         self._load_selected_btn = QPushButton("Load Selected")
@@ -241,10 +290,10 @@ class AssetBrowserPanel(QWidget):
         self._load_selected_btn.setToolTip("Load all selected assets into the viewport")
         self._load_selected_btn.clicked.connect(self._request_load_selected)
         self._load_selected_btn.setStyleSheet(
-            f"QPushButton {{ background: {COLOR_ACCENT}; color: #101010; border: none; "
-            f"border-radius: 4px; padding: 5px 8px; font-size: 10px; font-weight: 700; }}"
-            f"QPushButton:disabled {{ background: #3a3a3a; color: {COLOR_TEXT_DISABLED}; }}"
-            "QPushButton:enabled:hover { background: #8bd100; }"
+            f"QPushButton {{ background: {COLOR_ACCENT}; color: #090a08; border: none; "
+            f"border-radius: 13px; padding: 6px 10px; font-size: 10px; font-weight: 800; }}"
+            f"QPushButton:disabled {{ background: {COLOR_BG_PANEL}; color: {COLOR_TEXT_DISABLED}; }}"
+            f"QPushButton:enabled:hover {{ background: {COLOR_ACCENT_HOVER}; color: #090a08; }}"
         )
         selection_row.addWidget(self._load_selected_btn)
         root.addLayout(selection_row)
@@ -278,9 +327,9 @@ class AssetBrowserPanel(QWidget):
         self._progress.setFixedHeight(8)
         self._progress.setRange(0, 0)
         self._progress.setStyleSheet(
-            f"QProgressBar {{ background: #222; border: 1px solid {COLOR_BORDER}; "
-            f"border-radius: 3px; }}"
-            f"QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 2px; }}"
+            f"QProgressBar {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 4px; }}"
+            f"QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 3px; }}"
         )
         self._progress.hide()
         root.addWidget(self._progress)
@@ -350,6 +399,50 @@ class AssetBrowserPanel(QWidget):
         self._client.status_message.connect(self._on_status)
         self._client.error_occurred.connect(self._on_error)
         self._client.progress_updated.connect(self._on_progress)
+        self._client.locations_changed.connect(self._on_locations_changed)
+
+    def _add_s3_location(self):
+        text = self._s3_location_input.text().strip()
+        if not text:
+            return
+        try:
+            added = self._client.add_location(text)
+        except ValueError as exc:
+            self._on_error(str(exc))
+            return
+
+        if not added:
+            return
+        self._s3_location_input.clear()
+        self._progress.setRange(0, 0)
+        self._progress.show()
+        self._client.refresh(force_network=True)
+
+    def _remove_typed_s3_location(self):
+        text = self._s3_location_input.text().strip()
+        if not text:
+            self._on_error("Enter the S3 location you want to remove.")
+            return
+
+        try:
+            source_uri = parse_s3_location(text).root_uri
+        except ValueError as exc:
+            self._on_error(str(exc))
+            return
+
+        if self._client.remove_location(source_uri):
+            self._s3_location_input.clear()
+            self._client.refresh(force_network=True)
+
+    def _on_locations_changed(self, _locations):
+        valid_sources = {location.root_uri for location in self._client.locations}
+        if valid_sources:
+            self._assets = [asset for asset in self._assets if asset.source_uri in valid_sources]
+            valid_keys = {asset.asset_id for asset in self._assets}
+            self._selected_usd_keys.intersection_update(valid_keys)
+            self._update_selection_ui()
+        self._update_category_filter()
+        self._schedule_filter()
 
     # ── Slots ──────────────────────────────────────────────────────────────────
 
@@ -368,7 +461,7 @@ class AssetBrowserPanel(QWidget):
 
     def _on_assets_loaded(self, assets: List[AssetInfo]):
         self._assets = assets
-        valid_keys = {asset.usd_key for asset in assets}
+        valid_keys = {asset.asset_id for asset in assets}
         self._selected_usd_keys.intersection_update(valid_keys)
         self._update_selection_ui()
         self._update_category_filter()
@@ -377,7 +470,7 @@ class AssetBrowserPanel(QWidget):
         self._progress.hide()
 
     def _on_thumbnail_ready(self, asset: AssetInfo):
-        card = self._card_by_usd.get(asset.usd_key)
+        card = self._card_by_usd.get(asset.asset_id)
         if not card or not asset.local_thumbnail:
             return
 
@@ -390,7 +483,7 @@ class AssetBrowserPanel(QWidget):
             return
         self._thumbnail_decodes.add(decode_key)
         self._thumb_decode_pool.start(
-            _ThumbnailDecodeWorker(asset.usd_key, str(asset.local_thumbnail), thumb_size, self._thumb_decode_signals)
+            _ThumbnailDecodeWorker(asset.asset_id, str(asset.local_thumbnail), thumb_size, self._thumb_decode_signals)
         )
 
     def _on_thumbnail_decoded(self, usd_key: str, path: str, size: int, image: QImage):
@@ -423,7 +516,7 @@ class AssetBrowserPanel(QWidget):
     # ── Filtering ──────────────────────────────────────────────────────────────
 
     def _update_category_filter(self):
-        cats = sorted({a.category for a in self._assets})
+        cats = sorted({a.category for a in self._assets if a.category})
         current = self._cat_combo.currentText()
         self._cat_combo.blockSignals(True)
         self._cat_combo.clear()
@@ -446,6 +539,8 @@ class AssetBrowserPanel(QWidget):
             a for a in self._assets
             if (not query or query in a.display_name.lower()
                           or query in a.category.lower()
+                          or query in a.source_name.lower()
+                          or query in a.source_uri.lower()
                           or any(query in t.lower() for t in a.tags))
             and (cat == "All" or a.category == cat)
         ]
@@ -491,10 +586,10 @@ class AssetBrowserPanel(QWidget):
             card.grid_row = row
             card.clicked.connect(self._on_card_clicked)
             card.double_clicked.connect(self._on_card_double_clicked)
-            card.set_selected(asset.usd_key in self._selected_usd_keys)
+            card.set_selected(asset.asset_id in self._selected_usd_keys)
             self._grid.addWidget(card, row, col)
             self._cards.append(card)
-            self._card_by_usd[asset.usd_key] = card
+            self._card_by_usd[asset.asset_id] = card
 
         self._render_index = batch_end
         self._update_selection_ui()
@@ -578,7 +673,7 @@ class AssetBrowserPanel(QWidget):
             card_bottom = card_top + card.height()
             if card_bottom < top - margin or card_top > bottom + margin:
                 continue
-            key = card.asset.thumbnail_key or card.asset.usd_key
+            key = card.asset.asset_id + "::" + str(card.asset.thumbnail_key or card.asset.usd_key)
             if key in self._requested_thumbnails:
                 continue
             self._requested_thumbnails.add(key)
@@ -600,22 +695,22 @@ class AssetBrowserPanel(QWidget):
                 self._selected_usd_keys.clear()
             lo, hi = sorted((self._last_clicked_index, index))
             for item in self._visible_assets[lo : hi + 1]:
-                self._selected_usd_keys.add(item.usd_key)
+                self._selected_usd_keys.add(item.asset_id)
         elif ctrl_down:
-            if asset.usd_key in self._selected_usd_keys:
-                self._selected_usd_keys.remove(asset.usd_key)
+            if asset.asset_id in self._selected_usd_keys:
+                self._selected_usd_keys.remove(asset.asset_id)
             else:
-                self._selected_usd_keys.add(asset.usd_key)
+                self._selected_usd_keys.add(asset.asset_id)
             self._last_clicked_index = index
         else:
-            self._selected_usd_keys = {asset.usd_key}
+            self._selected_usd_keys = {asset.asset_id}
             self._last_clicked_index = index
 
         self._update_selection_ui()
         self.asset_selected.emit(asset)
 
     def _on_card_double_clicked(self, asset: AssetInfo):
-        self._selected_usd_keys = {asset.usd_key}
+        self._selected_usd_keys = {asset.asset_id}
         try:
             self._last_clicked_index = self._visible_assets.index(asset)
         except ValueError:
@@ -631,7 +726,7 @@ class AssetBrowserPanel(QWidget):
 
     def _selected_assets(self) -> List[AssetInfo]:
         selected = set(self._selected_usd_keys)
-        return [asset for asset in self._assets if asset.usd_key in selected]
+        return [asset for asset in self._assets if asset.asset_id in selected]
 
     def _update_selection_ui(self):
         selected_count = len(self._selected_usd_keys)
@@ -655,7 +750,7 @@ class AssetBrowserPanel(QWidget):
             )
 
         for card in self._cards:
-            card.set_selected(card.asset.usd_key in self._selected_usd_keys)
+            card.set_selected(card.asset.asset_id in self._selected_usd_keys)
 
 
 # ── Asset card widget ───────────────────────────────────────────────────────────
@@ -676,25 +771,29 @@ class AssetCard(QFrame):
         self._size = size
         self.setObjectName("asset_card")
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip(f"{asset.display_name}\n{asset.category}\n{asset.usd_key}")
+        self.setToolTip(f"{asset.display_name}\n{asset.source_name}\n{asset.category}\n{asset.s3_uri}")
         self.setFixedSize(size + CARD_WIDTH_PAD, size + CARD_HEIGHT_PAD)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(1)
+        layout.setContentsMargins(3, 3, 3, 4)
+        layout.setSpacing(4)
 
         self._thumb = QLabel()
         self._thumb.setAlignment(Qt.AlignCenter)
         self._thumb.setFixedSize(size, size)
+        self._thumb.setStyleSheet(
+            "background: #f4f5f0; border: 1px solid #dfe6d8; border-radius: 6px;"
+        )
         self._thumb.setPixmap(self._get_placeholder(size))
         layout.addWidget(self._thumb)
 
         name = QLabel(asset.display_name)
         name.setObjectName("asset_name")
-        name.setAlignment(Qt.AlignCenter)
+        name.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         name.setWordWrap(False)
         name.setStyleSheet(
-            f"color: {COLOR_TEXT_PRIMARY}; font-size: 9px; background: transparent;"
+            f"color: {COLOR_TEXT_PRIMARY}; font-size: 9px; font-weight: 700; "
+            f"background: transparent; padding: 0 2px;"
         )
         # Truncate long names
         fm = name.fontMetrics()
@@ -759,15 +858,15 @@ class AssetCard(QFrame):
     def _update_style(self, selected: bool):
         if selected:
             self.setStyleSheet(
-                f"QFrame#asset_card {{ background: #2a3d1a; "
-                f"border: 2px solid {COLOR_ACCENT}; border-radius: 6px; }}"
+                f"QFrame#asset_card {{ background: #171f10; "
+                f"border: 2px solid {COLOR_ACCENT}; border-radius: 8px; }}"
             )
         else:
             self.setStyleSheet(
-                f"QFrame#asset_card {{ background: {COLOR_BG_WIDGET}; "
-                f"border: 1px solid {COLOR_BORDER}; border-radius: 6px; }}"
-                f"QFrame#asset_card:hover {{ border: 1px solid {COLOR_ACCENT}; "
-                f"background: #2c2c2c; }}"
+                f"QFrame#asset_card {{ background: {COLOR_BG_PANEL}; "
+                f"border: 1px solid {COLOR_BORDER}; border-radius: 8px; }}"
+                f"QFrame#asset_card:hover {{ border: 1px solid {COLOR_ACCENT_DIM}; "
+                f"background: {COLOR_BG_HOVER}; }}"
             )
 
     @classmethod
@@ -775,15 +874,15 @@ class AssetCard(QFrame):
         if cls._PLACEHOLDER and cls._PLACEHOLDER.width() == size:
             return cls._PLACEHOLDER
         px = QPixmap(size, size)
-        px.fill(QColor("#1e1e1e"))
+        px.fill(QColor("#f4f5f0"))
         p = QPainter(px)
         p.setRenderHint(QPainter.Antialiasing)
         # Draw USD icon placeholder
-        p.setPen(QPen(QColor("#3a3a3a"), 2))
+        p.setPen(QPen(QColor("#c7d0c1"), 2))
         c = size // 2
         r = size // 3
         p.drawEllipse(c - r, c - r, r * 2, r * 2)
-        p.setPen(QColor("#4a4a4a"))
+        p.setPen(QColor("#65715e"))
         p.setFont(QFont("Segoe UI", size // 8))
         p.drawText(px.rect(), Qt.AlignCenter, "USD")
         p.end()

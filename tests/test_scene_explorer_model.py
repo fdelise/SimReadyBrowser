@@ -35,6 +35,52 @@ class SceneExplorerModelTests(unittest.TestCase):
             "/SimReadyAsset_02/Geometry/Cup",
         )
 
+    def test_uses_full_usd_prim_tree_when_available(self):
+        payload = build_scene_tree(
+            [{"name": "Cup", "source": "cup.usd"}],
+            [
+                {
+                    "prim_tree": {
+                        "name": "Asset",
+                        "path": "/World/Asset",
+                        "type": "Xform",
+                        "role": "asset",
+                        "properties": {"visible": True},
+                        "usd": {"type_name": "Xform", "applied_schemas": ["PhysicsRigidBodyAPI"]},
+                        "usd_properties": [{"name": "physics:mass", "type": "float", "value": "1.5"}],
+                        "children": [
+                            {
+                                "name": "Mesh",
+                                "path": "/World/Asset/Geometry/Mesh",
+                                "type": "Mesh",
+                                "role": "collider",
+                                "properties": {"visible": True},
+                                "usd": {
+                                    "type_name": "Mesh",
+                                    "applied_schemas": ["PhysicsCollisionAPI"],
+                                    "geometry": {"points": 12, "faces": 8},
+                                    "physics": {"collision": True},
+                                },
+                                "usd_properties": [{"name": "points", "type": "point3f[]", "value": "[12] ..."}],
+                                "children": [],
+                            }
+                        ],
+                    },
+                    "collider_count": 1,
+                }
+            ],
+        )
+
+        root = payload["roots"][0]
+        self.assertEqual(root["name"], "Cup")
+        self.assertEqual(root["path"], "/SimReadyAsset")
+        self.assertEqual(root["usd"]["applied_schemas"], ["PhysicsRigidBodyAPI"])
+        self.assertEqual(root["usd_properties"][0]["name"], "physics:mass")
+        child = root["children"][0]
+        self.assertEqual(child["path"], "/SimReadyAsset/Geometry/Mesh")
+        self.assertEqual(child["physics_path"], "/World/Asset/Geometry/Mesh")
+        self.assertEqual(child["usd"]["geometry"]["points"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

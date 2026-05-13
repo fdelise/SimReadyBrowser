@@ -49,12 +49,16 @@ from core.cad2usd_bridge import (
     is_supported_cad_file,
     make_cad_usd_output_path,
 )
-from core.s3_client import AssetInfo, S3Client, S3_URI_ROOT
+from core.s3_client import AssetInfo, S3Client
 from styles import nvidia_theme as theme
 from styles.nvidia_theme import (
     COLOR_ACCENT,
     COLOR_BG_HEADER,
+    COLOR_BG_HOVER,
+    COLOR_BG_WIDGET,
     COLOR_BG_WINDOW,
+    COLOR_BORDER,
+    COLOR_STATUS_BG,
     COLOR_TEXT_PRIMARY,
     COLOR_TEXT_SECONDARY,
 )
@@ -88,6 +92,7 @@ class MainWindow(QMainWindow):
         self._cad2usd_base_env = QProcessEnvironment.systemEnvironment()
         self._browser_fullscreen = False
         self._browser_fullscreen_state = None
+        self._default_splitter_applied = False
 
         # ── Window setup ────────────────────────────────────────────────────────
         self.setWindowTitle(APP_NAME)
@@ -126,8 +131,9 @@ class MainWindow(QMainWindow):
         mb = self.menuBar()
         mb.setStyleSheet(
             f"QMenuBar {{ background: {COLOR_BG_HEADER}; color: {COLOR_TEXT_PRIMARY}; "
-            f"border-bottom: 1px solid #3a3a3a; font-size: 12px; }}"
-            f"QMenuBar::item:selected {{ background: #363636; }}"
+            f"border-bottom: 1px solid {COLOR_BORDER}; font-size: 12px; padding: 2px 8px; }}"
+            "QMenuBar::item { background: transparent; padding: 5px 10px; border-radius: 10px; }"
+            f"QMenuBar::item:selected {{ background: {COLOR_BG_HOVER}; color: {COLOR_ACCENT}; }}"
         )
 
         # File menu
@@ -184,21 +190,21 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.setIconSize(QSize(20, 20))
         tb.setStyleSheet(
-            f"QToolBar {{ background: {COLOR_BG_HEADER}; border-bottom: 1px solid #3a3a3a; "
-            f"spacing: 6px; padding: 4px 8px; }}"
+            f"QToolBar {{ background: {COLOR_BG_HEADER}; border-bottom: 1px solid {COLOR_BORDER}; "
+            f"spacing: 6px; padding: 6px 10px; }}"
         )
         self.addToolBar(tb)
 
         # NVIDIA logo label
         logo = QLabel()
         logo.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 18px; font-weight: bold; "
-                           f"letter-spacing: 2px; padding: 0 8px;")
+                           f"letter-spacing: 0px; padding: 0 8px;")
         logo.setText("NVIDIA")
         tb.addWidget(logo)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.VLine)
-        sep.setStyleSheet(f"color: #3a3a3a;")
+        sep.setStyleSheet(f"color: {COLOR_BORDER};")
         tb.addWidget(sep)
 
         # App name
@@ -241,8 +247,8 @@ class MainWindow(QMainWindow):
         self._splitter = QSplitter(Qt.Horizontal)
         self._splitter.setChildrenCollapsible(False)
         self._splitter.setStyleSheet(
-            "QSplitter::handle { background: #2a2a2a; width: 2px; }"
-            "QSplitter::handle:hover { background: #76b900; }"
+            f"QSplitter::handle {{ background: {COLOR_BORDER}; width: 2px; }}"
+            f"QSplitter::handle:hover {{ background: {COLOR_ACCENT}; }}"
         )
 
         # Left: asset browser
@@ -257,20 +263,34 @@ class MainWindow(QMainWindow):
         self._controls = ControlsPanel()
         self._splitter.addWidget(self._controls)
 
-        self._splitter.setSizes([320, 960, 340])
+        self._splitter.setSizes([self._browser.maximumWidth(), 900, 340])
         self._splitter.setStretchFactor(0, 0)
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setStretchFactor(2, 0)
 
         h_layout.addWidget(self._splitter)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._default_splitter_applied:
+            self._default_splitter_applied = True
+            QTimer.singleShot(0, self._apply_default_splitter_sizes)
+
+    def _apply_default_splitter_sizes(self):
+        if self._browser_fullscreen:
+            return
+        browser_width = self._browser.maximumWidth()
+        controls_width = min(340, self._controls.maximumWidth())
+        viewport_width = max(1, self._splitter.width() - browser_width - controls_width)
+        self._splitter.setSizes([browser_width, viewport_width, controls_width])
+
     # ── Status bar ─────────────────────────────────────────────────────────────
 
     def _build_statusbar(self):
         sb = self.statusBar()
         sb.setStyleSheet(
-            f"QStatusBar {{ background: #111; color: {COLOR_TEXT_SECONDARY}; "
-            f"font-size: 11px; border-top: 1px solid #2a2a2a; }}"
+            f"QStatusBar {{ background: {COLOR_STATUS_BG}; color: {COLOR_TEXT_SECONDARY}; "
+            f"font-size: 11px; border-top: 1px solid {COLOR_BORDER}; }}"
         )
 
         self._status_left = QLabel("Ready")
@@ -281,18 +301,24 @@ class MainWindow(QMainWindow):
         self._loading_bar.setTextVisible(False)
         self._loading_bar.setFixedSize(180, 10)
         self._loading_bar.setStyleSheet(
-            f"QProgressBar {{ background: #252525; border: 1px solid #3a3a3a; "
-            f"border-radius: 3px; }}"
-            f"QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 2px; }}"
+            f"QProgressBar {{ background: {COLOR_BG_WIDGET}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 5px; }}"
+            f"QProgressBar::chunk {{ background: {COLOR_ACCENT}; border-radius: 4px; }}"
         )
         self._loading_bar.hide()
         sb.addWidget(self._loading_bar)
 
         sb.addPermanentWidget(_StatusSep())
 
-        self._status_s3 = QLabel(f"S3: {S3_URI_ROOT}")
+        self._status_s3 = QLabel(self._s3_status_text())
         self._status_s3.setStyleSheet(f"color: {COLOR_ACCENT}; font-size: 10px;")
         sb.addPermanentWidget(self._status_s3)
+
+    def _s3_status_text(self) -> str:
+        count = len(self._s3.locations)
+        if count == 1:
+            return f"S3: {self._s3.locations[0].root_uri}"
+        return f"S3: {count} locations"
 
     # ── Signal wiring ──────────────────────────────────────────────────────────
 
@@ -303,6 +329,7 @@ class MainWindow(QMainWindow):
         self._browser.load_selected_requested.connect(self._load_assets)
         self._browser.status_message.connect(self._set_status)
         self._browser.fullscreen_requested.connect(self._toggle_browser_fullscreen)
+        self._s3.locations_changed.connect(lambda _locations: self._status_s3.setText(self._s3_status_text()))
 
         # Viewport → status / FPS
         self._viewport.status_msg.connect(self._set_status)
@@ -317,6 +344,7 @@ class MainWindow(QMainWindow):
 
         # Controls → viewport
         self._controls.dome_intensity_changed.connect(self._viewport.set_dome_intensity)
+        self._controls.dome_environment_changed.connect(self._viewport.set_dome_environment)
         self._controls.dir_light_changed.connect(
             lambda i, az, el: self._viewport.set_directional_light(i, az, el)
         )
@@ -367,7 +395,7 @@ class MainWindow(QMainWindow):
         self._set_status(f"Loading {len(selected)} selected assets in OVRTX...")
         self._viewport.load_usds(
             [
-                {"name": asset.display_name, "source": asset.usd_url, "key": asset.usd_key}
+                {"name": asset.display_name, "source": asset.usd_url, "key": asset.asset_id}
                 for asset in selected
             ]
         )
@@ -689,7 +717,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             f"About {APP_NAME}",
-            f"<h2 style='color:#76b900'>NVIDIA SimReady Browser</h2>"
+            f"<h2 style='color:{COLOR_ACCENT}'>NVIDIA SimReady Browser</h2>"
             f"<p>Version {APP_VERSION}</p>"
             f"<p>Browse and preview NVIDIA SimReady USD assets from the "
             f"Omniverse content production S3 bucket using the OVRTX renderer.</p>"
@@ -743,5 +771,5 @@ class _StatusSep(QFrame):
     def __init__(self):
         super().__init__()
         self.setFrameShape(QFrame.VLine)
-        self.setStyleSheet("color: #3a3a3a;")
+        self.setStyleSheet(f"color: {COLOR_BORDER};")
         self.setFixedWidth(1)

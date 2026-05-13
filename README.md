@@ -6,29 +6,31 @@ The app is built for asset QA and simulation-readiness review. It combines a fas
 
 ## What It Does
 
-- Browses SimReady assets from `s3://omniverse-content-production/Assets/Isaac/6.0/Isaac/SimReady/`.
+- Browses SimReady assets from the default Omniverse bucket and any added public S3 bucket/prefix locations.
+- Merges added S3 locations into the same thumbnail browser and folder dropdown so browsing stays compact.
 - Uses the S3-side manifest and local cache data where available so asset discovery is fast.
 - Loads thumbnails lazily and caches them locally to keep category browsing responsive.
 - Double-clicks an asset card to load the USD into the OVRTX viewport.
 - Opens local USD files directly, or opens CAD/neutral 3D files by converting them to USD through the external CAD2USD tool.
 - Provides a Z-up Isaac-style review stage with ground plane, shadows, dome light, and direct light controls.
+- Supports a blurred studio lat-long dome environment option for softer background lighting and reflection checks.
 - Supports Kit-style camera navigation, WASD fly movement, zoom-to-extents with `F`, and viewport progress feedback.
 - Runs OVPhysX in a subprocess so Qt, OVRTX, OpenUSD, and PhysX runtime state stay isolated.
 - Traverses composed USD stages, including referenced and instanceable SimReady payloads, to find authored collision prims.
 - Uses the asset's authored colliders for physics review. It does not create fake asset colliders when authored colliders are missing or unavailable.
 - Adds review base scenes: plane, ramp, and obstacles.
 - Shows collision debug overlays as wireframe curves so you can compare the visible render asset against the collision representation.
-- Supports physics playback, restart, explicit PhysX engine restart, single or multi-asset drop-from-air testing, current-pose simulation startup, session CCD, persistent step-rate / CPU-GPU settings, and Shift + left mouse physics grabbing with adjustable grab force.
-- Adds a right-panel Scene Explorer tab that lists discovered asset parts in a USD-style tree and lets you select prims, inspect paths/properties, and author viewport transform or visibility overrides.
+- Supports physics playback, restart, explicit PhysX engine restart, single or multi-asset drop-from-air testing, current-pose simulation startup, session-only PhysX performance settings, and Shift + left mouse physics grabbing with adjustable grab force.
+- Adds a right-panel Scene Explorer tab that lists composed USD prims in a tree and lets you inspect schemas, geometry, material bindings, physics/PhysX attributes, and all USD properties on the selected prim.
 
 ## Typical Workflow
 
 1. Start the app with `launch.bat` or `python main.py`.
-2. Browse SimReady categories from the left asset browser.
+2. Browse SimReady categories from the left asset browser, or add another public S3 location with `s3://bucket/path`.
 3. Double-click a thumbnail to load the asset into the viewport.
 4. Review the asset visually using Kit-style camera controls.
 5. Toggle collision visualization to inspect authored collider wireframes.
-6. Open the Scene Explorer tab to inspect the loaded asset parts or edit selected prim visibility/transform overrides.
+6. Open the Scene Explorer tab to inspect the composed USD tree, selected-prim schemas, geometry/material/physics properties, or edit selected prim visibility/transform overrides.
 7. Use the Physics panel to select a base scene, then press Play or Drop.
 8. Play starts from the asset's current viewport pose; Drop places one or more copies above the base scene and starts physics.
 9. Hold Shift + left mouse button on the asset to grab it with a force-based physics handle, drag it, then release to drop or throw it.
@@ -50,6 +52,7 @@ SimReadyBrowser/
     physics_controller.py         Qt-side OVPhysX worker controller and scene authoring
     physics_worker.py             Isolated OVPhysX worker process
     usd_collision_discovery.py    Isolated OpenUSD composed-collider traversal helper
+    usd_scene_discovery.py        Isolated OpenUSD scene tree/property/schema traversal helper
   ui/
     asset_browser.py              Search, category browser, and asset cards
     viewport_widget.py            Qt viewport host and input routing
@@ -177,7 +180,7 @@ The physics path is designed to validate authored SimReady collision data, not t
 - App-authored USD review and physics layers set `framesPerSecond` and `timeCodesPerSecond` to 60.
 - Physics Play starts from the asset's current viewport pose. It no longer automatically drops the asset from above the base scene.
 - Drop places the selected number of asset copies above the base scene with tight random offsets so they collide. The UI caps this at 100 copies. Re-dropping the same count reuses the cooked OVPhysX scene; changing the count rebuilds because the number of rigid-body instances changes.
-- Persistent PhysX settings include authored steps per second, per-frame substeps, and CPU/GPU/Auto worker device mode. CCD is intentionally session-only and defaults off. Reset Defaults restores GPU device, CCD off, 60 steps/s, and 1 substep.
+- PhysX performance settings are intentionally session-only. Startup and Reset Defaults restore the default profile: GPU device, CCD off, 60 steps/s, and 4 substeps. Older persisted PhysX settings are cleared so stale slow profiles do not carry between launches.
 - The CCD checkbox globally authors scene-level `physxScene:enableCCD` and per-body `physxRigidBody:enableCCD` overrides for discovered asset rigid bodies. Changing it restarts the active physics scene so the setting is actually removed or applied.
 - Restart resets the cooked physics scene without re-cooking when possible. Restart Engine tears down the OVPhysX subprocess and starts a fresh scene, which is required for CPU/GPU mode changes and other settings that affect scene authoring.
 - Grab force is scaled by the estimated mass and by the user-controlled grab force multiplier, which supports 0.25x to 100x.
@@ -193,7 +196,7 @@ This overlay is for inspection only. It does not replace, simplify, or fabricate
 Compile the main modules:
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile main.py core\s3_client.py core\camera_controller.py core\ovrtx_renderer.py core\physics_controller.py core\physics_worker.py core\usd_collision_discovery.py ui\asset_browser.py ui\controls_panel.py ui\main_window.py ui\viewport_widget.py styles\nvidia_theme.py
+.\.venv\Scripts\python.exe -m py_compile main.py core\s3_client.py core\camera_controller.py core\ovrtx_renderer.py core\physics_controller.py core\physics_worker.py core\usd_collision_discovery.py core\usd_scene_discovery.py core\scene_explorer_model.py ui\asset_browser.py ui\controls_panel.py ui\main_window.py ui\viewport_widget.py styles\nvidia_theme.py
 ```
 
 Run physics smoke tests:

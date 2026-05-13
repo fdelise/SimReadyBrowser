@@ -23,7 +23,7 @@ FALL_THROUGH_LIMIT_Z = -0.25
 SIM_FRAME_COUNT = 240
 S3_COFFEE_CUP_SOURCE = (
     "s3://omniverse-content-production/"
-    "Assets/Isaac/6.0/Isaac/SimReady/Food/Beverage/food_beverage_coffeeCup_a01/"
+    "Assets/Isaac/6.0/Isaac/SimReady/Food/Beverage/Coffee_Cup_A01/"
     "sm_food_beverage_coffeeCup_a01_01.usd"
 )
 COFFEE_CUP_BOUNDS = {
